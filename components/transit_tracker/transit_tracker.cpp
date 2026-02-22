@@ -147,6 +147,20 @@ void TransitTracker::on_ws_message_(websockets::WebsocketsMessage message) {
 
     this->schedule_state_.mutex.unlock();
 
+    // Publish route name mapping to text_sensor
+    if (this->route_names_sensor_ != nullptr) {
+      std::string route_names_str;
+      std::set<std::string> seen_routes;
+      for (const auto &t : this->schedule_state_.trips) {
+        if (seen_routes.find(t.route_id) == seen_routes.end()) {
+          if (!route_names_str.empty()) route_names_str += ";";
+          route_names_str += t.route_id + "=" + t.route_name + "|" + t.headsign;
+          seen_routes.insert(t.route_id);
+        }
+      }
+      this->route_names_sensor_->publish_state(route_names_str);
+    }
+
     return true;
   });
 
@@ -276,6 +290,17 @@ void TransitTracker::set_route_styles_from_text(const std::string &text) {
     }
     uint32_t color = std::stoul(parts[2], nullptr, 16);
     this->add_route_style(parts[0], parts[1], Color(color));
+  }
+}
+
+void TransitTracker::set_hidden_routes_from_text(const std::string &text) {
+  this->hidden_routes_.clear();
+  if (text.empty()) return;
+  for (const auto &route_id : split(text, ';')) {
+    if (!route_id.empty()) {
+      this->hidden_routes_.insert(route_id);
+      ESP_LOGD(TAG, "Hiding route: %s", route_id.c_str());
+    }
   }
 }
 
@@ -472,6 +497,28 @@ void HOT TransitTracker::draw_schedule() {
 
   this->schedule_state_.mutex.lock();
 
+  // Filter out hidden routes
+  std::vector<Trip> visible_trips;
+  if (!this->hidden_routes_.empty()) {
+    for (const Trip &trip : this->schedule_state_.trips) {
+      if (this->hidden_routes_.find(trip.route_id) == this->hidden_routes_.end()) {
+        visible_trips.push_back(trip);
+      }
+    }
+  } else {
+    visible_trips = this->schedule_state_.trips;
+  }
+
+  if (visible_trips.empty()) {
+    this->schedule_state_.mutex.unlock();
+    auto message = "No upcoming arrivals";
+    if (this->display_departure_times_) {
+      message = "No upcoming departures";
+    }
+    this->draw_text_centered_(message, Color(0x252627));
+    return;
+  }
+
   int nominal_font_height = this->font_->get_ascender() + this->font_->get_descender();
   unsigned long uptime = millis();
   uint rtc_now = this->rtc_->now().timestamp;
@@ -486,7 +533,7 @@ void HOT TransitTracker::draw_schedule() {
     bool any_realtime = false;
     int _;
 
-    for (const Trip &trip : this->schedule_state_.trips) {
+    for (const Trip &trip : visible_trips) {
       int route_width;
       this->font_->measure(trip.route_name.c_str(), &route_width, &_, &_, &_);
       max_route_width = max(max_route_width, route_width);
@@ -518,7 +565,7 @@ void HOT TransitTracker::draw_schedule() {
   int scroll_cycle_duration = 0;
   if (this->scroll_headsigns_) {
     int largest_headsign_overflow = 0;
-    for (const Trip &trip : this->schedule_state_.trips) {
+    for (const Trip &trip : visible_trips) {
       int headsign_overflow;
       this->draw_trip(trip, 0, nominal_font_height, uptime, rtc_now, true, &headsign_overflow, 0, uniform_clipping_start, uniform_clipping_end);
       largest_headsign_overflow = max(largest_headsign_overflow, headsign_overflow);
@@ -533,7 +580,7 @@ void HOT TransitTracker::draw_schedule() {
   int max_trips_height = (this->limit_ * this->font_->get_ascender()) + ((this->limit_ - 1) * this->font_->get_descender());
   int y_offset = (this->display_->get_height() % max_trips_height) / 2;
 
-  for (const Trip &trip : this->schedule_state_.trips) {
+  for (const Trip &trip : visible_trips) {
     this->draw_trip(trip, y_offset, nominal_font_height, uptime, rtc_now, false, nullptr, scroll_cycle_duration, uniform_clipping_start, uniform_clipping_end);
     y_offset += nominal_font_height;
   }

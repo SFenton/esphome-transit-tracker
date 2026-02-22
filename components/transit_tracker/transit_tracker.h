@@ -1,12 +1,14 @@
 #pragma once
 
 #include <map>
+#include <set>
 #include <ArduinoWebsockets.h>
 
 #include "esphome/core/component.h"
 #include "esphome/components/display/display.h"
 #include "esphome/components/font/font.h"
 #include "esphome/components/time/real_time_clock.h"
+#include "esphome/components/text_sensor/text_sensor.h"
 
 #include "schedule_state.h"
 #include "localization.h"
@@ -38,6 +40,7 @@ class TransitTracker : public Component {
     void set_display(display::Display *display) { display_ = display; }
     void set_font(font::Font *font) { font_ = font; }
     void set_rtc(time::RealTimeClock *rtc) { rtc_ = rtc; }
+    void set_route_names_sensor(text_sensor::TextSensor *sensor) { route_names_sensor_ = sensor; }
 
     void set_base_url(const std::string &base_url) { base_url_ = base_url; }
     void set_feed_code(const std::string &feed_code) { feed_code_ = feed_code; }
@@ -56,6 +59,7 @@ class TransitTracker : public Component {
 
     void set_abbreviations_from_text(const std::string &text);
     void set_route_styles_from_text(const std::string &text);
+    void set_hidden_routes_from_text(const std::string &text);
 
     void set_realtime_color(const Color &color);
 
@@ -80,6 +84,7 @@ class TransitTracker : public Component {
     display::Display *display_;
     font::Font *font_;
     time::RealTimeClock *rtc_;
+    text_sensor::TextSensor *route_names_sensor_{nullptr};
 
     websockets::WebsocketsClient ws_client_{};
 
@@ -104,6 +109,8 @@ class TransitTracker : public Component {
     bool scroll_headsigns_ = false;
     bool uniform_headsign_start_ = false;
     bool uniform_headsign_end_ = false;
+
+    std::set<std::string> hidden_routes_;
 
     Color realtime_color_ = Color(0x20FF00);
     Color realtime_color_dark_ = Color(0x00A700);
