@@ -169,6 +169,7 @@ async def to_code(config):
 
     await cg.register_component(var, config)
 
+    cg.add_library("WiFi", None)
     cg.add_library("NetworkClientSecure", None)
     cg.add_library("HTTPClient", None)
 

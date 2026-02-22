@@ -46,6 +46,8 @@ class TransitTracker : public Component {
     void set_list_mode(const std::string &list_mode) { list_mode_ = list_mode; }
     void set_limit(int limit) { limit_ = limit; }
     void set_scroll_headsigns(bool scroll_headsigns) { scroll_headsigns_ = scroll_headsigns; }
+    void set_uniform_headsign_start(bool v) { uniform_headsign_start_ = v; }
+    void set_uniform_headsign_end(bool v) { uniform_headsign_end_ = v; }
 
     void set_unit_display(UnitDisplay unit_display) { this->localization_.set_unit_display(unit_display); }
     void add_abbreviation(const std::string &from, const std::string &to) { abbreviations_[from] = to; }
@@ -68,7 +70,8 @@ class TransitTracker : public Component {
 
     void draw_trip(
       const Trip &trip, int y_offset, int font_height, unsigned long uptime, uint rtc_now,
-      bool no_draw = false, int *headsign_overflow_out = nullptr, int scroll_cycle_duration = 0
+      bool no_draw = false, int *headsign_overflow_out = nullptr, int scroll_cycle_duration = 0,
+      int headsign_clipping_start_override = -1, int headsign_clipping_end_override = -1
     );
 
     Localization localization_{};
@@ -99,6 +102,8 @@ class TransitTracker : public Component {
     Color default_route_color_ = Color(0x028e51);
     std::map<std::string, RouteStyle> route_styles_;
     bool scroll_headsigns_ = false;
+    bool uniform_headsign_start_ = false;
+    bool uniform_headsign_end_ = false;
 
     Color realtime_color_ = Color(0x20FF00);
     Color realtime_color_dark_ = Color(0x00A700);

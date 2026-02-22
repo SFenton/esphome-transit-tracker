@@ -342,7 +342,8 @@ void HOT TransitTracker::draw_realtime_icon_(int bottom_right_x, int bottom_righ
 
 void TransitTracker::draw_trip(
     const Trip &trip, int y_offset, int font_height, unsigned long uptime, uint rtc_now,
-    bool no_draw, int *headsign_overflow_out, int scroll_cycle_duration
+    bool no_draw, int *headsign_overflow_out, int scroll_cycle_duration,
+    int headsign_clipping_start_override, int headsign_clipping_end_override
 ) {
     if (!no_draw) {
       this->display_->print(0, y_offset, this->font_, trip.route_color, display::TextAlign::TOP_LEFT, trip.route_name.c_str());
@@ -359,8 +360,8 @@ void TransitTracker::draw_trip(
     int time_width;
     this->font_->measure(time_display.c_str(), &time_width, &_, &_, &_);
 
-    int headsign_clipping_start = route_width + 3;
-    int headsign_clipping_end = this->display_->get_width() - time_width - 2;
+    int headsign_clipping_start = (headsign_clipping_start_override >= 0) ? headsign_clipping_start_override : route_width + 3;
+    int headsign_clipping_end = (headsign_clipping_end_override >= 0) ? headsign_clipping_end_override : this->display_->get_width() - time_width - 2;
 
     if (!no_draw) {
       Color time_color = trip.is_realtime ? this->realtime_color_ : Color(0xa7a7a7);
@@ -368,7 +369,9 @@ void TransitTracker::draw_trip(
     }
 
     if (trip.is_realtime) {
-      headsign_clipping_end -= 8;
+      if (headsign_clipping_end_override < 0) {
+        headsign_clipping_end -= 8;
+      }
 
       if(!no_draw) {
         int icon_bottom_right_x = this->display_->get_width() - time_width - 2;
@@ -473,12 +476,51 @@ void HOT TransitTracker::draw_schedule() {
   unsigned long uptime = millis();
   uint rtc_now = this->rtc_->now().timestamp;
 
+  // Pre-pass: compute uniform headsign boundaries if enabled
+  int uniform_clipping_start = -1;
+  int uniform_clipping_end = -1;
+
+  if (this->uniform_headsign_start_ || this->uniform_headsign_end_) {
+    int max_route_width = 0;
+    int max_time_width = 0;
+    bool any_realtime = false;
+    int _;
+
+    for (const Trip &trip : this->schedule_state_.trips) {
+      int route_width;
+      this->font_->measure(trip.route_name.c_str(), &route_width, &_, &_, &_);
+      max_route_width = max(max_route_width, route_width);
+
+      auto time_display = this->localization_.fmt_duration_from_now(
+        this->display_departure_times_ ? trip.departure_time : trip.arrival_time,
+        rtc_now
+      );
+      int time_width;
+      this->font_->measure(time_display.c_str(), &time_width, &_, &_, &_);
+      max_time_width = max(max_time_width, time_width);
+
+      if (trip.is_realtime) {
+        any_realtime = true;
+      }
+    }
+
+    if (this->uniform_headsign_start_) {
+      uniform_clipping_start = max_route_width + 3;
+    }
+    if (this->uniform_headsign_end_) {
+      uniform_clipping_end = this->display_->get_width() - max_time_width - 2;
+      if (any_realtime) {
+        uniform_clipping_end -= 8;
+      }
+    }
+  }
+
   int scroll_cycle_duration = 0;
   if (this->scroll_headsigns_) {
     int largest_headsign_overflow = 0;
     for (const Trip &trip : this->schedule_state_.trips) {
       int headsign_overflow;
-      this->draw_trip(trip, 0, nominal_font_height, uptime, rtc_now, true, &headsign_overflow);
+      this->draw_trip(trip, 0, nominal_font_height, uptime, rtc_now, true, &headsign_overflow, 0, uniform_clipping_start, uniform_clipping_end);
       largest_headsign_overflow = max(largest_headsign_overflow, headsign_overflow);
     }
 
@@ -492,7 +534,7 @@ void HOT TransitTracker::draw_schedule() {
   int y_offset = (this->display_->get_height() % max_trips_height) / 2;
 
   for (const Trip &trip : this->schedule_state_.trips) {
-    this->draw_trip(trip, y_offset, nominal_font_height, uptime, rtc_now, false, nullptr, scroll_cycle_duration);
+    this->draw_trip(trip, y_offset, nominal_font_height, uptime, rtc_now, false, nullptr, scroll_cycle_duration, uniform_clipping_start, uniform_clipping_end);
     y_offset += nominal_font_height;
   }
 
