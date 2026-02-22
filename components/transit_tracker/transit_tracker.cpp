@@ -184,7 +184,7 @@ void TransitTracker::on_ws_event_(websockets::WebsocketsEvent event, String data
       }
 
       data["routeStopPairs"] = this->schedule_string_;
-      data["limit"] = this->limit_;
+      data["limit"] = this->scroll_routes_ ? this->limit_ * 3 : this->limit_;
       data["sortByDeparture"] = this->display_departure_times_;
       data["listMode"] = this->list_mode_;
     });
@@ -562,30 +562,58 @@ void HOT TransitTracker::draw_schedule() {
     }
   }
 
+  // Determine which trips to display (paging)
+  int total_visible = visible_trips.size();
+  int page_size = this->limit_;
+  int start_index = 0;
+  int end_index = total_visible;
   int scroll_cycle_duration = 0;
-  if (this->scroll_headsigns_) {
-    int largest_headsign_overflow = 0;
-    for (const Trip &trip : visible_trips) {
-      int headsign_overflow;
-      this->draw_trip(trip, 0, nominal_font_height, uptime, rtc_now, true, &headsign_overflow, 0, uniform_clipping_start, uniform_clipping_end);
-      largest_headsign_overflow = max(largest_headsign_overflow, headsign_overflow);
-    }
 
-    if (largest_headsign_overflow > 0) {
-      int longest_scroll_time = largest_headsign_overflow * 1000 / scroll_speed;
-      scroll_cycle_duration = idle_time_left + idle_time_right + 2*longest_scroll_time;
+  if (this->scroll_routes_ && total_visible > page_size) {
+    // In rotate mode: total_pages = total_visible - page_size + 1 (slide by 1)
+    // In full-page mode: total_pages = ceil(total_visible / page_size)
+    int total_pages = this->paging_rotate_
+      ? total_visible - page_size + 1
+      : (total_visible + page_size - 1) / page_size;
+
+    int current_page = (uptime / this->page_interval_) % total_pages;
+    start_index = this->paging_rotate_ ? current_page : current_page * page_size;
+    end_index = std::min(start_index + page_size, total_visible);
+  }
+
+  if (this->scroll_headsigns_) {
+    int largest_overflow = 0;
+    for (int i = start_index; i < end_index; i++) {
+      int overflow;
+      this->draw_trip(visible_trips[i], 0, nominal_font_height, uptime, rtc_now, true, &overflow, 0, uniform_clipping_start, uniform_clipping_end);
+      largest_overflow = max(largest_overflow, overflow);
+    }
+    if (largest_overflow > 0) {
+      int scroll_time = largest_overflow * 1000 / scroll_speed;
+      scroll_cycle_duration = idle_time_left + idle_time_right + 2 * scroll_time;
     }
   }
 
-  int max_trips_height = (this->limit_ * this->font_->get_ascender()) + ((this->limit_ - 1) * this->font_->get_descender());
+  int display_count = end_index - start_index;
+  int max_trips_height = (display_count * this->font_->get_ascender()) + ((display_count - 1) * this->font_->get_descender());
   int y_offset = (this->display_->get_height() % max_trips_height) / 2;
 
-  for (const Trip &trip : visible_trips) {
+  for (int i = start_index; i < end_index; i++) {
+    const Trip &trip = visible_trips[i];
     this->draw_trip(trip, y_offset, nominal_font_height, uptime, rtc_now, false, nullptr, scroll_cycle_duration, uniform_clipping_start, uniform_clipping_end);
     y_offset += nominal_font_height;
   }
 
   this->schedule_state_.mutex.unlock();
+}
+
+void TransitTracker::set_scroll_routes(bool v) {
+  if (this->scroll_routes_ != v) {
+    this->scroll_routes_ = v;
+    if (this->ws_client_.available()) {
+      this->reconnect();
+    }
+  }
 }
 
 }  // namespace transit_tracker

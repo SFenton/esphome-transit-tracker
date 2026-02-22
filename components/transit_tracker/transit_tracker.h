@@ -51,6 +51,9 @@ class TransitTracker : public Component {
     void set_scroll_headsigns(bool scroll_headsigns) { scroll_headsigns_ = scroll_headsigns; }
     void set_uniform_headsign_start(bool v) { uniform_headsign_start_ = v; }
     void set_uniform_headsign_end(bool v) { uniform_headsign_end_ = v; }
+    void set_scroll_routes(bool v);
+    void set_page_interval(int seconds) { page_interval_ = seconds * 1000; }
+    void set_paging_style_rotate(bool v) { paging_rotate_ = v; }
 
     void set_unit_display(UnitDisplay unit_display) { this->localization_.set_unit_display(unit_display); }
     void add_abbreviation(const std::string &from, const std::string &to) { abbreviations_[from] = to; }
@@ -67,6 +70,7 @@ class TransitTracker : public Component {
     static constexpr int scroll_speed = 10; // pixels/second
     static constexpr int idle_time_left = 5000;
     static constexpr int idle_time_right = 1000;
+    int page_interval_ = 5000; // ms per page when scroll_routes is on
 
     std::string from_now_(time_t unix_timestamp, uint rtc_now) const;
     void draw_text_centered_(const char *text, Color color);
@@ -109,6 +113,8 @@ class TransitTracker : public Component {
     bool scroll_headsigns_ = false;
     bool uniform_headsign_start_ = false;
     bool uniform_headsign_end_ = false;
+    bool scroll_routes_ = false;
+    bool paging_rotate_ = false; // false = full page, true = single rotate
 
     std::set<std::string> hidden_routes_;
 
