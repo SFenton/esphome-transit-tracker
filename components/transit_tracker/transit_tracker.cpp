@@ -546,7 +546,8 @@ void HOT TransitTracker::draw_realtime_icon_(int bottom_right_x, int bottom_righ
 
 void TransitTracker::draw_trip(
     const Trip &trip, int y_offset, int font_height, unsigned long uptime, uint rtc_now,
-    bool no_draw, int *headsign_overflow_out, int scroll_cycle_duration,
+    bool no_draw, int *headsign_overflow_out, int *headsign_width_out,
+    int h_scroll_offset, int total_scroll_distance,
     int headsign_clipping_start_override, int headsign_clipping_end_override
 ) {
     if (!no_draw) {
@@ -594,42 +595,24 @@ void TransitTracker::draw_trip(
     if (headsign_overflow_out) {
       *headsign_overflow_out = headsign_overflow;
     }
+    if (headsign_width_out) {
+      *headsign_width_out = headsign_actual_width;
+    }
 
     if (no_draw) {
       return;
     }
 
-    int scroll_offset = 0;
-    if (headsign_overflow > 0 && scroll_cycle_duration > 0) {
-      /// Note: The scroll may jump if headsign_clipping_end changes (e.g. due to the width of the arrival time changing).
-      /// This is probably not a big deal, since the display makes sudden changes anyway (e.g. when routes are updated)
-      /// and this happens relatively infrequently.
-
-      int scroll_time = headsign_overflow * 1000 / scroll_speed;
-      int scroll_cycle_time = uptime % scroll_cycle_duration;
-
-      // Scroll idle (left side - default)
-      if(scroll_cycle_time < idle_time_left) {
-        // scroll_offset = 0; do nothing
-      } else if (scroll_cycle_time < idle_time_left + scroll_time) {
-        // Scrolling left
-        int time_since_scroll_start = scroll_cycle_time - idle_time_left;
-        scroll_offset = time_since_scroll_start * scroll_speed / 1000;
-      } else if (scroll_cycle_time < idle_time_left + scroll_time + idle_time_right) {
-        // Scroll idle (right side)
-        scroll_offset = headsign_overflow;
-      } else if (scroll_cycle_time < idle_time_left + 2 * scroll_time + idle_time_right){
-        // Scrolling right
-        int time_since_scroll_start = scroll_cycle_time - (idle_time_left + scroll_time + idle_time_right);
-        scroll_offset = headsign_overflow - (time_since_scroll_start * scroll_speed / 1000);
-      } else {
-        // Waiting for other headsigns to finish scrolling
-        // scroll_offset = 0; do nothing
-      }
-    }
-
+    // Draw headsign with optional continuous marquee scroll
     this->display_->start_clipping(headsign_clipping_start, 0, headsign_clipping_end, this->display_->get_height());
-    this->display_->print(headsign_clipping_start - scroll_offset, y_offset, this->font_, trip.headsign.c_str());
+    if (headsign_overflow > 0 && h_scroll_offset >= 0 && total_scroll_distance > 0) {
+      // Continuous marquee: draw text and its wrapping copy
+      int x = headsign_clipping_start - h_scroll_offset;
+      this->display_->print(x, y_offset, this->font_, trip.headsign.c_str());
+      this->display_->print(x + total_scroll_distance, y_offset, this->font_, trip.headsign.c_str());
+    } else {
+      this->display_->print(headsign_clipping_start, y_offset, this->font_, trip.headsign.c_str());
+    }
     this->display_->end_clipping();
 }
 
@@ -751,41 +734,107 @@ void HOT TransitTracker::draw_schedule() {
   bool paging_active = this->scroll_routes_ && total_visible > page_size;
 
   if (paging_active) {
-    // In rotate mode: total_pages = total_visible - page_size + 1 (slide by 1)
-    // In full-page mode: total_pages = ceil(total_visible / page_size)
     total_pages = this->paging_rotate_
       ? total_visible - page_size + 1
       : (total_visible + page_size - 1) / page_size;
 
-    current_page = (uptime / this->page_interval_) % total_pages;
-    start_index = this->paging_rotate_ ? current_page : current_page * page_size;
-    end_index = std::min(start_index + page_size, total_visible);
-  }
-
-  // Page scroll transition
-  bool in_page_scroll = false;
-  int old_start_index = 0, old_end_index = 0;
-  float scroll_progress = 0.0f; // 0.0 to 1.0, eased
-
-  if (paging_active && this->page_scroll_duration_ > 0) {
-    // Initialize tracking on first frame
-    if (this->last_page_index_ < 0) {
-      this->last_page_index_ = current_page;
+    // Initialize paging state on first frame
+    if (this->page_timer_start_ == 0) {
+      this->page_timer_start_ = uptime;
+      this->h_scroll_start_time_ = uptime;
+      this->current_page_index_ = 0;
+      this->page_change_pending_ = false;
+      this->h_scroll_cycles_at_pending_ = -1;
+      this->last_page_index_ = 0;
+      this->page_pause_start_ = uptime;
+      this->page_pause_is_pre_ = false;
     }
 
+    // Clamp page index if total_pages changed
+    if (this->current_page_index_ >= total_pages) {
+      this->current_page_index_ = 0;
+      this->page_timer_start_ = uptime;
+      this->h_scroll_start_time_ = uptime;
+      this->page_change_pending_ = false;
+      this->h_scroll_cycles_at_pending_ = -1;
+      this->page_pause_start_ = 0;
+      this->page_pause_is_pre_ = false;
+    }
+
+    current_page = this->current_page_index_;
+    start_index = this->paging_rotate_ ? current_page : current_page * page_size;
+    end_index = std::min(start_index + page_size, total_visible);
+  } else {
+    // Reset paging state when not active
+    this->page_timer_start_ = 0;
+    this->current_page_index_ = 0;
+    this->page_change_pending_ = false;
+    this->h_scroll_cycles_at_pending_ = -1;
+    this->h_scroll_start_time_ = 0;
+    this->last_page_index_ = -1;
+    this->page_scroll_start_ = 0;
+    this->page_pause_start_ = 0;
+    this->page_pause_is_pre_ = false;
+  }
+
+  // Helper: compute total continuous scroll distance for a range of trips.
+  // Returns the total pixel distance for one full marquee cycle, or 0 if no scrolling needed.
+  auto compute_scroll_distance = [&](int si, int ei) -> int {
+    if (!this->scroll_headsigns_) return 0;
+    int max_headsign_width = 0;
+    bool any_overflow = false;
+    for (int i = si; i < ei; i++) {
+      int overflow = 0;
+      int headsign_width = 0;
+      this->draw_trip(visible_trips[i], 0, nominal_font_height, uptime, rtc_now,
+                      true, &overflow, &headsign_width, -1, 0,
+                      uniform_clipping_start, uniform_clipping_end);
+      if (overflow > 0) any_overflow = true;
+      max_headsign_width = std::max(max_headsign_width, headsign_width);
+    }
+    if (any_overflow) {
+      return max_headsign_width + marquee_gap;
+    }
+    return 0;
+  };
+
+  // Compute horizontal scroll parameters for the current page
+  int total_scroll_distance = compute_scroll_distance(start_index, end_index);
+  int h_scroll_offset = -1;
+  int h_scroll_cycles = 0;
+  if (total_scroll_distance > 0) {
+    unsigned long elapsed = uptime - this->h_scroll_start_time_;
+    int total_px = (int)((unsigned long)elapsed * scroll_speed / 1000);
+    h_scroll_offset = total_px % total_scroll_distance;
+    h_scroll_cycles = total_px / total_scroll_distance;
+  }
+
+  // Page scroll transition handling
+  bool in_page_scroll = false;
+  int old_start_index = 0, old_end_index = 0;
+  float scroll_progress = 0.0f;
+
+  if (paging_active) {
     // Handle active scroll transition
-    if (this->page_scroll_start_ > 0) {
-      // Cancel transition if old page no longer valid
+    if (this->page_scroll_duration_ > 0 && this->page_scroll_start_ > 0) {
       if (this->scroll_from_page_ >= total_pages) {
+        // Old page no longer valid - cancel transition
         this->page_scroll_start_ = 0;
       } else {
         unsigned long elapsed = uptime - this->page_scroll_start_;
         if (elapsed >= (unsigned long)this->page_scroll_duration_) {
+          // Transition complete - begin post-scroll pause
           this->page_scroll_start_ = 0;
+          this->page_pause_start_ = uptime;
+          this->page_pause_is_pre_ = false;
+          total_scroll_distance = compute_scroll_distance(start_index, end_index);
+          h_scroll_offset = 0;
+          h_scroll_cycles = 0;
         } else {
           float t = (float)elapsed / (float)this->page_scroll_duration_;
           scroll_progress = t * t * (3.0f - 2.0f * t); // smoothstep ease-in-out
           in_page_scroll = true;
+          h_scroll_offset = 0; // Freeze horizontal scroll during transition
 
           old_start_index = this->paging_rotate_ ? this->scroll_from_page_ : this->scroll_from_page_ * page_size;
           old_end_index = std::min(old_start_index + page_size, total_visible);
@@ -793,52 +842,88 @@ void HOT TransitTracker::draw_schedule() {
       }
     }
 
-    // Detect page change (only when not already transitioning)
-    if (!in_page_scroll && current_page != this->last_page_index_) {
-      this->scroll_from_page_ = this->last_page_index_;
-      this->page_scroll_start_ = uptime;
-      this->last_page_index_ = current_page;
+    // Handle pause (pre-scroll or post-scroll)
+    if (!in_page_scroll && this->page_pause_start_ > 0) {
+      unsigned long pause_elapsed = uptime - this->page_pause_start_;
+      if (pause_elapsed >= (unsigned long)this->page_pause_duration_) {
+        this->page_pause_start_ = 0;
+        if (this->page_pause_is_pre_) {
+          // Pre-scroll pause complete - begin page transition
+          this->scroll_from_page_ = this->current_page_index_;
+          this->current_page_index_ = (this->current_page_index_ + 1) % total_pages;
+          this->last_page_index_ = this->current_page_index_;
 
-      in_page_scroll = true;
-      scroll_progress = 0.0f;
+          current_page = this->current_page_index_;
+          start_index = this->paging_rotate_ ? current_page : current_page * page_size;
+          end_index = std::min(start_index + page_size, total_visible);
 
-      old_start_index = this->paging_rotate_ ? this->scroll_from_page_ : this->scroll_from_page_ * page_size;
-      old_end_index = std::min(old_start_index + page_size, total_visible);
+          old_start_index = this->paging_rotate_ ? this->scroll_from_page_ : this->scroll_from_page_ * page_size;
+          old_end_index = std::min(old_start_index + page_size, total_visible);
+
+          if (this->page_scroll_duration_ > 0) {
+            this->page_scroll_start_ = uptime;
+            in_page_scroll = true;
+            scroll_progress = 0.0f;
+          } else {
+            // Instant page change - begin post-scroll pause
+            this->page_pause_start_ = uptime;
+            this->page_pause_is_pre_ = false;
+            total_scroll_distance = compute_scroll_distance(start_index, end_index);
+          }
+          h_scroll_offset = 0;
+          h_scroll_cycles = 0;
+        } else {
+          // Post-scroll pause complete - begin horizontal scrolling
+          this->h_scroll_start_time_ = uptime;
+          this->page_timer_start_ = uptime;
+          h_scroll_offset = 0;
+          h_scroll_cycles = 0;
+        }
+      } else {
+        // Still pausing - freeze horizontal scroll at 0
+        h_scroll_offset = 0;
+      }
     }
-  } else {
-    // Reset scroll state when paging is inactive or duration is 0
-    this->last_page_index_ = paging_active ? current_page : -1;
-    this->page_scroll_start_ = 0;
+
+    // Check if page change should be triggered
+    if (!in_page_scroll && this->page_scroll_start_ == 0 && this->page_pause_start_ == 0) {
+      // Check if page interval has elapsed
+      if (!this->page_change_pending_ &&
+          uptime - this->page_timer_start_ >= (unsigned long)this->page_interval_) {
+        this->page_change_pending_ = true;
+        this->h_scroll_cycles_at_pending_ = h_scroll_cycles;
+      }
+
+      // Check if conditions are met to trigger page change
+      if (this->page_change_pending_) {
+        bool can_change = (total_scroll_distance == 0) ||
+                          (h_scroll_cycles > this->h_scroll_cycles_at_pending_);
+
+        if (can_change) {
+          // Enter pre-scroll pause before page transition
+          h_scroll_offset = 0;
+          this->page_change_pending_ = false;
+          this->h_scroll_cycles_at_pending_ = -1;
+          this->page_pause_start_ = uptime;
+          this->page_pause_is_pre_ = true;
+        }
+      }
+    }
   }
 
-  // Helper: compute headsign scroll cycle duration for a range of trips
-  auto compute_headsign_scroll = [&](int si, int ei) -> int {
-    if (!this->scroll_headsigns_) return 0;
-    int largest_overflow = 0;
-    for (int i = si; i < ei; i++) {
-      int overflow;
-      this->draw_trip(visible_trips[i], 0, nominal_font_height, uptime, rtc_now, true, &overflow, 0, uniform_clipping_start, uniform_clipping_end);
-      largest_overflow = max(largest_overflow, overflow);
-    }
-    if (largest_overflow > 0) {
-      int scroll_time = largest_overflow * 1000 / scroll_speed;
-      return idle_time_left + idle_time_right + 2 * scroll_time;
-    }
-    return 0;
-  };
-
   // Helper: draw a page of trips at a given vertical base offset
-  auto draw_page = [&](int si, int ei, int y_base) {
+  auto draw_page = [&](int si, int ei, int y_base, int scroll_dist, int scroll_off) {
     if (si < 0 || si >= ei || ei > total_visible) return;
 
-    int scroll_cycle_duration = compute_headsign_scroll(si, ei);
     int display_count = ei - si;
     int max_trips_height = (display_count * this->font_->get_ascender()) + ((display_count - 1) * this->font_->get_descender());
     int y_offset = y_base + (this->display_->get_height() % max_trips_height) / 2;
 
     for (int i = si; i < ei; i++) {
       const Trip &trip = visible_trips[i];
-      this->draw_trip(trip, y_offset, nominal_font_height, uptime, rtc_now, false, nullptr, scroll_cycle_duration, uniform_clipping_start, uniform_clipping_end);
+      this->draw_trip(trip, y_offset, nominal_font_height, uptime, rtc_now,
+                      false, nullptr, nullptr, scroll_off, scroll_dist,
+                      uniform_clipping_start, uniform_clipping_end);
       y_offset += nominal_font_height;
     }
   };
@@ -847,13 +932,13 @@ void HOT TransitTracker::draw_schedule() {
     // Single-step rotate: adjacent pages in rotate mode share all but one trip,
     // so we scroll the combined range up by one line height (conveyor belt effect).
     bool single_line = this->paging_rotate_ &&
-                       this->scroll_from_page_ + 1 == this->last_page_index_;
+                       this->scroll_from_page_ + 1 == this->current_page_index_;
 
     if (single_line) {
       int combined_start = old_start_index;
       int combined_end = end_index;
       int pixel_shift = (int)(scroll_progress * nominal_font_height);
-      int scroll_cycle_duration = compute_headsign_scroll(combined_start, combined_end);
+      int combined_scroll_dist = compute_scroll_distance(combined_start, combined_end);
 
       // Centering based on page_size (same for old and new page)
       int max_trips_height = (page_size * this->font_->get_ascender()) + ((page_size - 1) * this->font_->get_descender());
@@ -861,17 +946,21 @@ void HOT TransitTracker::draw_schedule() {
 
       for (int i = combined_start; i < combined_end; i++) {
         int y_pos = y_center + (i - combined_start) * nominal_font_height - pixel_shift;
-        this->draw_trip(visible_trips[i], y_pos, nominal_font_height, uptime, rtc_now, false, nullptr, scroll_cycle_duration, uniform_clipping_start, uniform_clipping_end);
+        this->draw_trip(visible_trips[i], y_pos, nominal_font_height, uptime, rtc_now,
+                        false, nullptr, nullptr, 0, combined_scroll_dist,
+                        uniform_clipping_start, uniform_clipping_end);
       }
     } else {
       // Full page scroll: old page exits upward, new page enters from below
       int dh = this->display_->get_height();
       int pixel_shift = (int)(scroll_progress * dh);
-      draw_page(old_start_index, old_end_index, -pixel_shift);
-      draw_page(start_index, end_index, dh - pixel_shift);
+      int old_scroll_dist = compute_scroll_distance(old_start_index, old_end_index);
+      draw_page(old_start_index, old_end_index, -pixel_shift, old_scroll_dist, 0);
+      draw_page(start_index, end_index, dh - pixel_shift, total_scroll_distance, 0);
     }
   } else {
-    draw_page(start_index, end_index, 0);
+    int effective_offset = (h_scroll_offset >= 0) ? h_scroll_offset : 0;
+    draw_page(start_index, end_index, 0, total_scroll_distance, effective_offset);
   }
 
   this->schedule_state_.mutex.unlock();
@@ -880,6 +969,7 @@ void HOT TransitTracker::draw_schedule() {
 void TransitTracker::set_scroll_routes(bool v) {
   if (this->scroll_routes_ != v) {
     this->scroll_routes_ = v;
+    this->page_timer_start_ = 0; // Reset paging state
     if (this->ws_client_.available()) {
       this->reconnect();
     }

@@ -60,6 +60,7 @@ class TransitTracker : public Component {
     void set_scroll_routes(bool v);
     void set_page_interval(int seconds) { page_interval_ = seconds * 1000; }
     void set_page_scroll_duration(float seconds) { page_scroll_duration_ = (int)(seconds * 1000); }
+    void set_page_pause_duration(int seconds) { page_pause_duration_ = seconds * 1000; }
     void set_paging_style_rotate(bool v) { paging_rotate_ = v; }
 
     void set_unit_display(UnitDisplay unit_display) { this->localization_.set_unit_display(unit_display); }
@@ -88,13 +89,20 @@ class TransitTracker : public Component {
 
   protected:
     static constexpr int scroll_speed = 10; // pixels/second
-    static constexpr int idle_time_left = 5000;
-    static constexpr int idle_time_right = 1000;
+    static constexpr int marquee_gap = 20; // pixels between repetitions in continuous scroll
     int page_interval_ = 5000; // ms per page when scroll_routes is on
     int page_scroll_duration_ = 500; // ms for page scroll transition
     int last_page_index_ = -1;
     int scroll_from_page_ = -1;
     unsigned long page_scroll_start_ = 0;
+    int page_pause_duration_ = 1000;       // ms to pause after page scroll before h-scroll resumes
+    unsigned long h_scroll_start_time_ = 0; // when horizontal scrolling began for current page
+    unsigned long page_timer_start_ = 0;    // when current page interval timer started
+    unsigned long page_pause_start_ = 0;    // when pause began (0 = not pausing)
+    bool page_pause_is_pre_ = false;        // true = pre-scroll pause, false = post-scroll pause
+    bool page_change_pending_ = false;      // waiting for scroll to return to position 0
+    int current_page_index_ = 0;            // explicitly tracked page index
+    int h_scroll_cycles_at_pending_ = -1;   // scroll cycles completed when pending was set
 
     std::string from_now_(time_t unix_timestamp, uint rtc_now) const;
     void draw_text_centered_(const char *text, Color color);
@@ -102,7 +110,8 @@ class TransitTracker : public Component {
 
     void draw_trip(
       const Trip &trip, int y_offset, int font_height, unsigned long uptime, uint rtc_now,
-      bool no_draw = false, int *headsign_overflow_out = nullptr, int scroll_cycle_duration = 0,
+      bool no_draw = false, int *headsign_overflow_out = nullptr, int *headsign_width_out = nullptr,
+      int h_scroll_offset = -1, int total_scroll_distance = 0,
       int headsign_clipping_start_override = -1, int headsign_clipping_end_override = -1
     );
 
