@@ -61,8 +61,14 @@ void TransitTracker::loop() {
 
 #ifdef USE_MQTT
   // Publish pending MQTT routes when MQTT becomes connected
-  if (this->mqtt_routes_pending_ && mqtt::global_mqtt_client != nullptr && mqtt::global_mqtt_client->is_connected()) {
-    this->publish_mqtt_routes_();
+  if (mqtt::global_mqtt_client != nullptr && mqtt::global_mqtt_client->is_connected()) {
+    if (this->mqtt_routes_pending_) {
+      this->publish_mqtt_routes_();
+      this->publish_mqtt_route_colors_();
+    }
+    if (this->mqtt_divider_color_pending_) {
+      this->publish_mqtt_divider_color_();
+    }
   }
 #endif
 
@@ -146,6 +152,12 @@ void TransitTracker::on_ws_message_(websockets::WebsocketsMessage message) {
         route_color = Color(std::stoul(trip["routeColor"].as<std::string>(), nullptr, 16));
       }
 
+      // Apply MQTT color override if present (takes highest priority)
+      auto color_override = this->route_color_overrides_.find(route_id);
+      if (color_override != this->route_color_overrides_.end()) {
+        route_color = color_override->second;
+      }
+
       std::string stop_id;
       if (!trip["stopId"].isNull()) {
         stop_id = trip["stopId"].as<std::string>();
@@ -180,6 +192,7 @@ void TransitTracker::on_ws_message_(websockets::WebsocketsMessage message) {
 #ifdef USE_MQTT
     // Flag routes for MQTT discovery (will publish in loop or on connect)
     this->mqtt_routes_pending_ = true;
+    this->mqtt_divider_color_pending_ = true;
 #endif
 
     return true;
@@ -375,6 +388,31 @@ void TransitTracker::set_realtime_color(const Color &color) {
   );
 }
 
+void TransitTracker::set_divider_color_from_text(const std::string &text) {
+  if (text.empty()) return;
+  // Parse "R,G,B" format
+  int r = 255, g = 0, b = 0;
+  if (sscanf(text.c_str(), "%d,%d,%d", &r, &g, &b) == 3) {
+    this->divider_color_ = Color(r, g, b);
+  }
+}
+
+void TransitTracker::set_route_color_overrides_from_text(const std::string &text) {
+  this->route_color_overrides_.clear();
+  if (text.empty()) return;
+  // Format: "route_id:R,G,B;route_id:R,G,B;..."
+  for (const auto &entry : split(text, ';')) {
+    auto colon_pos = entry.find(':');
+    if (colon_pos == std::string::npos) continue;
+    std::string route_id = entry.substr(0, colon_pos);
+    std::string rgb_str = entry.substr(colon_pos + 1);
+    int r, g, b;
+    if (sscanf(rgb_str.c_str(), "%d,%d,%d", &r, &g, &b) == 3) {
+      this->route_color_overrides_[route_id] = Color(r, g, b);
+    }
+  }
+}
+
 #ifdef USE_MQTT
 
 std::string TransitTracker::slugify_(const std::string &input) {
@@ -544,6 +582,250 @@ void TransitTracker::persist_pinned_routes_() {
 #endif
 }
 
+void TransitTracker::persist_divider_color_() {
+  char buf[16];
+  snprintf(buf, sizeof(buf), "%d,%d,%d", this->divider_color_.r, this->divider_color_.g, this->divider_color_.b);
+  std::string color_str(buf);
+
+#ifdef USE_TEXT
+  if (this->divider_color_text_ != nullptr) {
+    auto call = this->divider_color_text_->make_call();
+    call.set_value(color_str);
+    call.perform();
+  }
+#endif
+}
+
+void TransitTracker::publish_mqtt_divider_color_() {
+  if (mqtt::global_mqtt_client == nullptr || !mqtt::global_mqtt_client->is_connected()) {
+    return;
+  }
+
+  this->mqtt_divider_color_pending_ = false;
+
+  std::string node = App.get_name();
+  std::string topic_prefix = mqtt::global_mqtt_client->get_topic_prefix();
+
+  std::string object_id = node + "_divider_color";
+  std::string state_topic = topic_prefix + "/divider_color/state";
+  std::string command_topic = topic_prefix + "/divider_color/set";
+
+  // Build MQTT Light discovery JSON (RGB only, no brightness)
+  std::string discovery_topic = "homeassistant/light/" + object_id + "/config";
+  auto payload = json::build_json([&](JsonObject root) {
+    root["name"] = "Pinned Line Color";
+    root["unique_id"] = object_id;
+    root["default_entity_id"] = "light." + object_id;
+    root["schema"] = "json";
+    root["state_topic"] = state_topic;
+    root["command_topic"] = command_topic;
+    root["icon"] = "mdi:line-scan";
+    root["brightness"] = false;
+
+    auto color_modes = root.createNestedArray("supported_color_modes");
+    color_modes.add("rgb");
+
+    const auto &avail = mqtt::global_mqtt_client->get_availability();
+    if (!avail.topic.empty()) {
+      root["availability_topic"] = avail.topic;
+      root["payload_available"] = avail.payload_available;
+      root["payload_not_available"] = avail.payload_not_available;
+    }
+
+    auto device = root.createNestedObject("device");
+    auto ids = device.createNestedArray("identifiers");
+    ids.add(node);
+    device["name"] = App.get_friendly_name().empty() ? node : App.get_friendly_name();
+  });
+
+  mqtt::global_mqtt_client->publish(discovery_topic, payload, 0, true);
+
+  // Publish current state
+  auto state_payload = json::build_json([&](JsonObject root) {
+    root["state"] = "ON";
+    auto color = root.createNestedObject("color");
+    color["r"] = this->divider_color_.r;
+    color["g"] = this->divider_color_.g;
+    color["b"] = this->divider_color_.b;
+    root["color_mode"] = "rgb";
+  });
+  mqtt::global_mqtt_client->publish(state_topic, state_payload, 0, true);
+
+  // Subscribe to command topic
+  if (!this->mqtt_divider_color_subscribed_) {
+    this->mqtt_divider_color_subscribed_ = true;
+    mqtt::global_mqtt_client->subscribe(
+      command_topic,
+      [this, state_topic](const std::string &topic, const std::string &cmd_payload) {
+        // Parse JSON command: {"state":"ON","color":{"r":255,"g":0,"b":0}}
+        bool parsed = json::parse_json(cmd_payload, [this](JsonObject root) -> bool {
+          if (root.containsKey("color")) {
+            JsonObject color = root["color"];
+            uint8_t r = color["r"] | 255;
+            uint8_t g = color["g"] | 0;
+            uint8_t b = color["b"] | 0;
+            this->divider_color_ = Color(r, g, b);
+          }
+          return true;
+        });
+
+        if (parsed) {
+          // Publish updated state back
+          auto new_state = json::build_json([this](JsonObject root) {
+            root["state"] = "ON";
+            auto color = root.createNestedObject("color");
+            color["r"] = this->divider_color_.r;
+            color["g"] = this->divider_color_.g;
+            color["b"] = this->divider_color_.b;
+            root["color_mode"] = "rgb";
+          });
+          mqtt::global_mqtt_client->publish(state_topic, new_state, 0, true);
+          this->persist_divider_color_();
+        }
+      },
+      0
+    );
+  }
+}
+
+void TransitTracker::persist_route_color_overrides_() {
+  std::string result;
+  for (const auto &entry : this->route_color_overrides_) {
+    if (!result.empty()) result += ";";
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s:%d,%d,%d",
+             entry.first.c_str(), entry.second.r, entry.second.g, entry.second.b);
+    result += buf;
+  }
+
+#ifdef USE_TEXT
+  if (this->route_color_overrides_text_ != nullptr) {
+    auto call = this->route_color_overrides_text_->make_call();
+    call.set_value(result);
+    call.perform();
+  }
+#endif
+}
+
+void TransitTracker::publish_mqtt_route_colors_() {
+  if (mqtt::global_mqtt_client == nullptr || !mqtt::global_mqtt_client->is_connected()) {
+    return;
+  }
+
+  std::string node = App.get_name();
+  std::string topic_prefix = mqtt::global_mqtt_client->get_topic_prefix();
+
+  std::set<std::string> seen_route_ids;
+  for (const auto &t : this->schedule_state_.trips) {
+    if (seen_route_ids.count(t.route_id)) continue;
+    seen_route_ids.insert(t.route_id);
+
+    std::string slug = slugify_(t.route_id);
+    std::string object_id = node + "_route_color_" + slug;
+    std::string state_topic = topic_prefix + "/route_color/" + slug + "/state";
+    std::string command_topic = topic_prefix + "/route_color/" + slug + "/set";
+
+    // Use route_name for the friendly name
+    std::string friendly_name = t.route_name + " Color";
+
+    // Determine current color for this route
+    Color current_color = t.route_color;
+
+    // Build MQTT Light discovery JSON (RGB only, no brightness)
+    std::string discovery_topic = "homeassistant/light/" + object_id + "/config";
+    auto payload = json::build_json([&](JsonObject root) {
+      root["name"] = friendly_name;
+      root["unique_id"] = object_id;
+      root["default_entity_id"] = "light." + object_id;
+      root["schema"] = "json";
+      root["state_topic"] = state_topic;
+      root["command_topic"] = command_topic;
+      root["icon"] = "mdi:palette";
+      root["brightness"] = false;
+
+      auto color_modes = root.createNestedArray("supported_color_modes");
+      color_modes.add("rgb");
+
+      const auto &avail = mqtt::global_mqtt_client->get_availability();
+      if (!avail.topic.empty()) {
+        root["availability_topic"] = avail.topic;
+        root["payload_available"] = avail.payload_available;
+        root["payload_not_available"] = avail.payload_not_available;
+      }
+
+      auto device = root.createNestedObject("device");
+      auto ids = device.createNestedArray("identifiers");
+      ids.add(node);
+      device["name"] = App.get_friendly_name().empty() ? node : App.get_friendly_name();
+    });
+
+    mqtt::global_mqtt_client->publish(discovery_topic, payload, 0, true);
+
+    // Publish current color state
+    auto state_payload = json::build_json([&](JsonObject root) {
+      root["state"] = "ON";
+      auto color = root.createNestedObject("color");
+      color["r"] = current_color.r;
+      color["g"] = current_color.g;
+      color["b"] = current_color.b;
+      root["color_mode"] = "rgb";
+    });
+    mqtt::global_mqtt_client->publish(state_topic, state_payload, 0, true);
+
+    // Subscribe to command topic if not already
+    if (this->mqtt_subscribed_route_colors_.find(t.route_id) == this->mqtt_subscribed_route_colors_.end()) {
+      this->mqtt_subscribed_route_colors_.insert(t.route_id);
+      std::string captured_route_id = t.route_id;
+      std::string captured_state_topic = state_topic;
+      mqtt::global_mqtt_client->subscribe(
+        command_topic,
+        [this, captured_route_id, captured_state_topic](const std::string &topic, const std::string &cmd_payload) {
+          bool parsed = json::parse_json(cmd_payload, [this, &captured_route_id](JsonObject root) -> bool {
+            if (root.containsKey("color")) {
+              JsonObject color = root["color"];
+              uint8_t r = color["r"] | 255;
+              uint8_t g = color["g"] | 0;
+              uint8_t b = color["b"] | 0;
+              Color new_color(r, g, b);
+
+              // Store the override
+              this->route_color_overrides_[captured_route_id] = new_color;
+
+              // Update all current trips with this route_id
+              this->schedule_state_.mutex.lock();
+              for (auto &trip : this->schedule_state_.trips) {
+                if (trip.route_id == captured_route_id) {
+                  trip.route_color = new_color;
+                }
+              }
+              this->schedule_state_.mutex.unlock();
+            }
+            return true;
+          });
+
+          if (parsed) {
+            // Publish updated state back
+            auto override_it = this->route_color_overrides_.find(captured_route_id);
+            if (override_it != this->route_color_overrides_.end()) {
+              auto new_state = json::build_json([&](JsonObject root) {
+                root["state"] = "ON";
+                auto color = root.createNestedObject("color");
+                color["r"] = override_it->second.r;
+                color["g"] = override_it->second.g;
+                color["b"] = override_it->second.b;
+                root["color_mode"] = "rgb";
+              });
+              mqtt::global_mqtt_client->publish(captured_state_topic, new_state, 0, true);
+            }
+            this->persist_route_color_overrides_();
+          }
+        },
+        0
+      );
+    }
+  }
+}
+
 #endif  // USE_MQTT
 
 const uint8_t realtime_icon[6][6] = {
@@ -596,14 +878,47 @@ void TransitTracker::draw_trip(
     const Trip &trip, int y_offset, int font_height, unsigned long uptime, uint rtc_now,
     bool no_draw, int *headsign_overflow_out, int *headsign_width_out,
     int h_scroll_offset, int total_scroll_distance,
-    int headsign_clipping_start_override, int headsign_clipping_end_override
+    int headsign_clipping_start_override, int headsign_clipping_end_override,
+    bool is_pinned
 ) {
+    // Draw pin icon for pinned routes (5px wide + 1px margins = 7px total)
+    // Non-pinned routes also respect the inset so route names align
+    int pin_offset = 0;
+    if (this->show_pin_icon_ && !this->pinned_routes_.empty()) {
+      pin_offset = 7; // 1px margin + 5px icon + 1px margin
+      if (is_pinned && !no_draw) {
+        Color pin_color = Color(0xFF0000); // red
+        int px = 1; // 1px left margin; icon occupies columns px..px+4 (5 wide)
+        int py = y_offset + 1;
+        int cx = px + 2; // center column of the 5px-wide icon
+
+        // Row 0: 5px wide
+        for (int c = 0; c < 5; c++) this->display_->draw_pixel_at(px + c, py, pin_color);
+        py++;
+        // Row 1: 3px centered
+        for (int c = 1; c <= 3; c++) this->display_->draw_pixel_at(px + c, py, pin_color);
+        py++;
+        // Row 2: 3px centered
+        for (int c = 1; c <= 3; c++) this->display_->draw_pixel_at(px + c, py, pin_color);
+        py++;
+        // Row 3: 5px centered
+        for (int c = 0; c < 5; c++) this->display_->draw_pixel_at(px + c, py, pin_color);
+        py++;
+        // Remaining rows: 1px white vertical line centered
+        int bottom = y_offset + font_height - 3;
+        for (int r = py; r < bottom; r++) {
+          this->display_->draw_pixel_at(cx, r, Color(0xFFFFFF));
+        }
+      }
+    }
+
     if (!no_draw) {
-      this->display_->print(0, y_offset, this->font_, trip.route_color, display::TextAlign::TOP_LEFT, trip.route_name.c_str());
+      this->display_->print(pin_offset, y_offset, this->font_, trip.route_color, display::TextAlign::TOP_LEFT, trip.route_name.c_str());
     }
 
     int route_width, _;
     this->font_->measure(trip.route_name.c_str(), &route_width, &_, &_, &_);
+    route_width += pin_offset;
 
     auto time_display = this->localization_.fmt_duration_from_now(
       this->display_departure_times_ ? trip.departure_time : trip.arrival_time,
@@ -628,7 +943,7 @@ void TransitTracker::draw_trip(
 
       if(!no_draw) {
         int icon_bottom_right_x = this->display_->get_width() - time_width - 2;
-        int icon_bottom_right_y = y_offset + font_height - 6;
+        int icon_bottom_right_y = y_offset + font_height - 5;
 
         this->draw_realtime_icon_(icon_bottom_right_x, icon_bottom_right_y, uptime);
       }
@@ -784,6 +1099,10 @@ void HOT TransitTracker::draw_schedule() {
 
     if (this->uniform_headsign_start_) {
       uniform_clipping_start = max_route_width + 3;
+      // Account for pin icon width when any pinned trips are visible
+      if (effective_pinned_count > 0 && this->show_pin_icon_) {
+        uniform_clipping_start += 7; // 1px margin + 5px icon + 1px margin
+      }
     }
     if (this->uniform_headsign_end_) {
       uniform_clipping_end = this->display_->get_width() - max_time_width - 2;
@@ -836,9 +1155,10 @@ void HOT TransitTracker::draw_schedule() {
     if (this->split_scroll_start_ > 0) {
       unsigned long anim_elapsed = uptime - this->split_scroll_start_;
       if (anim_elapsed >= (unsigned long)this->page_scroll_duration_) {
+        // Animation complete — begin post-scroll pause
         this->split_scroll_start_ = 0;
-        this->pinned_h_scroll_start_ = uptime;
-        this->pinned_page_timer_ = uptime;
+        this->split_pause_start_ = uptime;
+        this->split_pause_is_pre_ = false;
         this->split_unpinned_page_timer_ = 0;
       } else {
         float t = (float)anim_elapsed / (float)this->page_scroll_duration_;
@@ -847,17 +1167,63 @@ void HOT TransitTracker::draw_schedule() {
       }
     }
 
+    // ---- Handle split pause (pre-scroll or post-scroll) ----
+    bool in_split_pause = false;
+    if (!in_split_scroll && this->split_pause_start_ > 0) {
+      unsigned long pause_elapsed = uptime - this->split_pause_start_;
+      if (pause_elapsed >= (unsigned long)this->page_pause_duration_) {
+        this->split_pause_start_ = 0;
+        if (this->split_pause_is_pre_) {
+          // Pre-scroll pause complete — advance pages and begin scroll animation
+          bool needs_pinned_paging_now = (pinned_pool_size > pinned_rows);
+          bool needs_unpinned_paging_now = (unpinned_pool_size > unpinned_rows && this->scroll_routes_);
+
+          this->split_old_pinned_page_ = this->pinned_page_index_;
+          this->split_old_unpinned_page_ = this->split_unpinned_page_index_;
+
+          if (needs_pinned_paging_now)
+            this->pinned_page_index_ = (this->pinned_page_index_ + 1) % pinned_pages;
+          if (needs_unpinned_paging_now)
+            this->split_unpinned_page_index_ = (this->split_unpinned_page_index_ + 1) % unpinned_pages;
+
+          pinned_si = needs_pinned_paging_now ? this->pinned_page_index_ : 0;
+          pinned_ei = std::min(pinned_si + pinned_rows, pinned_pool_size);
+          unpinned_si = needs_unpinned_paging_now ? this->split_unpinned_page_index_ : 0;
+          unpinned_ei = std::min(unpinned_si + unpinned_rows, unpinned_pool_size);
+
+          if (this->page_scroll_duration_ > 0) {
+            this->split_scroll_start_ = uptime;
+            in_split_scroll = true;
+            split_scroll_progress = 0.0f;
+          } else {
+            // Instant page change — begin post-scroll pause
+            this->split_pause_start_ = uptime;
+            this->split_pause_is_pre_ = false;
+            in_split_pause = true;
+          }
+          this->split_unpinned_page_timer_ = 0;
+        } else {
+          // Post-scroll pause complete — resume horizontal scrolling
+          this->pinned_h_scroll_start_ = uptime;
+          this->pinned_page_timer_ = uptime;
+        }
+      } else {
+        // Still pausing — freeze horizontal scroll
+        in_split_pause = true;
+      }
+    }
+
     int shared_scroll_dist = 0;
     int shared_h_offset = 0;
     int shared_h_cycles = 0;
-    if (!in_split_scroll && this->scroll_headsigns_) {
+    if (!in_split_scroll && !in_split_pause && this->scroll_headsigns_) {
       int max_hw = 0;
       bool any_ov = false;
       for (int i = pinned_si; i < pinned_ei; i++) {
         int ov = 0, hw = 0;
         this->draw_trip(pinned_pool[i], 0, nominal_font_height, uptime, rtc_now,
                         true, &ov, &hw, -1, 0,
-                        uniform_clipping_start, uniform_clipping_end);
+                        uniform_clipping_start, uniform_clipping_end, true);
         if (ov > 0) any_ov = true;
         max_hw = std::max(max_hw, hw);
       }
@@ -865,7 +1231,7 @@ void HOT TransitTracker::draw_schedule() {
         int ov = 0, hw = 0;
         this->draw_trip(unpinned_pool[i], 0, nominal_font_height, uptime, rtc_now,
                         true, &ov, &hw, -1, 0,
-                        uniform_clipping_start, uniform_clipping_end);
+                        uniform_clipping_start, uniform_clipping_end, false);
         if (ov > 0) any_ov = true;
         max_hw = std::max(max_hw, hw);
       }
@@ -878,12 +1244,12 @@ void HOT TransitTracker::draw_schedule() {
       }
     }
 
-    // ---- Synchronized paging (only when not in scroll animation) ----
+    // ---- Synchronized paging (only when not in scroll animation or pause) ----
     bool needs_pinned_paging = (pinned_pool_size > pinned_rows);
     bool needs_unpinned_paging = (unpinned_pool_size > unpinned_rows && this->scroll_routes_);
     bool needs_any_paging = needs_pinned_paging || needs_unpinned_paging;
 
-    if (!in_split_scroll && needs_any_paging) {
+    if (!in_split_scroll && !in_split_pause && needs_any_paging) {
       bool page_interval_elapsed = (uptime - this->pinned_page_timer_ >= (unsigned long)this->page_interval_);
       if (page_interval_elapsed && this->split_unpinned_page_timer_ == 0) {
         this->split_unpinned_page_timer_ = 1;
@@ -894,35 +1260,14 @@ void HOT TransitTracker::draw_schedule() {
         bool can_change = (shared_scroll_dist == 0) ||
                           (shared_h_cycles > (int)this->split_unpinned_h_scroll_start_);
         if (can_change) {
-          // Save old page indices before advancing
-          this->split_old_pinned_page_ = this->pinned_page_index_;
-          this->split_old_unpinned_page_ = this->split_unpinned_page_index_;
-
-          if (needs_pinned_paging)
-            this->pinned_page_index_ = (this->pinned_page_index_ + 1) % pinned_pages;
-          if (needs_unpinned_paging)
-            this->split_unpinned_page_index_ = (this->split_unpinned_page_index_ + 1) % unpinned_pages;
-
-          // Update slice indices to new page
-          pinned_si = needs_pinned_paging ? this->pinned_page_index_ : 0;
-          pinned_ei = std::min(pinned_si + pinned_rows, pinned_pool_size);
-          unpinned_si = needs_unpinned_paging ? this->split_unpinned_page_index_ : 0;
-          unpinned_ei = std::min(unpinned_si + unpinned_rows, unpinned_pool_size);
-
-          // Start scroll animation or change instantly
-          if (this->page_scroll_duration_ > 0) {
-            this->split_scroll_start_ = uptime;
-            in_split_scroll = true;
-            split_scroll_progress = 0.0f;
-          } else {
-            this->pinned_page_timer_ = uptime;
-            this->pinned_h_scroll_start_ = uptime;
-          }
-          this->split_unpinned_page_timer_ = 0;
+          // Enter pre-scroll pause before page transition
           shared_h_offset = 0;
+          this->split_unpinned_page_timer_ = 0;
+          this->split_pause_start_ = uptime;
+          this->split_pause_is_pre_ = true;
         }
       }
-    } else if (!in_split_scroll) {
+    } else if (!in_split_scroll && !in_split_pause) {
       this->pinned_page_index_ = 0;
       this->split_unpinned_page_index_ = 0;
       this->split_unpinned_page_timer_ = 0;
@@ -953,7 +1298,7 @@ void HOT TransitTracker::draw_schedule() {
             int y = (y_base - 1) + row * fh - pixel_shift_one;
             this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
                             false, nullptr, nullptr, 0, 0,
-                            uniform_clipping_start, uniform_clipping_end);
+                            uniform_clipping_start, uniform_clipping_end, true);
           }
         } else {
           // Full section scroll (wrap-around)
@@ -965,14 +1310,14 @@ void HOT TransitTracker::draw_schedule() {
             int y = (y_base - 1) + row * fh - ps_full;
             this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
                             false, nullptr, nullptr, 0, 0,
-                            uniform_clipping_start, uniform_clipping_end);
+                            uniform_clipping_start, uniform_clipping_end, true);
           }
           for (int i = pinned_si; i < pinned_ei; i++) {
             int row = i - pinned_si;
             int y = (y_base - 1) + section_h + row * fh - ps_full;
             this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
                             false, nullptr, nullptr, 0, 0,
-                            uniform_clipping_start, uniform_clipping_end);
+                            uniform_clipping_start, uniform_clipping_end, true);
           }
         }
       } else {
@@ -981,7 +1326,7 @@ void HOT TransitTracker::draw_schedule() {
           int y = (y_base - 1) + row * fh;
           this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
                           false, nullptr, nullptr, 0, 0,
-                          uniform_clipping_start, uniform_clipping_end);
+                          uniform_clipping_start, uniform_clipping_end, true);
         }
       }
       this->display_->end_clipping();
@@ -998,7 +1343,7 @@ void HOT TransitTracker::draw_schedule() {
             int y = unpinned_y_start + row * fh - pixel_shift_one;
             this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
                             false, nullptr, nullptr, 0, 0,
-                            uniform_clipping_start, uniform_clipping_end);
+                            uniform_clipping_start, uniform_clipping_end, false);
           }
         } else {
           int section_h = unpinned_rows * fh;
@@ -1009,14 +1354,14 @@ void HOT TransitTracker::draw_schedule() {
             int y = unpinned_y_start + row * fh - ps_full;
             this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
                             false, nullptr, nullptr, 0, 0,
-                            uniform_clipping_start, uniform_clipping_end);
+                            uniform_clipping_start, uniform_clipping_end, false);
           }
           for (int i = unpinned_si; i < unpinned_ei; i++) {
             int row = i - unpinned_si;
             int y = unpinned_y_start + section_h + row * fh - ps_full;
             this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
                             false, nullptr, nullptr, 0, 0,
-                            uniform_clipping_start, uniform_clipping_end);
+                            uniform_clipping_start, uniform_clipping_end, false);
           }
         }
       } else {
@@ -1025,13 +1370,13 @@ void HOT TransitTracker::draw_schedule() {
           int y = unpinned_y_start + row * fh;
           this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
                           false, nullptr, nullptr, 0, 0,
-                          uniform_clipping_start, uniform_clipping_end);
+                          uniform_clipping_start, uniform_clipping_end, false);
         }
       }
       this->display_->end_clipping();
 
       // ==== Divider (always visible, drawn last) ====
-      this->display_->horizontal_line(0, divider_y, dw, Color(0xFF0000));
+      this->display_->horizontal_line(0, divider_y, dw, this->divider_color_);
     } else {
       // No animation — draw normally with clipping for safety
       this->display_->start_clipping(0, 0, dw, divider_y);
@@ -1040,17 +1385,17 @@ void HOT TransitTracker::draw_schedule() {
         int y = y_base - 1 + row * fh;
         this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
                         false, nullptr, nullptr, shared_h_offset, shared_scroll_dist,
-                        uniform_clipping_start, uniform_clipping_end);
+                        uniform_clipping_start, uniform_clipping_end, true);
       }
       this->display_->end_clipping();
-      this->display_->horizontal_line(0, divider_y, dw, Color(0xFF0000));
+      this->display_->horizontal_line(0, divider_y, dw, this->divider_color_);
       this->display_->start_clipping(0, divider_y + 1, dw, dh);
       for (int i = unpinned_si; i < unpinned_ei; i++) {
         int row = i - unpinned_si;
         int y = unpinned_y_start + row * fh;
         this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
                         false, nullptr, nullptr, shared_h_offset, shared_scroll_dist,
-                        uniform_clipping_start, uniform_clipping_end);
+                        uniform_clipping_start, uniform_clipping_end, false);
       }
       this->display_->end_clipping();
     }
@@ -1069,6 +1414,8 @@ void HOT TransitTracker::draw_schedule() {
   this->split_scroll_start_ = 0;
   this->split_old_pinned_page_ = 0;
   this->split_old_unpinned_page_ = 0;
+  this->split_pause_start_ = 0;
+  this->split_pause_is_pre_ = false;
 
   // Determine which trips to display (paging)
   int total_visible = visible_trips.size();
@@ -1134,7 +1481,7 @@ void HOT TransitTracker::draw_schedule() {
       int headsign_width = 0;
       this->draw_trip(visible_trips[i], 0, nominal_font_height, uptime, rtc_now,
                       true, &overflow, &headsign_width, -1, 0,
-                      uniform_clipping_start, uniform_clipping_end);
+                      uniform_clipping_start, uniform_clipping_end, i < effective_pinned_count);
       if (overflow > 0) any_overflow = true;
       max_headsign_width = std::max(max_headsign_width, headsign_width);
     }
@@ -1280,13 +1627,13 @@ void HOT TransitTracker::draw_schedule() {
       const Trip &trip = visible_trips[i];
       this->draw_trip(trip, y, nominal_font_height, uptime, rtc_now,
                       false, nullptr, nullptr, scroll_off, scroll_dist,
-                      uniform_clipping_start, uniform_clipping_end);
+                      uniform_clipping_start, uniform_clipping_end, i < effective_pinned_count);
     }
 
-    // Draw red divider line between pinned and unpinned sections
+    // Draw divider line between pinned and unpinned sections
     if (has_divider) {
       int divider_y = (y_offset - 1) + pinned_in_slice * nominal_font_height - 1;
-      this->display_->horizontal_line(0, divider_y, this->display_->get_width(), Color(0xFF0000));
+      this->display_->horizontal_line(0, divider_y, this->display_->get_width(), this->divider_color_);
     }
   };
 
@@ -1320,14 +1667,14 @@ void HOT TransitTracker::draw_schedule() {
         }
         this->draw_trip(visible_trips[i], y_pos, nominal_font_height, uptime, rtc_now,
                         false, nullptr, nullptr, 0, combined_scroll_dist,
-                        uniform_clipping_start, uniform_clipping_end);
+                        uniform_clipping_start, uniform_clipping_end, i < effective_pinned_count);
       }
 
-      // Draw red divider during conveyor scroll
+      // Draw divider during conveyor scroll
       if (has_divider) {
         int divider_y = (y_center - 1) + pinned_in_combined * nominal_font_height - 1 - pixel_shift;
         if (divider_y >= 0 && divider_y < this->display_->get_height()) {
-          this->display_->horizontal_line(0, divider_y, this->display_->get_width(), Color(0xFF0000));
+          this->display_->horizontal_line(0, divider_y, this->display_->get_width(), this->divider_color_);
         }
       }
     } else {

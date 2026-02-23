@@ -58,6 +58,7 @@ class TransitTracker : public Component {
     void set_uniform_headsign_start(bool v) { uniform_headsign_start_ = v; }
     void set_uniform_headsign_end(bool v) { uniform_headsign_end_ = v; }
     void set_scroll_routes(bool v);
+    void set_show_pin_icon(bool v) { show_pin_icon_ = v; }
     void set_page_interval(int seconds) { page_interval_ = seconds * 1000; }
     void set_page_scroll_duration(float seconds) { page_scroll_duration_ = (int)(seconds * 1000); }
     void set_page_pause_duration(int seconds) { page_pause_duration_ = seconds * 1000; }
@@ -76,19 +77,28 @@ class TransitTracker : public Component {
     void set_pinned_routes_from_text(const std::string &text);
 
     void set_realtime_color(const Color &color);
+    void set_divider_color(const Color &color) { divider_color_ = color; }
+    void set_divider_color_from_text(const std::string &text);
+    void set_route_color_overrides_from_text(const std::string &text);
 
     void rebuild_route_stop_map_();
 
 #ifdef USE_TEXT
     void set_hidden_routes_text(text::Text *text) { hidden_routes_text_ = text; }
     void set_pinned_routes_text(text::Text *text) { pinned_routes_text_ = text; }
+    void set_divider_color_text(text::Text *text) { divider_color_text_ = text; }
+    void set_route_color_overrides_text(text::Text *text) { route_color_overrides_text_ = text; }
 #endif
 
 #ifdef USE_MQTT
     void publish_mqtt_routes_();
+    void publish_mqtt_divider_color_();
+    void publish_mqtt_route_colors_();
     void update_mqtt_route_state_(const std::string &composite_key, bool visible);
     void persist_hidden_routes_();
     void persist_pinned_routes_();
+    void persist_divider_color_();
+    void persist_route_color_overrides_();
     static std::string slugify_(const std::string &input);
 #endif
 
@@ -123,6 +133,8 @@ class TransitTracker : public Component {
     unsigned long split_scroll_start_{0};       // millis when conveyor animation began (0 = idle)
     int split_old_pinned_page_{0};              // pinned page index before animation
     int split_old_unpinned_page_{0};            // unpinned page index before animation
+    unsigned long split_pause_start_{0};        // when split pause began (0 = not pausing)
+    bool split_pause_is_pre_{false};            // true = pre-scroll pause, false = post-scroll pause
 
     std::string from_now_(time_t unix_timestamp, uint rtc_now) const;
     void draw_text_centered_(const char *text, Color color);
@@ -132,7 +144,8 @@ class TransitTracker : public Component {
       const Trip &trip, int y_offset, int font_height, unsigned long uptime, uint rtc_now,
       bool no_draw = false, int *headsign_overflow_out = nullptr, int *headsign_width_out = nullptr,
       int h_scroll_offset = -1, int total_scroll_distance = 0,
-      int headsign_clipping_start_override = -1, int headsign_clipping_end_override = -1
+      int headsign_clipping_start_override = -1, int headsign_clipping_end_override = -1,
+      bool is_pinned = false
     );
 
     Localization localization_{};
@@ -162,7 +175,9 @@ class TransitTracker : public Component {
     std::map<std::string, std::string> abbreviations_;
     Color default_route_color_ = Color(0x028e51);
     std::map<std::string, RouteStyle> route_styles_;
+    std::map<std::string, Color> route_color_overrides_;  // MQTT-set per-route color overrides
     bool scroll_headsigns_ = false;
+    bool show_pin_icon_ = true;
     bool uniform_headsign_start_ = false;
     bool uniform_headsign_end_ = false;
     bool scroll_routes_ = false;
@@ -176,15 +191,21 @@ class TransitTracker : public Component {
 #ifdef USE_TEXT
     text::Text *hidden_routes_text_{nullptr};
     text::Text *pinned_routes_text_{nullptr};
+    text::Text *divider_color_text_{nullptr};
+    text::Text *route_color_overrides_text_{nullptr};
 #endif
 
 #ifdef USE_MQTT
     std::set<std::string> mqtt_subscribed_routes_;
+    std::set<std::string> mqtt_subscribed_route_colors_;
     bool mqtt_routes_pending_{false};
+    bool mqtt_divider_color_pending_{false};
+    bool mqtt_divider_color_subscribed_{false};
 #endif
 
     Color realtime_color_ = Color(0x20FF00);
     Color realtime_color_dark_ = Color(0x00A700);
+    Color divider_color_ = Color(0xFF0000);
 };
 
 
