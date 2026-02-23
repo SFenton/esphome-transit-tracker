@@ -5,8 +5,13 @@ from esphome.components.display import Display
 from esphome.components.font import Font
 from esphome.components.time import RealTimeClock
 from esphome.components import color
-from esphome.components.text_sensor import TextSensor
 from esphome.const import CONF_ID, CONF_DISPLAY_ID, CONF_TIME_ID, CONF_SHOW_UNITS, __version__ as ESPHOME_VERSION
+
+try:
+    from esphome.components import text as text_comp
+    TextEntity = text_comp.Text
+except Exception:
+    TextEntity = None
 
 _MINIMUM_ESPHOME_VERSION = "2025.7.0"
 
@@ -36,7 +41,7 @@ CONF_REALTIME_COLOR = "realtime_color"
 CONF_TIME_DISPLAY = "time_display"
 CONF_LIST_MODE = "list_mode"
 CONF_SCROLL_HEADSIGNS = "scroll_headsigns"
-CONF_ROUTE_NAMES_SENSOR = "route_names_sensor"
+CONF_HIDDEN_ROUTES_TEXT = "hidden_routes_text"
 
 
 def validate_ws_url(value):
@@ -74,7 +79,7 @@ CONFIG_SCHEMA = cv.All(
                 "sequential", "nextPerRoute"
             ),
             cv.Optional(CONF_SCROLL_HEADSIGNS, default=False) : cv.boolean,
-            cv.Optional(CONF_ROUTE_NAMES_SENSOR): cv.use_id(TextSensor),
+            cv.Optional(CONF_HIDDEN_ROUTES_TEXT): cv.use_id(TextEntity) if TextEntity else cv.string,
             cv.Optional(CONF_STOPS, default=[]): cv.ensure_list(
                 cv.Schema(
                     {
@@ -143,9 +148,9 @@ async def to_code(config):
     cg.add(var.set_list_mode(config[CONF_LIST_MODE]))
     cg.add(var.set_scroll_headsigns(config[CONF_SCROLL_HEADSIGNS]))
 
-    if CONF_ROUTE_NAMES_SENSOR in config:
-        sensor = await cg.get_variable(config[CONF_ROUTE_NAMES_SENSOR])
-        cg.add(var.set_route_names_sensor(sensor))
+    if CONF_HIDDEN_ROUTES_TEXT in config and TextEntity is not None:
+        text_entity = await cg.get_variable(config[CONF_HIDDEN_ROUTES_TEXT])
+        cg.add(var.set_hidden_routes_text(text_entity))
 
     cg.add(var.set_limit(config[CONF_LIMIT]))
 

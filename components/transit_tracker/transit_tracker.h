@@ -8,7 +8,14 @@
 #include "esphome/components/display/display.h"
 #include "esphome/components/font/font.h"
 #include "esphome/components/time/real_time_clock.h"
-#include "esphome/components/text_sensor/text_sensor.h"
+
+#ifdef USE_MQTT
+#include "esphome/components/mqtt/mqtt_client.h"
+#endif
+
+#ifdef USE_TEXT
+#include "esphome/components/text/text.h"
+#endif
 
 #include "schedule_state.h"
 #include "localization.h"
@@ -40,12 +47,11 @@ class TransitTracker : public Component {
     void set_display(display::Display *display) { display_ = display; }
     void set_font(font::Font *font) { font_ = font; }
     void set_rtc(time::RealTimeClock *rtc) { rtc_ = rtc; }
-    void set_route_names_sensor(text_sensor::TextSensor *sensor) { route_names_sensor_ = sensor; }
 
     void set_base_url(const std::string &base_url) { base_url_ = base_url; }
     void set_feed_code(const std::string &feed_code) { feed_code_ = feed_code; }
     void set_display_departure_times(bool display_departure_times) { display_departure_times_ = display_departure_times; }
-    void set_schedule_string(const std::string &schedule_string) { schedule_string_ = schedule_string; }
+    void set_schedule_string(const std::string &schedule_string) { schedule_string_ = schedule_string; rebuild_route_stop_map_(); }
     void set_list_mode(const std::string &list_mode) { list_mode_ = list_mode; }
     void set_limit(int limit) { limit_ = limit; }
     void set_scroll_headsigns(bool scroll_headsigns) { scroll_headsigns_ = scroll_headsigns; }
@@ -65,6 +71,19 @@ class TransitTracker : public Component {
     void set_hidden_routes_from_text(const std::string &text);
 
     void set_realtime_color(const Color &color);
+
+    void rebuild_route_stop_map_();
+
+#ifdef USE_TEXT
+    void set_hidden_routes_text(text::Text *text) { hidden_routes_text_ = text; }
+#endif
+
+#ifdef USE_MQTT
+    void publish_mqtt_routes_();
+    void update_mqtt_route_state_(const std::string &composite_key, bool visible);
+    void persist_hidden_routes_();
+    static std::string slugify_(const std::string &input);
+#endif
 
   protected:
     static constexpr int scroll_speed = 10; // pixels/second
@@ -88,7 +107,6 @@ class TransitTracker : public Component {
     display::Display *display_;
     font::Font *font_;
     time::RealTimeClock *rtc_;
-    text_sensor::TextSensor *route_names_sensor_{nullptr};
 
     websockets::WebsocketsClient ws_client_{};
 
@@ -117,6 +135,16 @@ class TransitTracker : public Component {
     bool paging_rotate_ = false; // false = full page, true = single rotate
 
     std::set<std::string> hidden_routes_;
+    std::map<std::string, std::string> route_stop_map_;  // route_id -> stop_id (from schedule_string_)
+
+#ifdef USE_TEXT
+    text::Text *hidden_routes_text_{nullptr};
+#endif
+
+#ifdef USE_MQTT
+    std::set<std::string> mqtt_subscribed_routes_;
+    bool mqtt_routes_pending_{false};
+#endif
 
     Color realtime_color_ = Color(0x20FF00);
     Color realtime_color_dark_ = Color(0x00A700);

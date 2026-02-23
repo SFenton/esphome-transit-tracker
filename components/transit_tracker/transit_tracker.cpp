@@ -21,6 +21,9 @@ void TransitTracker::setup() {
     this->on_ws_event_(event, data);
   });
 
+  // Build the route_id -> stop_id lookup from schedule_string_
+  this->rebuild_route_stop_map_();
+
   this->connect_ws_();
 
   this->set_interval("check_stale_trips", 10000, [this]() {
@@ -53,6 +56,13 @@ void TransitTracker::setup() {
 
 void TransitTracker::loop() {
   this->ws_client_.poll();
+
+#ifdef USE_MQTT
+  // Publish pending MQTT routes when MQTT becomes connected
+  if (this->mqtt_routes_pending_ && mqtt::global_mqtt_client != nullptr && mqtt::global_mqtt_client->is_connected()) {
+    this->publish_mqtt_routes_();
+  }
+#endif
 
   if (this->last_heartbeat_ != 0 && millis() - this->last_heartbeat_ > 60000) {
     ESP_LOGW(TAG, "Heartbeat timeout, reconnecting");
@@ -134,11 +144,29 @@ void TransitTracker::on_ws_message_(websockets::WebsocketsMessage message) {
         route_color = Color(std::stoul(trip["routeColor"].as<std::string>(), nullptr, 16));
       }
 
+      std::string stop_id;
+      if (!trip["stopId"].isNull()) {
+        stop_id = trip["stopId"].as<std::string>();
+      } else {
+        // Fall back to schedule_string_ lookup
+        auto it = this->route_stop_map_.find(route_id);
+        if (it != this->route_stop_map_.end()) {
+          stop_id = it->second;
+        }
+      }
+
+      std::string stop_name;
+      if (!trip["stopName"].isNull()) {
+        stop_name = trip["stopName"].as<std::string>();
+      }
+
       this->schedule_state_.trips.push_back({
         .route_id = route_id,
         .route_name = route_name,
         .route_color = route_color,
         .headsign = headsign,
+        .stop_id = stop_id,
+        .stop_name = stop_name,
         .arrival_time = trip["arrivalTime"].as<time_t>(),
         .departure_time = trip["departureTime"].as<time_t>(),
         .is_realtime = trip["isRealtime"].as<bool>(),
@@ -147,19 +175,10 @@ void TransitTracker::on_ws_message_(websockets::WebsocketsMessage message) {
 
     this->schedule_state_.mutex.unlock();
 
-    // Publish route name mapping to text_sensor
-    if (this->route_names_sensor_ != nullptr) {
-      std::string route_names_str;
-      std::set<std::string> seen_routes;
-      for (const auto &t : this->schedule_state_.trips) {
-        if (seen_routes.find(t.route_id) == seen_routes.end()) {
-          if (!route_names_str.empty()) route_names_str += ";";
-          route_names_str += t.route_id + "=" + t.route_name + "|" + t.headsign;
-          seen_routes.insert(t.route_id);
-        }
-      }
-      this->route_names_sensor_->publish_state(route_names_str);
-    }
+#ifdef USE_MQTT
+    // Flag routes for MQTT discovery (will publish in loop or on connect)
+    this->mqtt_routes_pending_ = true;
+#endif
 
     return true;
   });
@@ -304,6 +323,30 @@ void TransitTracker::set_hidden_routes_from_text(const std::string &text) {
   }
 }
 
+void TransitTracker::rebuild_route_stop_map_() {
+  // Parse schedule_string_ to build route_id -> stop_id lookup.
+  // Format: route,stop_id,time_offset;route,stop_id,time_offset;...
+  // If a route appears at multiple different stops, we can't disambiguate
+  // from server data, so we leave it out (headsign still differentiates).
+  this->route_stop_map_.clear();
+  std::set<std::string> ambiguous_routes;
+  for (const auto &pair : split(this->schedule_string_, ';')) {
+    auto parts = split(pair, ',');
+    if (parts.size() >= 2) {
+      auto it = this->route_stop_map_.find(parts[0]);
+      if (it != this->route_stop_map_.end() && it->second != parts[1]) {
+        ambiguous_routes.insert(parts[0]);
+      } else {
+        this->route_stop_map_[parts[0]] = parts[1];
+      }
+    }
+  }
+  for (const auto &r : ambiguous_routes) {
+    this->route_stop_map_.erase(r);
+    ESP_LOGD(TAG, "Route %s appears at multiple stops, stop_id omitted from key", r.c_str());
+  }
+}
+
 void TransitTracker::draw_text_centered_(const char *text, Color color) {
   int display_center_x = this->display_->get_width() / 2;
   int display_center_y = this->display_->get_height() / 2;
@@ -318,6 +361,142 @@ void TransitTracker::set_realtime_color(const Color &color) {
     (color.b * 0.5)
   );
 }
+
+#ifdef USE_MQTT
+
+std::string TransitTracker::slugify_(const std::string &input) {
+  std::string slug = input;
+  for (auto &c : slug) {
+    if (c == ':' || c == ' ' || c == '|') c = '_';
+    else c = tolower(c);
+  }
+  return slug;
+}
+
+void TransitTracker::publish_mqtt_routes_() {
+  if (mqtt::global_mqtt_client == nullptr || !mqtt::global_mqtt_client->is_connected()) {
+    return;
+  }
+
+  this->mqtt_routes_pending_ = false;
+
+  std::string node = App.get_name();
+  std::string topic_prefix = mqtt::global_mqtt_client->get_topic_prefix();
+
+  std::set<std::string> seen;
+  for (const auto &t : this->schedule_state_.trips) {
+    std::string key = t.composite_key();
+    if (seen.count(key)) continue;
+    seen.insert(key);
+
+    std::string slug = slugify_(key);
+    std::string object_id = node + "_route_" + slug;
+    std::string state_topic = topic_prefix + "/route/" + slug + "/state";
+    std::string command_topic = topic_prefix + "/route/" + slug + "/set";
+
+    std::string friendly_name = t.route_name;
+    if (!t.headsign.empty()) {
+      friendly_name += " - " + t.headsign;
+    }
+    if (!t.stop_name.empty()) {
+      friendly_name += " - " + t.stop_name;
+    }
+
+    // Build discovery JSON
+    std::string discovery_topic = "homeassistant/switch/" + object_id + "/config";
+    auto payload = json::build_json([&](JsonObject root) {
+      root["name"] = friendly_name;
+      root["unique_id"] = object_id;
+      root["default_entity_id"] = "switch." + object_id;
+      root["state_topic"] = state_topic;
+      root["command_topic"] = command_topic;
+      root["payload_on"] = "ON";
+      root["payload_off"] = "OFF";
+      root["icon"] = "mdi:bus";
+
+      // Use the MQTT client's own availability info so topics match the birth/will messages
+      const auto &avail = mqtt::global_mqtt_client->get_availability();
+      if (!avail.topic.empty()) {
+        root["availability_topic"] = avail.topic;
+        root["payload_available"] = avail.payload_available;
+        root["payload_not_available"] = avail.payload_not_available;
+      }
+
+      auto device = root.createNestedObject("device");
+      auto ids = device.createNestedArray("identifiers");
+      ids.add(node);
+      device["name"] = App.get_friendly_name().empty() ? node : App.get_friendly_name();
+    });
+
+    mqtt::global_mqtt_client->publish(discovery_topic, payload, 0, true);
+    ESP_LOGD(TAG, "Published MQTT discovery for route: %s", friendly_name.c_str());
+
+    // Publish current state
+    bool visible = (this->hidden_routes_.find(key) == this->hidden_routes_.end());
+    mqtt::global_mqtt_client->publish(state_topic, std::string(visible ? "ON" : "OFF"), 0, true);
+
+    // Subscribe to command topic if not already
+    if (this->mqtt_subscribed_routes_.find(key) == this->mqtt_subscribed_routes_.end()) {
+      this->mqtt_subscribed_routes_.insert(key);
+      std::string captured_key = key;
+      std::string captured_state_topic = state_topic;
+      mqtt::global_mqtt_client->subscribe(
+        command_topic,
+        [this, captured_key, captured_state_topic](const std::string &topic, const std::string &payload) {
+          bool turn_on = (payload == "ON");
+
+          if (turn_on) {
+            this->hidden_routes_.erase(captured_key);
+          } else {
+            // Enforce at least one route visible
+            int visible_count = 0;
+            std::set<std::string> current_keys;
+            for (const auto &trip : this->schedule_state_.trips) {
+              std::string k = trip.composite_key();
+              if (current_keys.count(k)) continue;
+              current_keys.insert(k);
+              if (this->hidden_routes_.find(k) == this->hidden_routes_.end()) {
+                visible_count++;
+              }
+            }
+            if (visible_count <= 1) {
+              ESP_LOGW(TAG, "Cannot hide route %s — at least one must remain visible", captured_key.c_str());
+              // Re-publish ON state to reject the command
+              mqtt::global_mqtt_client->publish(captured_state_topic, std::string("ON"), 0, true);
+              return;
+            }
+            this->hidden_routes_.insert(captured_key);
+          }
+
+          mqtt::global_mqtt_client->publish(captured_state_topic, std::string(turn_on ? "ON" : "OFF"), 0, true);
+          ESP_LOGD(TAG, "Route %s set to %s via MQTT", captured_key.c_str(), turn_on ? "visible" : "hidden");
+
+          this->persist_hidden_routes_();
+        },
+        0
+      );
+    }
+  }
+}
+
+void TransitTracker::persist_hidden_routes_() {
+  std::string hidden_str;
+  for (const auto &k : this->hidden_routes_) {
+    if (!hidden_str.empty()) hidden_str += ";";
+    hidden_str += k;
+  }
+
+#ifdef USE_TEXT
+  if (this->hidden_routes_text_ != nullptr) {
+    auto call = this->hidden_routes_text_->make_call();
+    call.set_value(hidden_str);
+    call.perform();
+    ESP_LOGD(TAG, "Persisted hidden routes to text entity: %s", hidden_str.c_str());
+  }
+#endif
+}
+
+#endif  // USE_MQTT
 
 const uint8_t realtime_icon[6][6] = {
   {0, 0, 0, 3, 3, 3},
@@ -497,11 +676,11 @@ void HOT TransitTracker::draw_schedule() {
 
   this->schedule_state_.mutex.lock();
 
-  // Filter out hidden routes
+  // Filter out hidden routes (matched by composite key: routeId:headsign[:stopId])
   std::vector<Trip> visible_trips;
   if (!this->hidden_routes_.empty()) {
     for (const Trip &trip : this->schedule_state_.trips) {
-      if (this->hidden_routes_.find(trip.route_id) == this->hidden_routes_.end()) {
+      if (this->hidden_routes_.find(trip.composite_key()) == this->hidden_routes_.end()) {
         visible_trips.push_back(trip);
       }
     }
