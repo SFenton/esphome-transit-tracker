@@ -42,6 +42,7 @@ CONF_TIME_DISPLAY = "time_display"
 CONF_LIST_MODE = "list_mode"
 CONF_SCROLL_HEADSIGNS = "scroll_headsigns"
 CONF_HIDDEN_ROUTES_TEXT = "hidden_routes_text"
+CONF_PINNED_ROUTES_TEXT = "pinned_routes_text"
 
 
 def validate_ws_url(value):
@@ -80,6 +81,7 @@ CONFIG_SCHEMA = cv.All(
             ),
             cv.Optional(CONF_SCROLL_HEADSIGNS, default=False) : cv.boolean,
             cv.Optional(CONF_HIDDEN_ROUTES_TEXT): cv.use_id(TextEntity) if TextEntity else cv.string,
+            cv.Optional(CONF_PINNED_ROUTES_TEXT): cv.use_id(TextEntity) if TextEntity else cv.string,
             cv.Optional(CONF_STOPS, default=[]): cv.ensure_list(
                 cv.Schema(
                     {
@@ -151,6 +153,10 @@ async def to_code(config):
     if CONF_HIDDEN_ROUTES_TEXT in config and TextEntity is not None:
         text_entity = await cg.get_variable(config[CONF_HIDDEN_ROUTES_TEXT])
         cg.add(var.set_hidden_routes_text(text_entity))
+
+    if CONF_PINNED_ROUTES_TEXT in config and TextEntity is not None:
+        text_entity = await cg.get_variable(config[CONF_PINNED_ROUTES_TEXT])
+        cg.add(var.set_pinned_routes_text(text_entity))
 
     cg.add(var.set_limit(config[CONF_LIMIT]))
 

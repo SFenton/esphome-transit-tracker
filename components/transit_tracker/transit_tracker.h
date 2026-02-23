@@ -62,6 +62,8 @@ class TransitTracker : public Component {
     void set_page_scroll_duration(float seconds) { page_scroll_duration_ = (int)(seconds * 1000); }
     void set_page_pause_duration(int seconds) { page_pause_duration_ = seconds * 1000; }
     void set_paging_style_rotate(bool v) { paging_rotate_ = v; }
+    void set_pinned_rows_count(int count) { pinned_rows_count_ = std::max(1, std::min(count, limit_ - 1)); }
+    int get_pinned_rows_count() const { return pinned_rows_count_; }
 
     void set_unit_display(UnitDisplay unit_display) { this->localization_.set_unit_display(unit_display); }
     void add_abbreviation(const std::string &from, const std::string &to) { abbreviations_[from] = to; }
@@ -71,6 +73,7 @@ class TransitTracker : public Component {
     void set_abbreviations_from_text(const std::string &text);
     void set_route_styles_from_text(const std::string &text);
     void set_hidden_routes_from_text(const std::string &text);
+    void set_pinned_routes_from_text(const std::string &text);
 
     void set_realtime_color(const Color &color);
 
@@ -78,12 +81,14 @@ class TransitTracker : public Component {
 
 #ifdef USE_TEXT
     void set_hidden_routes_text(text::Text *text) { hidden_routes_text_ = text; }
+    void set_pinned_routes_text(text::Text *text) { pinned_routes_text_ = text; }
 #endif
 
 #ifdef USE_MQTT
     void publish_mqtt_routes_();
     void update_mqtt_route_state_(const std::string &composite_key, bool visible);
     void persist_hidden_routes_();
+    void persist_pinned_routes_();
     static std::string slugify_(const std::string &input);
 #endif
 
@@ -103,6 +108,21 @@ class TransitTracker : public Component {
     bool page_change_pending_ = false;      // waiting for scroll to return to position 0
     int current_page_index_ = 0;            // explicitly tracked page index
     int h_scroll_cycles_at_pending_ = -1;   // scroll cycles completed when pending was set
+
+    // Split layout paging state (pinned section)
+    int pinned_page_index_{0};
+    unsigned long pinned_page_timer_{0};
+    unsigned long pinned_h_scroll_start_{0};
+
+    // Split layout paging state (unpinned section)
+    int split_unpinned_page_index_{0};
+    unsigned long split_unpinned_page_timer_{0};
+    unsigned long split_unpinned_h_scroll_start_{0};
+
+    // Split layout scroll animation state
+    unsigned long split_scroll_start_{0};       // millis when conveyor animation began (0 = idle)
+    int split_old_pinned_page_{0};              // pinned page index before animation
+    int split_old_unpinned_page_{0};            // unpinned page index before animation
 
     std::string from_now_(time_t unix_timestamp, uint rtc_now) const;
     void draw_text_centered_(const char *text, Color color);
@@ -149,10 +169,13 @@ class TransitTracker : public Component {
     bool paging_rotate_ = false; // false = full page, true = single rotate
 
     std::set<std::string> hidden_routes_;
+    std::set<std::string> pinned_routes_;
+    int pinned_rows_count_{1};
     std::map<std::string, std::string> route_stop_map_;  // route_id -> stop_id (from schedule_string_)
 
 #ifdef USE_TEXT
     text::Text *hidden_routes_text_{nullptr};
+    text::Text *pinned_routes_text_{nullptr};
 #endif
 
 #ifdef USE_MQTT

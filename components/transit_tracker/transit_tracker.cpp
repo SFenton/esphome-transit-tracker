@@ -1,6 +1,8 @@
 #include "transit_tracker.h"
 #include "string_utils.h"
 
+#include <algorithm>
+
 #include "esphome/core/log.h"
 #include "esphome/core/application.h"
 #include "esphome/components/json/json_util.h"
@@ -323,6 +325,17 @@ void TransitTracker::set_hidden_routes_from_text(const std::string &text) {
   }
 }
 
+void TransitTracker::set_pinned_routes_from_text(const std::string &text) {
+  this->pinned_routes_.clear();
+  if (text.empty()) return;
+  for (const auto &route_id : split(text, ';')) {
+    if (!route_id.empty()) {
+      this->pinned_routes_.insert(route_id);
+      ESP_LOGD(TAG, "Pinning route: %s", route_id.c_str());
+    }
+  }
+}
+
 void TransitTracker::rebuild_route_stop_map_() {
   // Parse schedule_string_ to build route_id -> stop_id lookup.
   // Format: route,stop_id,time_offset;route,stop_id,time_offset;...
@@ -402,17 +415,20 @@ void TransitTracker::publish_mqtt_routes_() {
       friendly_name += " - " + t.stop_name;
     }
 
-    // Build discovery JSON
-    std::string discovery_topic = "homeassistant/switch/" + object_id + "/config";
+    // Build discovery JSON (MQTT select entity with Off/On/Pinned)
+    std::string discovery_topic = "homeassistant/select/" + object_id + "/config";
     auto payload = json::build_json([&](JsonObject root) {
       root["name"] = friendly_name;
       root["unique_id"] = object_id;
-      root["default_entity_id"] = "switch." + object_id;
+      root["default_entity_id"] = "select." + object_id;
       root["state_topic"] = state_topic;
       root["command_topic"] = command_topic;
-      root["payload_on"] = "ON";
-      root["payload_off"] = "OFF";
       root["icon"] = "mdi:bus";
+
+      auto options = root.createNestedArray("options");
+      options.add("Off");
+      options.add("On");
+      options.add("Pinned");
 
       // Use the MQTT client's own availability info so topics match the birth/will messages
       const auto &avail = mqtt::global_mqtt_client->get_availability();
@@ -429,11 +445,18 @@ void TransitTracker::publish_mqtt_routes_() {
     });
 
     mqtt::global_mqtt_client->publish(discovery_topic, payload, 0, true);
+
+    // Also remove any stale switch discovery from before the conversion
+    std::string old_switch_topic = "homeassistant/switch/" + object_id + "/config";
+    mqtt::global_mqtt_client->publish(old_switch_topic, "", 0, true);
+
     ESP_LOGD(TAG, "Published MQTT discovery for route: %s", friendly_name.c_str());
 
-    // Publish current state
-    bool visible = (this->hidden_routes_.find(key) == this->hidden_routes_.end());
-    mqtt::global_mqtt_client->publish(state_topic, std::string(visible ? "ON" : "OFF"), 0, true);
+    // Determine and publish current state
+    bool hidden = (this->hidden_routes_.find(key) != this->hidden_routes_.end());
+    bool pinned = (this->pinned_routes_.find(key) != this->pinned_routes_.end());
+    std::string state = hidden ? "Off" : (pinned ? "Pinned" : "On");
+    mqtt::global_mqtt_client->publish(state_topic, state, 0, true);
 
     // Subscribe to command topic if not already
     if (this->mqtt_subscribed_routes_.find(key) == this->mqtt_subscribed_routes_.end()) {
@@ -443,11 +466,7 @@ void TransitTracker::publish_mqtt_routes_() {
       mqtt::global_mqtt_client->subscribe(
         command_topic,
         [this, captured_key, captured_state_topic](const std::string &topic, const std::string &payload) {
-          bool turn_on = (payload == "ON");
-
-          if (turn_on) {
-            this->hidden_routes_.erase(captured_key);
-          } else {
+          if (payload == "Off") {
             // Enforce at least one route visible
             int visible_count = 0;
             std::set<std::string> current_keys;
@@ -461,17 +480,29 @@ void TransitTracker::publish_mqtt_routes_() {
             }
             if (visible_count <= 1) {
               ESP_LOGW(TAG, "Cannot hide route %s — at least one must remain visible", captured_key.c_str());
-              // Re-publish ON state to reject the command
-              mqtt::global_mqtt_client->publish(captured_state_topic, std::string("ON"), 0, true);
+              // Re-publish current state to reject the command
+              bool is_pinned = (this->pinned_routes_.find(captured_key) != this->pinned_routes_.end());
+              mqtt::global_mqtt_client->publish(captured_state_topic, std::string(is_pinned ? "Pinned" : "On"), 0, true);
               return;
             }
             this->hidden_routes_.insert(captured_key);
+            this->pinned_routes_.erase(captured_key);
+          } else if (payload == "On") {
+            this->hidden_routes_.erase(captured_key);
+            this->pinned_routes_.erase(captured_key);
+          } else if (payload == "Pinned") {
+            this->hidden_routes_.erase(captured_key);
+            this->pinned_routes_.insert(captured_key);
+          } else {
+            ESP_LOGW(TAG, "Unknown route command: %s", payload.c_str());
+            return;
           }
 
-          mqtt::global_mqtt_client->publish(captured_state_topic, std::string(turn_on ? "ON" : "OFF"), 0, true);
-          ESP_LOGD(TAG, "Route %s set to %s via MQTT", captured_key.c_str(), turn_on ? "visible" : "hidden");
+          mqtt::global_mqtt_client->publish(captured_state_topic, payload, 0, true);
+          ESP_LOGD(TAG, "Route %s set to %s via MQTT", captured_key.c_str(), payload.c_str());
 
           this->persist_hidden_routes_();
+          this->persist_pinned_routes_();
         },
         0
       );
@@ -492,6 +523,23 @@ void TransitTracker::persist_hidden_routes_() {
     call.set_value(hidden_str);
     call.perform();
     ESP_LOGD(TAG, "Persisted hidden routes to text entity: %s", hidden_str.c_str());
+  }
+#endif
+}
+
+void TransitTracker::persist_pinned_routes_() {
+  std::string pinned_str;
+  for (const auto &k : this->pinned_routes_) {
+    if (!pinned_str.empty()) pinned_str += ";";
+    pinned_str += k;
+  }
+
+#ifdef USE_TEXT
+  if (this->pinned_routes_text_ != nullptr) {
+    auto call = this->pinned_routes_text_->make_call();
+    call.set_value(pinned_str);
+    call.perform();
+    ESP_LOGD(TAG, "Persisted pinned routes to text entity: %s", pinned_str.c_str());
   }
 #endif
 }
@@ -648,6 +696,7 @@ void HOT TransitTracker::draw_schedule() {
   }
 
   if (this->schedule_state_.trips.empty()) {
+    ESP_LOGW(TAG, "draw_schedule: trips empty (pre-lock)");
     auto message = "No upcoming arrivals";
     if (this->display_departure_times_) {
       message = "No upcoming departures";
@@ -672,6 +721,8 @@ void HOT TransitTracker::draw_schedule() {
   }
 
   if (visible_trips.empty()) {
+    ESP_LOGW(TAG, "draw_schedule: visible_trips empty after filtering (total trips=%d, hidden_routes=%d)",
+             (int)this->schedule_state_.trips.size(), (int)this->hidden_routes_.size());
     this->schedule_state_.mutex.unlock();
     auto message = "No upcoming arrivals";
     if (this->display_departure_times_) {
@@ -680,6 +731,24 @@ void HOT TransitTracker::draw_schedule() {
     this->draw_text_centered_(message, Color(0x252627));
     return;
   }
+
+  // Partition visible trips: pinned first, then unpinned (stable to preserve order within each group)
+  int actual_pinned_in_visible = 0;
+  if (!this->pinned_routes_.empty()) {
+    std::stable_partition(visible_trips.begin(), visible_trips.end(), [this](const Trip &trip) {
+      return this->pinned_routes_.find(trip.composite_key()) != this->pinned_routes_.end();
+    });
+    for (const auto &trip : visible_trips) {
+      if (this->pinned_routes_.find(trip.composite_key()) != this->pinned_routes_.end()) {
+        actual_pinned_in_visible++;
+      } else {
+        break;
+      }
+    }
+  }
+  int effective_pinned_count = (actual_pinned_in_visible > 0)
+    ? std::min(this->pinned_rows_count_, actual_pinned_in_visible)
+    : 0;
 
   int nominal_font_height = this->font_->get_ascender() + this->font_->get_descender();
   unsigned long uptime = millis();
@@ -723,6 +792,283 @@ void HOT TransitTracker::draw_schedule() {
       }
     }
   }
+
+  // ====== SPLIT LAYOUT: independent pinned + unpinned sections ======
+  bool has_split = (effective_pinned_count > 0 && actual_pinned_in_visible < (int)visible_trips.size());
+
+  if (has_split) {
+    // Separate trip pools
+    std::vector<Trip> pinned_pool(visible_trips.begin(), visible_trips.begin() + actual_pinned_in_visible);
+    std::vector<Trip> unpinned_pool(visible_trips.begin() + actual_pinned_in_visible, visible_trips.end());
+
+    int pinned_rows = effective_pinned_count;
+    int unpinned_rows = this->limit_ - pinned_rows;
+    int pinned_pool_size = (int)pinned_pool.size();
+    int unpinned_pool_size = (int)unpinned_pool.size();
+
+    // Centering based on full layout (limit_ rows)
+    int total_display_rows = this->limit_;
+    int max_trips_height = (total_display_rows * this->font_->get_ascender()) + ((total_display_rows - 1) * this->font_->get_descender());
+    int y_base = (this->display_->get_height() % max_trips_height) / 2;
+
+    // ---- Determine current page slices from stored indices ----
+    int pinned_pages = std::max(1, pinned_pool_size - pinned_rows + 1);
+    if (this->pinned_page_index_ >= pinned_pages) this->pinned_page_index_ = 0;
+    int pinned_si = (pinned_pool_size > pinned_rows) ? this->pinned_page_index_ : 0;
+    int pinned_ei = std::min(pinned_si + pinned_rows, pinned_pool_size);
+
+    int unpinned_pages = std::max(1, unpinned_pool_size - unpinned_rows + 1);
+    if (this->split_unpinned_page_index_ >= unpinned_pages) this->split_unpinned_page_index_ = 0;
+    int unpinned_si = (unpinned_pool_size > unpinned_rows && this->scroll_routes_) ? this->split_unpinned_page_index_ : 0;
+    int unpinned_ei = std::min(unpinned_si + unpinned_rows, unpinned_pool_size);
+
+    // ---- Shared h-scroll across ALL on-screen trips (pinned + unpinned) ----
+    // pinned_h_scroll_start_ = shared h-scroll start time
+    // pinned_page_timer_     = shared page dwell timer (when current page was set)
+    // split_unpinned_page_timer_      = 0 if no page change pending, 1 if pending
+    // split_unpinned_h_scroll_start_  = h-scroll cycle count when pending was set
+    if (this->pinned_h_scroll_start_ == 0) this->pinned_h_scroll_start_ = uptime;
+    if (this->pinned_page_timer_ == 0) this->pinned_page_timer_ = uptime;
+
+    // ---- Check vertical scroll animation state ----
+    bool in_split_scroll = false;
+    float split_scroll_progress = 0.0f;
+    if (this->split_scroll_start_ > 0) {
+      unsigned long anim_elapsed = uptime - this->split_scroll_start_;
+      if (anim_elapsed >= (unsigned long)this->page_scroll_duration_) {
+        this->split_scroll_start_ = 0;
+        this->pinned_h_scroll_start_ = uptime;
+        this->pinned_page_timer_ = uptime;
+        this->split_unpinned_page_timer_ = 0;
+      } else {
+        float t = (float)anim_elapsed / (float)this->page_scroll_duration_;
+        split_scroll_progress = t * t * (3.0f - 2.0f * t);  // smoothstep
+        in_split_scroll = true;
+      }
+    }
+
+    int shared_scroll_dist = 0;
+    int shared_h_offset = 0;
+    int shared_h_cycles = 0;
+    if (!in_split_scroll && this->scroll_headsigns_) {
+      int max_hw = 0;
+      bool any_ov = false;
+      for (int i = pinned_si; i < pinned_ei; i++) {
+        int ov = 0, hw = 0;
+        this->draw_trip(pinned_pool[i], 0, nominal_font_height, uptime, rtc_now,
+                        true, &ov, &hw, -1, 0,
+                        uniform_clipping_start, uniform_clipping_end);
+        if (ov > 0) any_ov = true;
+        max_hw = std::max(max_hw, hw);
+      }
+      for (int i = unpinned_si; i < unpinned_ei; i++) {
+        int ov = 0, hw = 0;
+        this->draw_trip(unpinned_pool[i], 0, nominal_font_height, uptime, rtc_now,
+                        true, &ov, &hw, -1, 0,
+                        uniform_clipping_start, uniform_clipping_end);
+        if (ov > 0) any_ov = true;
+        max_hw = std::max(max_hw, hw);
+      }
+      if (any_ov) {
+        shared_scroll_dist = max_hw + marquee_gap;
+        unsigned long elapsed = uptime - this->pinned_h_scroll_start_;
+        int total_px = (int)(elapsed * scroll_speed / 1000);
+        shared_h_offset = total_px % shared_scroll_dist;
+        shared_h_cycles = total_px / shared_scroll_dist;
+      }
+    }
+
+    // ---- Synchronized paging (only when not in scroll animation) ----
+    bool needs_pinned_paging = (pinned_pool_size > pinned_rows);
+    bool needs_unpinned_paging = (unpinned_pool_size > unpinned_rows && this->scroll_routes_);
+    bool needs_any_paging = needs_pinned_paging || needs_unpinned_paging;
+
+    if (!in_split_scroll && needs_any_paging) {
+      bool page_interval_elapsed = (uptime - this->pinned_page_timer_ >= (unsigned long)this->page_interval_);
+      if (page_interval_elapsed && this->split_unpinned_page_timer_ == 0) {
+        this->split_unpinned_page_timer_ = 1;
+        this->split_unpinned_h_scroll_start_ = (unsigned long)shared_h_cycles;
+      }
+
+      if (this->split_unpinned_page_timer_ != 0) {
+        bool can_change = (shared_scroll_dist == 0) ||
+                          (shared_h_cycles > (int)this->split_unpinned_h_scroll_start_);
+        if (can_change) {
+          // Save old page indices before advancing
+          this->split_old_pinned_page_ = this->pinned_page_index_;
+          this->split_old_unpinned_page_ = this->split_unpinned_page_index_;
+
+          if (needs_pinned_paging)
+            this->pinned_page_index_ = (this->pinned_page_index_ + 1) % pinned_pages;
+          if (needs_unpinned_paging)
+            this->split_unpinned_page_index_ = (this->split_unpinned_page_index_ + 1) % unpinned_pages;
+
+          // Update slice indices to new page
+          pinned_si = needs_pinned_paging ? this->pinned_page_index_ : 0;
+          pinned_ei = std::min(pinned_si + pinned_rows, pinned_pool_size);
+          unpinned_si = needs_unpinned_paging ? this->split_unpinned_page_index_ : 0;
+          unpinned_ei = std::min(unpinned_si + unpinned_rows, unpinned_pool_size);
+
+          // Start scroll animation or change instantly
+          if (this->page_scroll_duration_ > 0) {
+            this->split_scroll_start_ = uptime;
+            in_split_scroll = true;
+            split_scroll_progress = 0.0f;
+          } else {
+            this->pinned_page_timer_ = uptime;
+            this->pinned_h_scroll_start_ = uptime;
+          }
+          this->split_unpinned_page_timer_ = 0;
+          shared_h_offset = 0;
+        }
+      }
+    } else if (!in_split_scroll) {
+      this->pinned_page_index_ = 0;
+      this->split_unpinned_page_index_ = 0;
+      this->split_unpinned_page_timer_ = 0;
+      this->pinned_page_timer_ = uptime;
+    }
+
+    // ---- Drawing ----
+    int fh = nominal_font_height;
+    int divider_y = y_base - 1 + pinned_rows * fh - 1;
+    int unpinned_y_start = y_base + pinned_rows * fh;
+    int dw = this->display_->get_width();
+    int dh = this->display_->get_height();
+
+    if (in_split_scroll) {
+      // Vertical scroll animation — draw with clipping per section
+      int pixel_shift_one = (int)(split_scroll_progress * fh);
+
+      // ==== Pinned section (clipped to above divider) ====
+      this->display_->start_clipping(0, 0, dw, divider_y);
+      if (needs_pinned_paging) {
+        int old_psi = this->split_old_pinned_page_;
+        int new_psi = this->pinned_page_index_;
+        if (old_psi + 1 == new_psi) {
+          // Conveyor: combined range scrolls up by one row height
+          int combined_end = std::min(new_psi + pinned_rows, pinned_pool_size);
+          for (int i = old_psi; i < combined_end; i++) {
+            int row = i - old_psi;
+            int y = (y_base - 1) + row * fh - pixel_shift_one;
+            this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
+                            false, nullptr, nullptr, 0, 0,
+                            uniform_clipping_start, uniform_clipping_end);
+          }
+        } else {
+          // Full section scroll (wrap-around)
+          int section_h = pinned_rows * fh;
+          int ps_full = (int)(split_scroll_progress * section_h);
+          int old_ei_p = std::min(old_psi + pinned_rows, pinned_pool_size);
+          for (int i = old_psi; i < old_ei_p; i++) {
+            int row = i - old_psi;
+            int y = (y_base - 1) + row * fh - ps_full;
+            this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
+                            false, nullptr, nullptr, 0, 0,
+                            uniform_clipping_start, uniform_clipping_end);
+          }
+          for (int i = pinned_si; i < pinned_ei; i++) {
+            int row = i - pinned_si;
+            int y = (y_base - 1) + section_h + row * fh - ps_full;
+            this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
+                            false, nullptr, nullptr, 0, 0,
+                            uniform_clipping_start, uniform_clipping_end);
+          }
+        }
+      } else {
+        for (int i = pinned_si; i < pinned_ei; i++) {
+          int row = i - pinned_si;
+          int y = (y_base - 1) + row * fh;
+          this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end);
+        }
+      }
+      this->display_->end_clipping();
+
+      // ==== Unpinned section (clipped to below divider) ====
+      this->display_->start_clipping(0, divider_y + 1, dw, dh);
+      if (needs_unpinned_paging) {
+        int old_usi = this->split_old_unpinned_page_;
+        int new_usi = this->split_unpinned_page_index_;
+        if (old_usi + 1 == new_usi) {
+          int combined_end = std::min(new_usi + unpinned_rows, unpinned_pool_size);
+          for (int i = old_usi; i < combined_end; i++) {
+            int row = i - old_usi;
+            int y = unpinned_y_start + row * fh - pixel_shift_one;
+            this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                            false, nullptr, nullptr, 0, 0,
+                            uniform_clipping_start, uniform_clipping_end);
+          }
+        } else {
+          int section_h = unpinned_rows * fh;
+          int ps_full = (int)(split_scroll_progress * section_h);
+          int old_ei_u = std::min(old_usi + unpinned_rows, unpinned_pool_size);
+          for (int i = old_usi; i < old_ei_u; i++) {
+            int row = i - old_usi;
+            int y = unpinned_y_start + row * fh - ps_full;
+            this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                            false, nullptr, nullptr, 0, 0,
+                            uniform_clipping_start, uniform_clipping_end);
+          }
+          for (int i = unpinned_si; i < unpinned_ei; i++) {
+            int row = i - unpinned_si;
+            int y = unpinned_y_start + section_h + row * fh - ps_full;
+            this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                            false, nullptr, nullptr, 0, 0,
+                            uniform_clipping_start, uniform_clipping_end);
+          }
+        }
+      } else {
+        for (int i = unpinned_si; i < unpinned_ei; i++) {
+          int row = i - unpinned_si;
+          int y = unpinned_y_start + row * fh;
+          this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end);
+        }
+      }
+      this->display_->end_clipping();
+
+      // ==== Divider (always visible, drawn last) ====
+      this->display_->horizontal_line(0, divider_y, dw, Color(0xFF0000));
+    } else {
+      // No animation — draw normally with clipping for safety
+      this->display_->start_clipping(0, 0, dw, divider_y);
+      for (int i = pinned_si; i < pinned_ei; i++) {
+        int row = i - pinned_si;
+        int y = y_base - 1 + row * fh;
+        this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
+                        false, nullptr, nullptr, shared_h_offset, shared_scroll_dist,
+                        uniform_clipping_start, uniform_clipping_end);
+      }
+      this->display_->end_clipping();
+      this->display_->horizontal_line(0, divider_y, dw, Color(0xFF0000));
+      this->display_->start_clipping(0, divider_y + 1, dw, dh);
+      for (int i = unpinned_si; i < unpinned_ei; i++) {
+        int row = i - unpinned_si;
+        int y = unpinned_y_start + row * fh;
+        this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                        false, nullptr, nullptr, shared_h_offset, shared_scroll_dist,
+                        uniform_clipping_start, uniform_clipping_end);
+      }
+      this->display_->end_clipping();
+    }
+
+    this->schedule_state_.mutex.unlock();
+    return;
+  }
+
+  // Reset split paging state when not in split mode
+  this->pinned_page_index_ = 0;
+  this->pinned_page_timer_ = 0;
+  this->pinned_h_scroll_start_ = 0;
+  this->split_unpinned_page_index_ = 0;
+  this->split_unpinned_page_timer_ = 0;
+  this->split_unpinned_h_scroll_start_ = 0;
+  this->split_scroll_start_ = 0;
+  this->split_old_pinned_page_ = 0;
+  this->split_old_unpinned_page_ = 0;
 
   // Determine which trips to display (paging)
   int total_visible = visible_trips.size();
@@ -919,12 +1265,28 @@ void HOT TransitTracker::draw_schedule() {
     int max_trips_height = (display_count * this->font_->get_ascender()) + ((display_count - 1) * this->font_->get_descender());
     int y_offset = y_base + (this->display_->get_height() % max_trips_height) / 2;
 
+    // Determine how many pinned rows are at the start of this slice
+    int pinned_in_slice = std::max(0, std::min(effective_pinned_count, ei) - si);
+    bool has_divider = (pinned_in_slice > 0 && pinned_in_slice < display_count);
+
     for (int i = si; i < ei; i++) {
+      int row_index = i - si;
+      int y;
+      if (has_divider && row_index < pinned_in_slice) {
+        y = y_offset - 1 + row_index * nominal_font_height;  // shift pinned rows up 1px
+      } else {
+        y = y_offset + row_index * nominal_font_height;
+      }
       const Trip &trip = visible_trips[i];
-      this->draw_trip(trip, y_offset, nominal_font_height, uptime, rtc_now,
+      this->draw_trip(trip, y, nominal_font_height, uptime, rtc_now,
                       false, nullptr, nullptr, scroll_off, scroll_dist,
                       uniform_clipping_start, uniform_clipping_end);
-      y_offset += nominal_font_height;
+    }
+
+    // Draw red divider line between pinned and unpinned sections
+    if (has_divider) {
+      int divider_y = (y_offset - 1) + pinned_in_slice * nominal_font_height - 1;
+      this->display_->horizontal_line(0, divider_y, this->display_->get_width(), Color(0xFF0000));
     }
   };
 
@@ -944,11 +1306,29 @@ void HOT TransitTracker::draw_schedule() {
       int max_trips_height = (page_size * this->font_->get_ascender()) + ((page_size - 1) * this->font_->get_descender());
       int y_center = (this->display_->get_height() % max_trips_height) / 2;
 
+      // Pinned row awareness during conveyor scroll
+      int pinned_in_combined = std::max(0, std::min(effective_pinned_count, combined_end) - combined_start);
+      bool has_divider = (pinned_in_combined > 0 && pinned_in_combined < (combined_end - combined_start));
+
       for (int i = combined_start; i < combined_end; i++) {
-        int y_pos = y_center + (i - combined_start) * nominal_font_height - pixel_shift;
+        int row_index = i - combined_start;
+        int y_pos;
+        if (has_divider && row_index < pinned_in_combined) {
+          y_pos = y_center - 1 + row_index * nominal_font_height - pixel_shift;
+        } else {
+          y_pos = y_center + row_index * nominal_font_height - pixel_shift;
+        }
         this->draw_trip(visible_trips[i], y_pos, nominal_font_height, uptime, rtc_now,
                         false, nullptr, nullptr, 0, combined_scroll_dist,
                         uniform_clipping_start, uniform_clipping_end);
+      }
+
+      // Draw red divider during conveyor scroll
+      if (has_divider) {
+        int divider_y = (y_center - 1) + pinned_in_combined * nominal_font_height - 1 - pixel_shift;
+        if (divider_y >= 0 && divider_y < this->display_->get_height()) {
+          this->display_->horizontal_line(0, divider_y, this->display_->get_width(), Color(0xFF0000));
+        }
       }
     } else {
       // Full page scroll: old page exits upward, new page enters from below
