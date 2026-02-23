@@ -59,6 +59,7 @@ class TransitTracker : public Component {
     void set_uniform_headsign_end(bool v) { uniform_headsign_end_ = v; }
     void set_scroll_routes(bool v);
     void set_page_interval(int seconds) { page_interval_ = seconds * 1000; }
+    void set_page_scroll_duration(float seconds) { page_scroll_duration_ = (int)(seconds * 1000); }
     void set_paging_style_rotate(bool v) { paging_rotate_ = v; }
 
     void set_unit_display(UnitDisplay unit_display) { this->localization_.set_unit_display(unit_display); }
@@ -90,6 +91,10 @@ class TransitTracker : public Component {
     static constexpr int idle_time_left = 5000;
     static constexpr int idle_time_right = 1000;
     int page_interval_ = 5000; // ms per page when scroll_routes is on
+    int page_scroll_duration_ = 500; // ms for page scroll transition
+    int last_page_index_ = -1;
+    int scroll_from_page_ = -1;
+    unsigned long page_scroll_start_ = 0;
 
     std::string from_now_(time_t unix_timestamp, uint rtc_now) const;
     void draw_text_centered_(const char *text, Color color);
