@@ -138,7 +138,7 @@ class TransitTracker : public Component {
     int split_old_unpinned_page_{0};            // unpinned page index before animation
 
     // Pin transition animation state (smooth transition when pins change)
-    int pin_transition_phase_{0};               // 0=idle, 1=wait-for-scroll-idle, 2=collapse-rows, 3=push-divider, 4=slide-route-names
+    int pin_transition_phase_{0};               // 0=idle, 1=wait-for-scroll, 2=collapse, 3=push-divider, 4=slide+reveal, 5=hide-pinned, 6=slide-left, 7=sweep-out, 8=scroll-up
     unsigned long pin_transition_start_{0};     // millis when current phase began
     int pin_transition_old_eff_pinned_{-1};     // effective_pinned_count before the change (-1 = uninitialized)
     std::set<std::string> pin_transition_old_pinned_routes_;  // snapshot of pinned_routes_ before change
