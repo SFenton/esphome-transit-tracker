@@ -112,6 +112,7 @@ class TransitTracker : public Component {
     unsigned long page_scroll_start_ = 0;
     int page_pause_duration_ = 1000;       // ms to pause after page scroll before h-scroll resumes
     unsigned long h_scroll_start_time_ = 0; // when horizontal scrolling began for current page
+    int last_scroll_distance_{0};            // previous frame's total_scroll_distance (for graceful wind-down)
     unsigned long page_timer_start_ = 0;    // when current page interval timer started
     unsigned long page_pause_start_ = 0;    // when pause began (0 = not pausing)
     bool page_pause_is_pre_ = false;        // true = pre-scroll pause, false = post-scroll pause
@@ -123,6 +124,7 @@ class TransitTracker : public Component {
     int pinned_page_index_{0};
     unsigned long pinned_page_timer_{0};
     unsigned long pinned_h_scroll_start_{0};
+    int last_shared_scroll_dist_{0};          // previous frame's shared_scroll_dist (for graceful wind-down)
 
     // Split layout paging state (unpinned section)
     int split_unpinned_page_index_{0};
@@ -134,6 +136,26 @@ class TransitTracker : public Component {
     int split_scroll_phase_{0};                 // 0=idle, 1=pre-pause, 2=pinned-scroll, 3=mid-pause, 4=unpinned-scroll, 5=post-pause
     int split_old_pinned_page_{0};              // pinned page index before animation
     int split_old_unpinned_page_{0};            // unpinned page index before animation
+
+    // Pin transition animation state (smooth transition when pins change)
+    int pin_transition_phase_{0};               // 0=idle, 1=wait-for-scroll-idle, 2=collapse-rows, 3=push-divider, 4=slide-route-names
+    unsigned long pin_transition_start_{0};     // millis when current phase began
+    int pin_transition_old_eff_pinned_{-1};     // effective_pinned_count before the change (-1 = uninitialized)
+    std::set<std::string> pin_transition_old_pinned_routes_;  // snapshot of pinned_routes_ before change
+    bool pin_transition_seen_nonzero_offset_{false}; // true once h_scroll_offset > 0 during phase 1
+    int pin_transition_target_eff_pinned_{0};   // effective_pinned_count we're transitioning toward
+    bool pin_transition_pending_restart_{false}; // a NEW pin change arrived mid-transition
+    bool frame_show_pin_icons_{false};          // per-frame flag: should draw_trip apply pin icon inset?
+    int frame_pin_offset_override_{-1};         // per-frame: if >= 0, override pin_offset in draw_trip (no icon drawn)
+
+    // Data transition animation state (smooth collapse when trips expire/change)
+    int data_transition_phase_{0};              // 0=idle, 1=waiting for h-scroll, 2=animating collapse
+    unsigned long data_transition_start_{0};    // millis when animation began
+    std::vector<std::string> data_transition_old_keys_;  // composite keys of on-screen trips last frame
+    std::vector<Trip> data_transition_departing_;         // cached Trip objects for departing trips
+    int data_transition_old_start_{0};          // start_index when transition started
+    int data_transition_old_end_{0};            // end_index when transition started
+    int data_transition_pending_cycles_{-1};    // h_scroll_cycles when change detected (wait for next cycle)
 
     std::string from_now_(time_t unix_timestamp, uint rtc_now) const;
     void draw_text_centered_(const char *text, Color color);
