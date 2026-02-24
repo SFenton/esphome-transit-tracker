@@ -130,11 +130,10 @@ class TransitTracker : public Component {
     unsigned long split_unpinned_h_scroll_start_{0};
 
     // Split layout scroll animation state
-    unsigned long split_scroll_start_{0};       // millis when conveyor animation began (0 = idle)
+    unsigned long split_scroll_start_{0};       // millis when current phase began (0 = idle)
+    int split_scroll_phase_{0};                 // 0=idle, 1=pre-pause, 2=pinned-scroll, 3=mid-pause, 4=unpinned-scroll, 5=post-pause
     int split_old_pinned_page_{0};              // pinned page index before animation
     int split_old_unpinned_page_{0};            // unpinned page index before animation
-    unsigned long split_pause_start_{0};        // when split pause began (0 = not pausing)
-    bool split_pause_is_pre_{false};            // true = pre-scroll pause, false = post-scroll pause
 
     std::string from_now_(time_t unix_timestamp, uint rtc_now) const;
     void draw_text_centered_(const char *text, Color color);

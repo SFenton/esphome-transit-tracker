@@ -1149,67 +1149,129 @@ void HOT TransitTracker::draw_schedule() {
     if (this->pinned_h_scroll_start_ == 0) this->pinned_h_scroll_start_ = uptime;
     if (this->pinned_page_timer_ == 0) this->pinned_page_timer_ = uptime;
 
-    // ---- Check vertical scroll animation state ----
+    // ---- Paging needs (used by state machine and drawing) ----
+    bool needs_pinned_paging = (pinned_pool_size > pinned_rows);
+    bool needs_unpinned_paging = (unpinned_pool_size > unpinned_rows && this->scroll_routes_);
+    bool needs_any_paging = needs_pinned_paging || needs_unpinned_paging;
+
+    // ---- Split scroll phase state machine ----
+    // Phase 0: idle (normal h-scroll + paging)
+    // Phase 1: pre-scroll pause
+    // Phase 2: pinned section v-scroll animation
+    // Phase 3: mid-pause (between pinned and unpinned scrolls)
+    // Phase 4: unpinned section v-scroll animation
+    // Phase 5: post-scroll pause
     bool in_split_scroll = false;
+    bool in_split_pinned_scroll = false;
+    bool in_split_unpinned_scroll = false;
     float split_scroll_progress = 0.0f;
-    if (this->split_scroll_start_ > 0) {
-      unsigned long anim_elapsed = uptime - this->split_scroll_start_;
-      if (anim_elapsed >= (unsigned long)this->page_scroll_duration_) {
-        // Animation complete — begin post-scroll pause
-        this->split_scroll_start_ = 0;
-        this->split_pause_start_ = uptime;
-        this->split_pause_is_pre_ = false;
-        this->split_unpinned_page_timer_ = 0;
-      } else {
-        float t = (float)anim_elapsed / (float)this->page_scroll_duration_;
-        split_scroll_progress = t * t * (3.0f - 2.0f * t);  // smoothstep
-        in_split_scroll = true;
-      }
-    }
-
-    // ---- Handle split pause (pre-scroll or post-scroll) ----
     bool in_split_pause = false;
-    if (!in_split_scroll && this->split_pause_start_ > 0) {
-      unsigned long pause_elapsed = uptime - this->split_pause_start_;
-      if (pause_elapsed >= (unsigned long)this->page_pause_duration_) {
-        this->split_pause_start_ = 0;
-        if (this->split_pause_is_pre_) {
-          // Pre-scroll pause complete — advance pages and begin scroll animation
-          bool needs_pinned_paging_now = (pinned_pool_size > pinned_rows);
-          bool needs_unpinned_paging_now = (unpinned_pool_size > unpinned_rows && this->scroll_routes_);
 
-          this->split_old_pinned_page_ = this->pinned_page_index_;
-          this->split_old_unpinned_page_ = this->split_unpinned_page_index_;
+    if (this->split_scroll_phase_ > 0 && this->split_scroll_start_ > 0) {
+      unsigned long phase_elapsed = uptime - this->split_scroll_start_;
 
-          if (needs_pinned_paging_now)
-            this->pinned_page_index_ = (this->pinned_page_index_ + 1) % pinned_pages;
-          if (needs_unpinned_paging_now)
-            this->split_unpinned_page_index_ = (this->split_unpinned_page_index_ + 1) % unpinned_pages;
+      switch (this->split_scroll_phase_) {
+        case 1: // Pre-scroll pause
+          if (phase_elapsed >= (unsigned long)this->page_pause_duration_) {
+            // Pre-pause complete — advance pages and begin pinned scroll
+            this->split_old_pinned_page_ = this->pinned_page_index_;
+            this->split_old_unpinned_page_ = this->split_unpinned_page_index_;
 
-          pinned_si = needs_pinned_paging_now ? this->pinned_page_index_ : 0;
-          pinned_ei = std::min(pinned_si + pinned_rows, pinned_pool_size);
-          unpinned_si = needs_unpinned_paging_now ? this->split_unpinned_page_index_ : 0;
-          unpinned_ei = std::min(unpinned_si + unpinned_rows, unpinned_pool_size);
+            if (needs_pinned_paging)
+              this->pinned_page_index_ = (this->pinned_page_index_ + 1) % pinned_pages;
+            if (needs_unpinned_paging)
+              this->split_unpinned_page_index_ = (this->split_unpinned_page_index_ + 1) % unpinned_pages;
 
-          if (this->page_scroll_duration_ > 0) {
+            pinned_si = needs_pinned_paging ? this->pinned_page_index_ : 0;
+            pinned_ei = std::min(pinned_si + pinned_rows, pinned_pool_size);
+            unpinned_si = needs_unpinned_paging ? this->split_unpinned_page_index_ : 0;
+            unpinned_ei = std::min(unpinned_si + unpinned_rows, unpinned_pool_size);
+
+            if (needs_pinned_paging && this->page_scroll_duration_ > 0) {
+              // Begin pinned section scroll
+              this->split_scroll_phase_ = 2;
+              this->split_scroll_start_ = uptime;
+              in_split_pinned_scroll = true;
+              in_split_scroll = true;
+              split_scroll_progress = 0.0f;
+            } else if (needs_unpinned_paging && this->page_scroll_duration_ > 0) {
+              // No pinned paging — skip to unpinned section scroll
+              this->split_scroll_phase_ = 4;
+              this->split_scroll_start_ = uptime;
+              in_split_unpinned_scroll = true;
+              in_split_scroll = true;
+              split_scroll_progress = 0.0f;
+            } else {
+              // No animation needed — go to post-pause
+              this->split_scroll_phase_ = 5;
+              this->split_scroll_start_ = uptime;
+              in_split_pause = true;
+            }
+            this->split_unpinned_page_timer_ = 0;
+          } else {
+            in_split_pause = true;
+          }
+          break;
+
+        case 2: // Pinned section v-scroll
+          if (phase_elapsed >= (unsigned long)this->page_scroll_duration_) {
+            if (needs_unpinned_paging) {
+              // Pinned done — enter mid-pause before unpinned scroll
+              this->split_scroll_phase_ = 3;
+              this->split_scroll_start_ = uptime;
+              in_split_pause = true;
+            } else {
+              // No unpinned scroll needed — go to post-pause
+              this->split_scroll_phase_ = 5;
+              this->split_scroll_start_ = uptime;
+              in_split_pause = true;
+            }
+          } else {
+            float t = (float)phase_elapsed / (float)this->page_scroll_duration_;
+            split_scroll_progress = t * t * (3.0f - 2.0f * t);
+            in_split_pinned_scroll = true;
+            in_split_scroll = true;
+          }
+          break;
+
+        case 3: // Mid-pause (between sections)
+          if (phase_elapsed >= (unsigned long)this->page_pause_duration_) {
+            // Mid-pause complete — begin unpinned scroll
+            this->split_scroll_phase_ = 4;
             this->split_scroll_start_ = uptime;
+            in_split_unpinned_scroll = true;
             in_split_scroll = true;
             split_scroll_progress = 0.0f;
           } else {
-            // Instant page change — begin post-scroll pause
-            this->split_pause_start_ = uptime;
-            this->split_pause_is_pre_ = false;
             in_split_pause = true;
           }
-          this->split_unpinned_page_timer_ = 0;
-        } else {
-          // Post-scroll pause complete — resume horizontal scrolling
-          this->pinned_h_scroll_start_ = uptime;
-          this->pinned_page_timer_ = uptime;
-        }
-      } else {
-        // Still pausing — freeze horizontal scroll
-        in_split_pause = true;
+          break;
+
+        case 4: // Unpinned section v-scroll
+          if (phase_elapsed >= (unsigned long)this->page_scroll_duration_) {
+            // Unpinned done — enter post-pause
+            this->split_scroll_phase_ = 5;
+            this->split_scroll_start_ = uptime;
+            in_split_pause = true;
+          } else {
+            float t = (float)phase_elapsed / (float)this->page_scroll_duration_;
+            split_scroll_progress = t * t * (3.0f - 2.0f * t);
+            in_split_unpinned_scroll = true;
+            in_split_scroll = true;
+          }
+          break;
+
+        case 5: // Post-scroll pause
+          if (phase_elapsed >= (unsigned long)this->page_pause_duration_) {
+            // Post-pause complete — resume normal operation
+            this->split_scroll_phase_ = 0;
+            this->split_scroll_start_ = 0;
+            this->pinned_h_scroll_start_ = uptime;
+            this->pinned_page_timer_ = uptime;
+          } else {
+            in_split_pause = true;
+          }
+          break;
       }
     }
 
@@ -1244,12 +1306,8 @@ void HOT TransitTracker::draw_schedule() {
       }
     }
 
-    // ---- Synchronized paging (only when not in scroll animation or pause) ----
-    bool needs_pinned_paging = (pinned_pool_size > pinned_rows);
-    bool needs_unpinned_paging = (unpinned_pool_size > unpinned_rows && this->scroll_routes_);
-    bool needs_any_paging = needs_pinned_paging || needs_unpinned_paging;
-
-    if (!in_split_scroll && !in_split_pause && needs_any_paging) {
+    // ---- Paging trigger (only in phase 0) ----
+    if (this->split_scroll_phase_ == 0 && needs_any_paging) {
       bool page_interval_elapsed = (uptime - this->pinned_page_timer_ >= (unsigned long)this->page_interval_);
       if (page_interval_elapsed && this->split_unpinned_page_timer_ == 0) {
         this->split_unpinned_page_timer_ = 1;
@@ -1260,14 +1318,14 @@ void HOT TransitTracker::draw_schedule() {
         bool can_change = (shared_scroll_dist == 0) ||
                           (shared_h_cycles > (int)this->split_unpinned_h_scroll_start_);
         if (can_change) {
-          // Enter pre-scroll pause before page transition
+          // Enter pre-scroll pause
           shared_h_offset = 0;
           this->split_unpinned_page_timer_ = 0;
-          this->split_pause_start_ = uptime;
-          this->split_pause_is_pre_ = true;
+          this->split_scroll_phase_ = 1;
+          this->split_scroll_start_ = uptime;
         }
       }
-    } else if (!in_split_scroll && !in_split_pause) {
+    } else if (this->split_scroll_phase_ == 0 && !needs_any_paging) {
       this->pinned_page_index_ = 0;
       this->split_unpinned_page_index_ = 0;
       this->split_unpinned_page_timer_ = 0;
@@ -1281,49 +1339,39 @@ void HOT TransitTracker::draw_schedule() {
     int dw = this->display_->get_width();
     int dh = this->display_->get_height();
 
-    if (in_split_scroll) {
-      // Vertical scroll animation — draw with clipping per section
+    if (in_split_pinned_scroll) {
+      // Phase 2: Pinned section animates, unpinned stays at old position
       int pixel_shift_one = (int)(split_scroll_progress * fh);
 
-      // ==== Pinned section (clipped to above divider) ====
+      // ==== Pinned section (animated, clipped) ====
       this->display_->start_clipping(0, 0, dw, divider_y);
-      if (needs_pinned_paging) {
-        int old_psi = this->split_old_pinned_page_;
-        int new_psi = this->pinned_page_index_;
-        if (old_psi + 1 == new_psi) {
-          // Conveyor: combined range scrolls up by one row height
-          int combined_end = std::min(new_psi + pinned_rows, pinned_pool_size);
-          for (int i = old_psi; i < combined_end; i++) {
-            int row = i - old_psi;
-            int y = (y_base - 1) + row * fh - pixel_shift_one;
-            this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
-                            false, nullptr, nullptr, 0, 0,
-                            uniform_clipping_start, uniform_clipping_end, true);
-          }
-        } else {
-          // Full section scroll (wrap-around)
-          int section_h = pinned_rows * fh;
-          int ps_full = (int)(split_scroll_progress * section_h);
-          int old_ei_p = std::min(old_psi + pinned_rows, pinned_pool_size);
-          for (int i = old_psi; i < old_ei_p; i++) {
-            int row = i - old_psi;
-            int y = (y_base - 1) + row * fh - ps_full;
-            this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
-                            false, nullptr, nullptr, 0, 0,
-                            uniform_clipping_start, uniform_clipping_end, true);
-          }
-          for (int i = pinned_si; i < pinned_ei; i++) {
-            int row = i - pinned_si;
-            int y = (y_base - 1) + section_h + row * fh - ps_full;
-            this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
-                            false, nullptr, nullptr, 0, 0,
-                            uniform_clipping_start, uniform_clipping_end, true);
-          }
+      int old_psi = this->split_old_pinned_page_;
+      int new_psi = this->pinned_page_index_;
+      if (old_psi + 1 == new_psi) {
+        // Conveyor: combined range scrolls up by one row height
+        int combined_end = std::min(new_psi + pinned_rows, pinned_pool_size);
+        for (int i = old_psi; i < combined_end; i++) {
+          int row = i - old_psi;
+          int y = (y_base - 1) + row * fh - pixel_shift_one;
+          this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, true);
         }
       } else {
+        // Full section scroll (wrap-around)
+        int section_h = pinned_rows * fh;
+        int ps_full = (int)(split_scroll_progress * section_h);
+        int old_ei_p = std::min(old_psi + pinned_rows, pinned_pool_size);
+        for (int i = old_psi; i < old_ei_p; i++) {
+          int row = i - old_psi;
+          int y = (y_base - 1) + row * fh - ps_full;
+          this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, true);
+        }
         for (int i = pinned_si; i < pinned_ei; i++) {
           int row = i - pinned_si;
-          int y = (y_base - 1) + row * fh;
+          int y = (y_base - 1) + section_h + row * fh - ps_full;
           this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
                           false, nullptr, nullptr, 0, 0,
                           uniform_clipping_start, uniform_clipping_end, true);
@@ -1331,43 +1379,63 @@ void HOT TransitTracker::draw_schedule() {
       }
       this->display_->end_clipping();
 
-      // ==== Unpinned section (clipped to below divider) ====
+      // ==== Unpinned section (static at OLD position, no h-scroll) ====
+      int old_usi = this->split_old_unpinned_page_;
+      int old_uei = std::min(old_usi + unpinned_rows, unpinned_pool_size);
       this->display_->start_clipping(0, divider_y + 1, dw, dh);
-      if (needs_unpinned_paging) {
-        int old_usi = this->split_old_unpinned_page_;
-        int new_usi = this->split_unpinned_page_index_;
-        if (old_usi + 1 == new_usi) {
-          int combined_end = std::min(new_usi + unpinned_rows, unpinned_pool_size);
-          for (int i = old_usi; i < combined_end; i++) {
-            int row = i - old_usi;
-            int y = unpinned_y_start + row * fh - pixel_shift_one;
-            this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
-                            false, nullptr, nullptr, 0, 0,
-                            uniform_clipping_start, uniform_clipping_end, false);
-          }
-        } else {
-          int section_h = unpinned_rows * fh;
-          int ps_full = (int)(split_scroll_progress * section_h);
-          int old_ei_u = std::min(old_usi + unpinned_rows, unpinned_pool_size);
-          for (int i = old_usi; i < old_ei_u; i++) {
-            int row = i - old_usi;
-            int y = unpinned_y_start + row * fh - ps_full;
-            this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
-                            false, nullptr, nullptr, 0, 0,
-                            uniform_clipping_start, uniform_clipping_end, false);
-          }
-          for (int i = unpinned_si; i < unpinned_ei; i++) {
-            int row = i - unpinned_si;
-            int y = unpinned_y_start + section_h + row * fh - ps_full;
-            this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
-                            false, nullptr, nullptr, 0, 0,
-                            uniform_clipping_start, uniform_clipping_end, false);
-          }
+      for (int i = old_usi; i < old_uei; i++) {
+        int row = i - old_usi;
+        int y = unpinned_y_start + row * fh;
+        this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                        false, nullptr, nullptr, 0, 0,
+                        uniform_clipping_start, uniform_clipping_end, false);
+      }
+      this->display_->end_clipping();
+
+      this->display_->horizontal_line(0, divider_y, dw, this->divider_color_);
+
+    } else if (in_split_unpinned_scroll) {
+      // Phase 4: Unpinned section animates, pinned stays at new position
+      int pixel_shift_one = (int)(split_scroll_progress * fh);
+
+      // ==== Pinned section (static at NEW position, no h-scroll) ====
+      this->display_->start_clipping(0, 0, dw, divider_y);
+      for (int i = pinned_si; i < pinned_ei; i++) {
+        int row = i - pinned_si;
+        int y = (y_base - 1) + row * fh;
+        this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
+                        false, nullptr, nullptr, 0, 0,
+                        uniform_clipping_start, uniform_clipping_end, true);
+      }
+      this->display_->end_clipping();
+
+      // ==== Unpinned section (animated, clipped) ====
+      this->display_->start_clipping(0, divider_y + 1, dw, dh);
+      int old_usi = this->split_old_unpinned_page_;
+      int new_usi = this->split_unpinned_page_index_;
+      if (old_usi + 1 == new_usi) {
+        int combined_end = std::min(new_usi + unpinned_rows, unpinned_pool_size);
+        for (int i = old_usi; i < combined_end; i++) {
+          int row = i - old_usi;
+          int y = unpinned_y_start + row * fh - pixel_shift_one;
+          this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, false);
         }
       } else {
+        int section_h = unpinned_rows * fh;
+        int ps_full = (int)(split_scroll_progress * section_h);
+        int old_ei_u = std::min(old_usi + unpinned_rows, unpinned_pool_size);
+        for (int i = old_usi; i < old_ei_u; i++) {
+          int row = i - old_usi;
+          int y = unpinned_y_start + row * fh - ps_full;
+          this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, false);
+        }
         for (int i = unpinned_si; i < unpinned_ei; i++) {
           int row = i - unpinned_si;
-          int y = unpinned_y_start + row * fh;
+          int y = unpinned_y_start + section_h + row * fh - ps_full;
           this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
                           false, nullptr, nullptr, 0, 0,
                           uniform_clipping_start, uniform_clipping_end, false);
@@ -1375,10 +1443,41 @@ void HOT TransitTracker::draw_schedule() {
       }
       this->display_->end_clipping();
 
-      // ==== Divider (always visible, drawn last) ====
       this->display_->horizontal_line(0, divider_y, dw, this->divider_color_);
+
+    } else if (in_split_pause) {
+      // Paused — draw both sections statically, no h-scroll
+      // Phase 3 (mid-pause): pinned at new, unpinned at old
+      // Phases 1, 5: both at current indices
+      int draw_unp_si = unpinned_si;
+      int draw_unp_ei = unpinned_ei;
+      if (this->split_scroll_phase_ == 3) {
+        draw_unp_si = this->split_old_unpinned_page_;
+        draw_unp_ei = std::min(draw_unp_si + unpinned_rows, unpinned_pool_size);
+      }
+
+      this->display_->start_clipping(0, 0, dw, divider_y);
+      for (int i = pinned_si; i < pinned_ei; i++) {
+        int row = i - pinned_si;
+        int y = y_base - 1 + row * fh;
+        this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
+                        false, nullptr, nullptr, 0, 0,
+                        uniform_clipping_start, uniform_clipping_end, true);
+      }
+      this->display_->end_clipping();
+      this->display_->horizontal_line(0, divider_y, dw, this->divider_color_);
+      this->display_->start_clipping(0, divider_y + 1, dw, dh);
+      for (int i = draw_unp_si; i < draw_unp_ei; i++) {
+        int row = i - draw_unp_si;
+        int y = unpinned_y_start + row * fh;
+        this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                        false, nullptr, nullptr, 0, 0,
+                        uniform_clipping_start, uniform_clipping_end, false);
+      }
+      this->display_->end_clipping();
+
     } else {
-      // No animation — draw normally with clipping for safety
+      // Phase 0: Normal — draw with h-scroll
       this->display_->start_clipping(0, 0, dw, divider_y);
       for (int i = pinned_si; i < pinned_ei; i++) {
         int row = i - pinned_si;
@@ -1412,10 +1511,9 @@ void HOT TransitTracker::draw_schedule() {
   this->split_unpinned_page_timer_ = 0;
   this->split_unpinned_h_scroll_start_ = 0;
   this->split_scroll_start_ = 0;
+  this->split_scroll_phase_ = 0;
   this->split_old_pinned_page_ = 0;
   this->split_old_unpinned_page_ = 0;
-  this->split_pause_start_ = 0;
-  this->split_pause_is_pre_ = false;
 
   // Determine which trips to display (paging)
   int total_visible = visible_trips.size();
