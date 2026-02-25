@@ -187,12 +187,22 @@ void TransitTracker::on_ws_message_(websockets::WebsocketsMessage message) {
       });
     }
 
+    // Log received trips for debugging
+    ESP_LOGD(TAG, "Schedule update: %d trip(s) received", (int)this->schedule_state_.trips.size());
+    for (size_t i = 0; i < this->schedule_state_.trips.size(); i++) {
+      const auto &t = this->schedule_state_.trips[i];
+      ESP_LOGD(TAG, "  [%d] %s  dep=%ld  rt=%s",
+               (int)i, t.composite_key().c_str(), (long)t.departure_time, t.is_realtime ? "Y" : "N");
+    }
+
     this->schedule_state_.mutex.unlock();
 
 #ifdef USE_MQTT
     // Flag routes for MQTT discovery (will publish in loop or on connect)
     this->mqtt_routes_pending_ = true;
-    this->mqtt_divider_color_pending_ = true;
+    if (!this->mqtt_divider_published_) {
+      this->mqtt_divider_color_pending_ = true;
+    }
 #endif
 
     return true;
@@ -434,11 +444,10 @@ void TransitTracker::publish_mqtt_routes_() {
   std::string node = App.get_name();
   std::string topic_prefix = mqtt::global_mqtt_client->get_topic_prefix();
 
-  std::set<std::string> seen;
   for (const auto &t : this->schedule_state_.trips) {
     std::string key = t.composite_key();
-    if (seen.count(key)) continue;
-    seen.insert(key);
+    if (this->mqtt_published_routes_.count(key)) continue;
+    this->mqtt_published_routes_.insert(key);
 
     std::string slug = slugify_(key);
     std::string object_id = node + "_route_" + slug;
@@ -602,6 +611,7 @@ void TransitTracker::publish_mqtt_divider_color_() {
   }
 
   this->mqtt_divider_color_pending_ = false;
+  this->mqtt_divider_published_ = true;
 
   std::string node = App.get_name();
   std::string topic_prefix = mqtt::global_mqtt_client->get_topic_prefix();
@@ -715,10 +725,9 @@ void TransitTracker::publish_mqtt_route_colors_() {
   std::string node = App.get_name();
   std::string topic_prefix = mqtt::global_mqtt_client->get_topic_prefix();
 
-  std::set<std::string> seen_route_ids;
   for (const auto &t : this->schedule_state_.trips) {
-    if (seen_route_ids.count(t.route_id)) continue;
-    seen_route_ids.insert(t.route_id);
+    if (this->mqtt_published_route_color_ids_.count(t.route_id)) continue;
+    this->mqtt_published_route_color_ids_.insert(t.route_id);
 
     std::string slug = slugify_(t.route_id);
     std::string object_id = node + "_route_color_" + slug;
@@ -1050,14 +1059,17 @@ void HOT TransitTracker::draw_schedule() {
     return;
   }
 
-  // Count pinned trips (without reordering yet — partition happens after transition check)
+  // Count distinct pinned routes (without reordering — partition and dedup happen after transition check)
+  // Each pinned route occupies exactly one row; multiple trips from the same route share that row.
   int actual_pinned_in_visible = 0;
   if (!this->pinned_routes_.empty()) {
+    std::set<std::string> seen_pinned_keys;
     for (const auto &trip : visible_trips) {
       if (this->pinned_routes_.find(trip.composite_key()) != this->pinned_routes_.end()) {
-        actual_pinned_in_visible++;
+        seen_pinned_keys.insert(trip.composite_key());
       }
     }
+    actual_pinned_in_visible = (int)seen_pinned_keys.size();
   }
   int effective_pinned_count = (actual_pinned_in_visible > 0)
     ? std::min(this->pinned_rows_count_, actual_pinned_in_visible)
@@ -1072,6 +1084,7 @@ void HOT TransitTracker::draw_schedule() {
   if (this->pin_transition_old_eff_pinned_ < 0) {
     this->pin_transition_old_eff_pinned_ = effective_pinned_count;
     this->pin_transition_old_pinned_routes_ = this->pinned_routes_;
+    this->pin_transition_old_hidden_routes_ = this->hidden_routes_;
   }
 
   // Detect change in effective pinned count (new pins added or removed)
@@ -1082,24 +1095,112 @@ void HOT TransitTracker::draw_schedule() {
     this->pin_transition_start_ = uptime;
     this->pin_transition_seen_nonzero_offset_ = false;
     this->pin_transition_target_eff_pinned_ = effective_pinned_count;
+    this->pin_transition_target_pinned_routes_ = this->pinned_routes_;
+    this->pin_transition_target_hidden_routes_ = this->hidden_routes_;
+    this->pin_transition_pending_restart_ = false;
+  } else if (this->pin_transition_phase_ == 0 &&
+             effective_pinned_count == this->pin_transition_old_eff_pinned_ &&
+             this->pinned_routes_ != this->pin_transition_old_pinned_routes_) {
+    // Pinned route SET changed but effective count stayed the same
+    // (e.g. pinned_rows_count_=1, already had route A pinned, now also pin route B)
+    // Still need to animate the transition.
+    ESP_LOGD(TAG, "Pin transition: route set changed (eff count %d unchanged), entering phase 1",
+             effective_pinned_count);
+    this->pin_transition_phase_ = 1;
+    this->pin_transition_start_ = uptime;
+    this->pin_transition_seen_nonzero_offset_ = false;
+    this->pin_transition_target_eff_pinned_ = effective_pinned_count;
+    this->pin_transition_target_pinned_routes_ = this->pinned_routes_;
+    this->pin_transition_target_hidden_routes_ = this->hidden_routes_;
     this->pin_transition_pending_restart_ = false;
   } else if (this->pin_transition_phase_ != 0 && effective_pinned_count != this->pin_transition_target_eff_pinned_) {
-    // A genuinely NEW pin change arrived mid-transition (target shifted)
-    ESP_LOGD(TAG, "Pin transition: new change mid-transition (target %d -> %d), queuing restart",
-             this->pin_transition_target_eff_pinned_, effective_pinned_count);
-    this->pin_transition_target_eff_pinned_ = effective_pinned_count;
-    this->pin_transition_pending_restart_ = true;
+    if (this->pin_transition_phase_ == 1) {
+      // Still waiting for scroll idle — no animation has started yet, so we can
+      // safely update the targets directly instead of queuing a restart.
+      // This avoids a full close+reopen when e.g. unpinning route A then immediately
+      // pinning route B (two MQTT messages in rapid succession).
+      ESP_LOGD(TAG, "Pin transition: new change during phase 1 (target %d -> %d), updating target directly",
+               this->pin_transition_target_eff_pinned_, effective_pinned_count);
+      this->pin_transition_target_eff_pinned_ = effective_pinned_count;
+      this->pin_transition_target_pinned_routes_ = this->pinned_routes_;
+      this->pin_transition_target_hidden_routes_ = this->hidden_routes_;
+      this->pin_transition_pending_restart_ = false;
+      // If targets now match the old state (net zero change), cancel the transition entirely
+      if (this->pin_transition_target_eff_pinned_ == this->pin_transition_old_eff_pinned_ &&
+          this->pin_transition_target_pinned_routes_ == this->pin_transition_old_pinned_routes_ &&
+          this->pin_transition_target_hidden_routes_ == this->pin_transition_old_hidden_routes_) {
+        ESP_LOGD(TAG, "Pin transition: net zero change, cancelling transition");
+        this->pin_transition_phase_ = 0;
+      }
+    } else {
+      // Animation already in progress — queue restart
+      // Don't update target_pinned_routes_ — let the current transition finish with
+      // its original target. The pending restart will start a new transition afterward.
+      ESP_LOGD(TAG, "Pin transition: new change mid-transition (target %d -> %d), queuing restart",
+               this->pin_transition_target_eff_pinned_, effective_pinned_count);
+      this->pin_transition_target_eff_pinned_ = effective_pinned_count;
+      this->pin_transition_pending_restart_ = true;
+    }
+  } else if (this->pin_transition_phase_ != 0 && !this->pin_transition_pending_restart_ &&
+             this->pinned_routes_ != this->pin_transition_target_pinned_routes_) {
+    if (this->pin_transition_phase_ == 1) {
+      // Still in phase 1 — update target route set directly
+      ESP_LOGD(TAG, "Pin transition: pin set changed during phase 1 (same count), updating target directly");
+      this->pin_transition_target_pinned_routes_ = this->pinned_routes_;
+      this->pin_transition_target_hidden_routes_ = this->hidden_routes_;
+      this->pin_transition_pending_restart_ = false;
+      // If targets now match old state, cancel
+      if (this->pin_transition_target_pinned_routes_ == this->pin_transition_old_pinned_routes_ &&
+          this->pin_transition_target_hidden_routes_ == this->pin_transition_old_hidden_routes_) {
+        ESP_LOGD(TAG, "Pin transition: net zero change, cancelling transition");
+        this->pin_transition_phase_ = 0;
+      }
+    } else {
+      // Pin set changed but effective count stayed the same (e.g. swapped which route is pinned)
+      // Queue a restart so the current transition finishes with its target, then a new one starts
+      ESP_LOGD(TAG, "Pin transition: pin set changed mid-transition (same count), queuing restart");
+      this->pin_transition_pending_restart_ = true;
+    }
   }
 
   // Reset per-frame pin offset override (phase 4 sets it)
   this->frame_pin_offset_override_ = -1;
 
-  // Phase 1 & 2: use OLD pinned routes for partitioning so the display doesn't change.
+  // During pin transitions, freeze the hidden-route filter to prevent newly-unhidden
+  // routes from snapping in before the animation handles them.
+  // Phases 1-2, 5-9, 12 use old hidden routes (pre-change); phases 3-4, 10-11, 13 use target.
+  if (this->pin_transition_phase_ >= 1) {
+    const auto &frozen_hidden =
+      (this->pin_transition_phase_ <= 2 || (this->pin_transition_phase_ >= 5 && this->pin_transition_phase_ <= 9) || this->pin_transition_phase_ == 12)
+        ? this->pin_transition_old_hidden_routes_
+        : this->pin_transition_target_hidden_routes_;
+
+    visible_trips.clear();
+    for (const Trip &trip : this->schedule_state_.trips) {
+      if (frozen_hidden.find(trip.composite_key()) == frozen_hidden.end()) {
+        visible_trips.push_back(trip);
+      }
+    }
+
+    if (visible_trips.empty()) {
+      this->schedule_state_.mutex.unlock();
+      auto message = "No upcoming arrivals";
+      if (this->display_departure_times_) {
+        message = "No upcoming departures";
+      }
+      this->draw_text_centered_(message, Color(0x252627));
+      return;
+    }
+  }
+
+  // Phase 1, 2, 9, 12: use OLD pinned routes for partitioning so the display doesn't change.
   // Phase 2 additionally animates collapsing newly-pinned rows.
-  // Phase 3 & 4 use NEW routes (fall through to normal partition below).
+  // Phase 3, 4, 10, 11, 13 use TARGET routes (frozen at transition start, not live pinned_routes_).
   // Unpin phases 5-8 all use OLD routes (rendering old split layout while animating out).
+  // Phase 12 uses OLD routes for pinned section collapse + computes target unpinned internally.
   if ((this->pin_transition_phase_ >= 1 && this->pin_transition_phase_ <= 2) ||
-      (this->pin_transition_phase_ >= 5 && this->pin_transition_phase_ <= 8)) {
+      (this->pin_transition_phase_ >= 5 && this->pin_transition_phase_ <= 9) ||
+      this->pin_transition_phase_ == 12) {
     // Partition with OLD pinned routes
     actual_pinned_in_visible = 0;
     if (!this->pin_transition_old_pinned_routes_.empty()) {
@@ -1111,6 +1212,23 @@ void HOT TransitTracker::draw_schedule() {
           actual_pinned_in_visible++;
         } else {
           break;
+        }
+      }
+      // Deduplicate pinned section: keep only the soonest trip per distinct route
+      {
+        std::set<std::string> seen_keys;
+        int write = 0;
+        for (int i = 0; i < actual_pinned_in_visible; i++) {
+          std::string key = visible_trips[i].composite_key();
+          if (seen_keys.find(key) == seen_keys.end()) {
+            seen_keys.insert(key);
+            if (write != i) visible_trips[write] = visible_trips[i];
+            write++;
+          }
+        }
+        if (write < actual_pinned_in_visible) {
+          visible_trips.erase(visible_trips.begin() + write, visible_trips.begin() + actual_pinned_in_visible);
+          actual_pinned_in_visible = write;
         }
       }
     }
@@ -1125,26 +1243,62 @@ void HOT TransitTracker::draw_schedule() {
       this->frame_show_pin_icons_ = false;
     }
   } else {
-    // Normal: partition with current pinned routes
-    if (!this->pinned_routes_.empty()) {
-      std::stable_partition(visible_trips.begin(), visible_trips.end(), [this](const Trip &trip) {
-        return this->pinned_routes_.find(trip.composite_key()) != this->pinned_routes_.end();
+    // Determine which routes to use for partitioning:
+    // During phases 3-4 and 10-11, use the transition target (frozen at start of transition)
+    // to prevent mid-transition pin changes from snapping in immediately.
+    bool use_target = (this->pin_transition_phase_ >= 3 && this->pin_transition_phase_ <= 4) ||
+                      (this->pin_transition_phase_ >= 10 && this->pin_transition_phase_ <= 11);
+    const auto &partition_routes = use_target
+      ? this->pin_transition_target_pinned_routes_
+      : this->pinned_routes_;
+
+    if (!partition_routes.empty()) {
+      std::stable_partition(visible_trips.begin(), visible_trips.end(), [&partition_routes](const Trip &trip) {
+        return partition_routes.find(trip.composite_key()) != partition_routes.end();
       });
       // Recount after partition (order-dependent count)
       actual_pinned_in_visible = 0;
       for (const auto &trip : visible_trips) {
-        if (this->pinned_routes_.find(trip.composite_key()) != this->pinned_routes_.end()) {
+        if (partition_routes.find(trip.composite_key()) != partition_routes.end()) {
           actual_pinned_in_visible++;
         } else {
           break;
         }
       }
+      // Deduplicate pinned section: keep only the soonest trip per distinct route
+      {
+        std::set<std::string> seen_keys;
+        int write = 0;
+        for (int i = 0; i < actual_pinned_in_visible; i++) {
+          std::string key = visible_trips[i].composite_key();
+          if (seen_keys.find(key) == seen_keys.end()) {
+            seen_keys.insert(key);
+            if (write != i) visible_trips[write] = visible_trips[i];
+            write++;
+          }
+        }
+        if (write < actual_pinned_in_visible) {
+          visible_trips.erase(visible_trips.begin() + write, visible_trips.begin() + actual_pinned_in_visible);
+          actual_pinned_in_visible = write;
+        }
+      }
     }
+    // Recompute effective_pinned_count based on distinct pinned routes
+    effective_pinned_count = (actual_pinned_in_visible > 0)
+      ? std::min(this->pinned_rows_count_, actual_pinned_in_visible)
+      : 0;
     // Set frame flag for pin icons based on current state
     this->frame_show_pin_icons_ = (effective_pinned_count > 0);
     // Suppress pin icons during phase 3 push-down, phase 4 slide, and phase 8 scroll-up
     if (this->pin_transition_phase_ == 3 || this->pin_transition_phase_ == 4 || this->pin_transition_phase_ == 8) {
       this->frame_show_pin_icons_ = false;
+    }
+
+    // Keep hidden-routes snapshot current while idle so it's ready for next transition
+    if (this->pin_transition_phase_ == 0) {
+      this->pin_transition_old_hidden_routes_ = this->hidden_routes_;
+      this->pin_transition_old_pinned_routes_ = this->pinned_routes_;
+      this->pin_transition_old_eff_pinned_ = effective_pinned_count;
     }
   }
 
@@ -1255,6 +1409,7 @@ void HOT TransitTracker::draw_schedule() {
       switch (this->split_scroll_phase_) {
         case 1: // Pre-scroll pause
           if (phase_elapsed >= (unsigned long)this->page_pause_duration_) {
+            ESP_LOGD(TAG, "Split scroll: phase 1 (pre-pause) complete, advancing pages");
             // Pre-pause complete — advance pages and begin pinned scroll
             this->split_old_pinned_page_ = this->pinned_page_index_;
             this->split_old_unpinned_page_ = this->split_unpinned_page_index_;
@@ -1346,10 +1501,16 @@ void HOT TransitTracker::draw_schedule() {
         case 5: // Post-scroll pause
           if (phase_elapsed >= (unsigned long)this->page_pause_duration_) {
             // Post-pause complete — resume normal operation
+            ESP_LOGD(TAG, "Split scroll: phase 5 (post-pause) complete, resuming normal");
             this->split_scroll_phase_ = 0;
             this->split_scroll_start_ = 0;
             this->pinned_h_scroll_start_ = uptime;
             this->pinned_page_timer_ = uptime;
+            // Clear old keys so the data transition detector doesn't see the
+            // page change as a trip departure.  The steady-state updater will
+            // repopulate them with the new page's keys this same frame.
+            this->data_transition_old_keys_.clear();
+            this->pinned_dt_old_trips_.clear();
           } else {
             in_split_pause = true;
           }
@@ -1363,13 +1524,26 @@ void HOT TransitTracker::draw_schedule() {
     if (!in_split_scroll && !in_split_pause && this->scroll_headsigns_) {
       int max_hw = 0;
       bool any_ov = false;
-      for (int i = pinned_si; i < pinned_ei; i++) {
-        int ov = 0, hw = 0;
-        this->draw_trip(pinned_pool[i], 0, nominal_font_height, uptime, rtc_now,
-                        true, &ov, &hw, -1, 0,
-                        uniform_clipping_start, uniform_clipping_end, true);
-        if (ov > 0) any_ov = true;
-        max_hw = std::max(max_hw, hw);
+      // During pinned data transition, use cached old trips for scroll distance
+      // so the h-scroll doesn't jump when the trip changes mid-cycle.
+      if (this->pinned_dt_phase_ >= 1 && !this->pinned_dt_old_trips_.empty()) {
+        for (const auto &trip : this->pinned_dt_old_trips_) {
+          int ov = 0, hw = 0;
+          this->draw_trip(trip, 0, nominal_font_height, uptime, rtc_now,
+                          true, &ov, &hw, -1, 0,
+                          uniform_clipping_start, uniform_clipping_end, true);
+          if (ov > 0) any_ov = true;
+          max_hw = std::max(max_hw, hw);
+        }
+      } else {
+        for (int i = pinned_si; i < pinned_ei; i++) {
+          int ov = 0, hw = 0;
+          this->draw_trip(pinned_pool[i], 0, nominal_font_height, uptime, rtc_now,
+                          true, &ov, &hw, -1, 0,
+                          uniform_clipping_start, uniform_clipping_end, true);
+          if (ov > 0) any_ov = true;
+          max_hw = std::max(max_hw, hw);
+        }
       }
       for (int i = unpinned_si; i < unpinned_ei; i++) {
         int ov = 0, hw = 0;
@@ -1418,10 +1592,23 @@ void HOT TransitTracker::draw_schedule() {
         if (this->pin_transition_seen_nonzero_offset_ && shared_h_offset < 3) {
           shared_h_offset = 0;
           this->pinned_h_scroll_start_ = uptime;  // reset h-scroll to genuine 0
-          bool is_pin_up = (this->pin_transition_target_eff_pinned_ > this->pin_transition_old_eff_pinned_);
-          if (is_pin_up) {
+          bool is_same_count_swap = (this->pin_transition_target_eff_pinned_ == this->pin_transition_old_eff_pinned_) &&
+                                    (this->pin_transition_target_pinned_routes_ != this->pin_transition_old_pinned_routes_);
+          bool is_pin_up = (this->pin_transition_target_eff_pinned_ >= this->pin_transition_old_eff_pinned_);
+          bool is_pin_expand = is_pin_up && this->pin_transition_old_eff_pinned_ > 0;
+          if (is_same_count_swap) {
+            ESP_LOGD(TAG, "Pin transition: phase 1 complete (split swap), entering phase 5 (hide old pinned)");
+            this->pin_transition_phase_ = 5;
+          } else if (is_pin_expand) {
+            ESP_LOGD(TAG, "Pin transition: phase 1 complete (split expand), entering phase 9 (push-down)");
+            this->pin_transition_phase_ = 9;
+          } else if (is_pin_up) {
             ESP_LOGD(TAG, "Pin transition: phase 1 complete (split), entering phase 2");
             this->pin_transition_phase_ = 2;
+          } else if (this->pin_transition_target_eff_pinned_ > 0) {
+            ESP_LOGD(TAG, "Pin transition: phase 1 complete (split shrink %d->%d), entering phase 12",
+                     this->pin_transition_old_eff_pinned_, this->pin_transition_target_eff_pinned_);
+            this->pin_transition_phase_ = 12;
           } else {
             ESP_LOGD(TAG, "Pin transition: phase 1 complete (split unpin), entering phase 5 (hide-pinned)");
             this->pin_transition_phase_ = 5;
@@ -1432,10 +1619,23 @@ void HOT TransitTracker::draw_schedule() {
         // No scrolling — wait 500ms
         unsigned long phase1_elapsed = uptime - this->pin_transition_start_;
         if (phase1_elapsed >= 500) {
-          bool is_pin_up = (this->pin_transition_target_eff_pinned_ > this->pin_transition_old_eff_pinned_);
-          if (is_pin_up) {
+          bool is_same_count_swap = (this->pin_transition_target_eff_pinned_ == this->pin_transition_old_eff_pinned_) &&
+                                    (this->pin_transition_target_pinned_routes_ != this->pin_transition_old_pinned_routes_);
+          bool is_pin_up = (this->pin_transition_target_eff_pinned_ >= this->pin_transition_old_eff_pinned_);
+          bool is_pin_expand = is_pin_up && this->pin_transition_old_eff_pinned_ > 0;
+          if (is_same_count_swap) {
+            ESP_LOGD(TAG, "Pin transition: phase 1 complete (split swap no-scroll), entering phase 5");
+            this->pin_transition_phase_ = 5;
+          } else if (is_pin_expand) {
+            ESP_LOGD(TAG, "Pin transition: phase 1 complete (split expand no-scroll), entering phase 9");
+            this->pin_transition_phase_ = 9;
+          } else if (is_pin_up) {
             ESP_LOGD(TAG, "Pin transition: phase 1 complete (split no-scroll), entering phase 2");
             this->pin_transition_phase_ = 2;
+          } else if (this->pin_transition_target_eff_pinned_ > 0) {
+            ESP_LOGD(TAG, "Pin transition: phase 1 complete (split shrink no-scroll %d->%d), entering phase 12",
+                     this->pin_transition_old_eff_pinned_, this->pin_transition_target_eff_pinned_);
+            this->pin_transition_phase_ = 12;
           } else {
             ESP_LOGD(TAG, "Pin transition: phase 1 complete (split no-scroll unpin), entering phase 5");
             this->pin_transition_phase_ = 5;
@@ -1452,7 +1652,7 @@ void HOT TransitTracker::draw_schedule() {
       collapse_t = collapse_t * collapse_t * (3.0f - 2.0f * collapse_t);
 
       if (collapse_t >= 1.0f && phase2_elapsed >= 1000) { // 500ms collapse + 500ms dwell
-        bool is_pin_up = (this->pin_transition_target_eff_pinned_ > this->pin_transition_old_eff_pinned_);
+        bool is_pin_up = (this->pin_transition_target_eff_pinned_ >= this->pin_transition_old_eff_pinned_);
         if (is_pin_up) {
           ESP_LOGD(TAG, "Pin transition: phase 2 complete (split), entering phase 3 (push-divider)");
           this->pin_transition_phase_ = 3;
@@ -1478,9 +1678,9 @@ void HOT TransitTracker::draw_schedule() {
       int collapsing_count = 0;
       for (int i = split_phase2_base; i < split_on_screen_end; i++) {
         std::string ck = visible_trips[i].composite_key();
-        bool newly_pinned = (this->pinned_routes_.find(ck) != this->pinned_routes_.end()) &&
+        bool newly_pinned = (this->pin_transition_target_pinned_routes_.find(ck) != this->pin_transition_target_pinned_routes_.end()) &&
                             (this->pin_transition_old_pinned_routes_.find(ck) == this->pin_transition_old_pinned_routes_.end());
-        bool newly_unpinned = (this->pinned_routes_.find(ck) == this->pinned_routes_.end()) &&
+        bool newly_unpinned = (this->pin_transition_target_pinned_routes_.find(ck) == this->pin_transition_target_pinned_routes_.end()) &&
                               (this->pin_transition_old_pinned_routes_.find(ck) != this->pin_transition_old_pinned_routes_.end());
         bool collapsing = newly_pinned || newly_unpinned;
         split_phase2_entries.push_back({i, collapsing});
@@ -1491,9 +1691,9 @@ void HOT TransitTracker::draw_schedule() {
       // First scan: from split_on_screen_end to end of list
       for (int i = split_on_screen_end; i < (int)visible_trips.size() && fill_needed > 0; i++) {
         std::string ck = visible_trips[i].composite_key();
-        bool newly_pinned = (this->pinned_routes_.find(ck) != this->pinned_routes_.end()) &&
+        bool newly_pinned = (this->pin_transition_target_pinned_routes_.find(ck) != this->pin_transition_target_pinned_routes_.end()) &&
                             (this->pin_transition_old_pinned_routes_.find(ck) == this->pin_transition_old_pinned_routes_.end());
-        bool newly_unpinned = (this->pinned_routes_.find(ck) == this->pinned_routes_.end()) &&
+        bool newly_unpinned = (this->pin_transition_target_pinned_routes_.find(ck) == this->pin_transition_target_pinned_routes_.end()) &&
                               (this->pin_transition_old_pinned_routes_.find(ck) != this->pin_transition_old_pinned_routes_.end());
         if (!newly_pinned && !newly_unpinned) {
           split_phase2_entries.push_back({i, false});
@@ -1503,9 +1703,9 @@ void HOT TransitTracker::draw_schedule() {
       // Wrap around: if still need fill, scan from 0 up to split_phase2_base
       for (int i = 0; i < split_phase2_base && fill_needed > 0; i++) {
         std::string ck = visible_trips[i].composite_key();
-        bool newly_pinned = (this->pinned_routes_.find(ck) != this->pinned_routes_.end()) &&
+        bool newly_pinned = (this->pin_transition_target_pinned_routes_.find(ck) != this->pin_transition_target_pinned_routes_.end()) &&
                             (this->pin_transition_old_pinned_routes_.find(ck) == this->pin_transition_old_pinned_routes_.end());
-        bool newly_unpinned = (this->pinned_routes_.find(ck) == this->pinned_routes_.end()) &&
+        bool newly_unpinned = (this->pin_transition_target_pinned_routes_.find(ck) == this->pin_transition_target_pinned_routes_.end()) &&
                               (this->pin_transition_old_pinned_routes_.find(ck) != this->pin_transition_old_pinned_routes_.end());
         if (!newly_pinned && !newly_unpinned) {
           split_phase2_entries.push_back({i, false});
@@ -1651,12 +1851,17 @@ void HOT TransitTracker::draw_schedule() {
         this->pin_transition_phase_ = 0;
         this->frame_pin_offset_override_ = -1; // clear override so snap uses normal pin icons
         if (this->pin_transition_pending_restart_) {
-          ESP_LOGD(TAG, "Pin transition: pending restart, re-initializing");
-          this->pin_transition_old_eff_pinned_ = -1;
+          ESP_LOGD(TAG, "Pin transition: pending restart, transitioning from target to live");
+          // Set old to the target we just finished transitioning to, so the detection
+          // block correctly sees the difference between target and current live state
+          this->pin_transition_old_eff_pinned_ = this->pin_transition_target_eff_pinned_;
+          this->pin_transition_old_pinned_routes_ = this->pin_transition_target_pinned_routes_;
+          this->pin_transition_old_hidden_routes_ = this->pin_transition_target_hidden_routes_;
           this->pin_transition_pending_restart_ = false;
         } else {
-          this->pin_transition_old_eff_pinned_ = -1;
-          this->pin_transition_old_pinned_routes_ = this->pinned_routes_;
+          this->pin_transition_old_eff_pinned_ = this->pin_transition_target_eff_pinned_;
+          this->pin_transition_old_pinned_routes_ = this->pin_transition_target_pinned_routes_;
+          this->pin_transition_old_hidden_routes_ = this->pin_transition_target_hidden_routes_;
         }
         // Reset split paging state for clean start
         this->pinned_page_index_ = 0;
@@ -1666,6 +1871,15 @@ void HOT TransitTracker::draw_schedule() {
         this->pinned_page_timer_ = 0;
         this->pinned_h_scroll_start_ = 0;
         this->last_shared_scroll_dist_ = 0;
+        // Clear data transition state so the split path doesn't detect a false
+        // trip change (old keys are stale from before the pin transition started)
+        this->data_transition_old_keys_.clear();
+        this->data_transition_phase_ = 0;
+        this->data_transition_departing_.clear();
+        this->data_transition_pending_cycles_ = -1;
+        this->pinned_dt_phase_ = 0;
+        this->pinned_dt_old_trips_.clear();
+        this->pinned_dt_pending_cycles_ = -1;
         // Don't return — let the phase 4 rendering run one more frame
         // so the display isn't blank. Normal layout picks up next frame.
       }
@@ -1749,9 +1963,24 @@ void HOT TransitTracker::draw_schedule() {
       hide_t = hide_t * hide_t * (3.0f - 2.0f * hide_t); // smoothstep
 
       if (hide_t >= 1.0f) {
-        ESP_LOGD(TAG, "Pin transition: phase 5 complete, entering phase 6 (slide-left)");
-        this->pin_transition_phase_ = 6;
-        this->pin_transition_start_ = uptime;
+        if (this->pin_transition_old_eff_pinned_ == this->pin_transition_target_eff_pinned_) {
+          // Same-count swap: old pinned route is now hidden; skip phases 6-9 and go
+          // directly to phase 10 to reveal the new pinned route. Set old_eff to 0 so
+          // phase 10 treats ALL pinned rows as "new" and scrolls them in from bottom.
+          ESP_LOGD(TAG, "Pin transition: phase 5 complete (swap), skipping to phase 10 (reveal new pinned)");
+          // Cache on-screen unpinned trips for smooth swap animation
+          this->pin_swap_old_unpinned_.clear();
+          for (int i = unpinned_si; i < unpinned_ei; i++) {
+            this->pin_swap_old_unpinned_.push_back(unpinned_pool[i]);
+          }
+          this->pin_transition_old_eff_pinned_ = 0;
+          this->pin_transition_phase_ = 10;
+          this->pin_transition_start_ = uptime;
+        } else {
+          ESP_LOGD(TAG, "Pin transition: phase 5 complete, entering phase 6 (slide-left)");
+          this->pin_transition_phase_ = 6;
+          this->pin_transition_start_ = uptime;
+        }
       }
 
       int fh = nominal_font_height;
@@ -1813,9 +2042,11 @@ void HOT TransitTracker::draw_schedule() {
       this->frame_pin_offset_override_ = slide_offset;
 
       // Recompute uniform_clipping with sliding offset
+      // uniform_clipping_start already has +7 baked in (from frame_show_pin_icons_ during pre-pass);
+      // replace that with the current slide_offset so the headsign slides left with the route name.
       int phase6_uniform_start = uniform_clipping_start;
       if (this->uniform_headsign_start_ && this->show_pin_icon_ && phase6_uniform_start >= 0) {
-        phase6_uniform_start += slide_offset;
+        phase6_uniform_start = phase6_uniform_start - 7 + slide_offset;
       }
 
       // Pinned area is empty (rows hidden in phase 5)
@@ -1894,12 +2125,17 @@ void HOT TransitTracker::draw_schedule() {
         ESP_LOGD(TAG, "Pin transition: phase 8 complete, snapping to flat layout");
         this->pin_transition_phase_ = 0;
         if (this->pin_transition_pending_restart_) {
-          ESP_LOGD(TAG, "Pin transition: pending restart, re-initializing");
-          this->pin_transition_old_eff_pinned_ = -1;
+          ESP_LOGD(TAG, "Pin transition: pending restart, transitioning from target to live");
+          // Set old to the target we just finished transitioning to, so the detection
+          // block correctly sees the difference between target and current live state
+          this->pin_transition_old_eff_pinned_ = this->pin_transition_target_eff_pinned_;
+          this->pin_transition_old_pinned_routes_ = this->pin_transition_target_pinned_routes_;
+          this->pin_transition_old_hidden_routes_ = this->pin_transition_target_hidden_routes_;
           this->pin_transition_pending_restart_ = false;
         } else {
-          this->pin_transition_old_eff_pinned_ = -1;
-          this->pin_transition_old_pinned_routes_ = this->pinned_routes_;
+          this->pin_transition_old_eff_pinned_ = this->pin_transition_target_eff_pinned_;
+          this->pin_transition_old_pinned_routes_ = this->pin_transition_target_pinned_routes_;
+          this->pin_transition_old_hidden_routes_ = this->pin_transition_target_hidden_routes_;
         }
         // Reset both split and flat paging state for clean start
         this->pinned_page_index_ = 0;
@@ -1922,6 +2158,15 @@ void HOT TransitTracker::draw_schedule() {
         this->data_transition_phase_ = 0;
         this->data_transition_departing_.clear();
         this->data_transition_pending_cycles_ = -1;
+        this->pinned_dt_phase_ = 0;
+        this->pinned_dt_old_trips_.clear();
+        this->pinned_dt_pending_cycles_ = -1;
+        this->pin_swap_old_unpinned_.clear();
+        ESP_LOGV(TAG, "Pin snap (flat): visible=%d, showing [0..%d)",
+                 (int)visible_trips.size(), std::min((int)visible_trips.size(), this->limit_));
+        for (int i = 0; i < std::min((int)visible_trips.size(), this->limit_); i++) {
+          ESP_LOGV(TAG, "  [%d] %s", i, visible_trips[i].composite_key().c_str());
+        }
         // Don't return — render one more frame at final position
       }
 
@@ -1957,8 +2202,9 @@ void HOT TransitTracker::draw_schedule() {
         if (it != unpinned_row_map.end()) {
           old_y = y_base + pinned_rows * fh + it->second * fh;
         } else {
-          // Formerly pinned: start just above display area
-          old_y = y_base - fh;
+          // Formerly pinned: start just below the last visible unpinned row
+          // so it enters from the bottom like a new row, not from above
+          old_y = y_base + pinned_rows * fh + unpinned_vis_count * fh;
         }
 
         int y = old_y + (int)((float)(target_y - old_y) * scroll_t + 0.5f);
@@ -1974,10 +2220,539 @@ void HOT TransitTracker::draw_schedule() {
       return;
     }
 
-    // ---- Paging trigger (only in phase 0) ----
-    if (this->split_scroll_phase_ == 0 && needs_any_paging) {
+    // Pin transition phase 9 (expand pins): push down barrier + unpinned content
+    if (this->pin_transition_phase_ == 9) {
+      unsigned long phase9_elapsed = uptime - this->pin_transition_start_;
+      float push_t = std::min(1.0f, (float)phase9_elapsed / 500.0f);
+      push_t = push_t * push_t * (3.0f - 2.0f * push_t); // smoothstep
+
+      if (push_t >= 1.0f) {
+        ESP_LOGD(TAG, "Pin transition: phase 9 complete, entering phase 10 (reveal expanded pins)");
+        this->pin_transition_phase_ = 10;
+        this->pin_transition_start_ = uptime;
+        // Don't return — render one more frame at pushed position.
+        // Note: do NOT populate pin_swap_old_unpinned_ here — the expand push-down
+        // already handles the visual transition, and phase 11's scroll covers the
+        // content change. Caching would cause a double-scroll effect.
+      }
+
+      int fh = nominal_font_height;
+      int dw = this->display_->get_width();
+      int dh = this->display_->get_height();
+      int old_pinned_rows = effective_pinned_count; // using OLD partition
+      int new_pinned_rows = this->pin_transition_target_eff_pinned_;
+      int delta_rows = new_pinned_rows - old_pinned_rows;
+      int push_pixels = (int)((float)(delta_rows * fh) * push_t + 0.5f);
+
+      // Old pinned rows: static if staying, scroll-out if being replaced
+      int old_divider_y = y_base - 1 + old_pinned_rows * fh - 1;
+      for (int i = pinned_si; i < pinned_ei; i++) {
+        int row = i - pinned_si;
+        int row_top = y_base - 1 + row * fh;
+        int row_bot = row_top + fh;
+        bool staying = this->pin_transition_target_pinned_routes_.find(pinned_pool[i].composite_key())
+                       != this->pin_transition_target_pinned_routes_.end();
+        this->display_->start_clipping(0, row_top, dw, std::min(row_bot, old_divider_y));
+        if (staying) {
+          this->draw_trip(pinned_pool[i], row_top, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, true);
+        } else {
+          // Scroll down out of row (like phase 5 hide)
+          int y_anim = row_top + (int)((float)fh * push_t + 0.5f);
+          this->draw_trip(pinned_pool[i], y_anim, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, true);
+        }
+        this->display_->end_clipping();
+      }
+
+      // Divider: animates from old position to new position
+      int divider_y_anim = old_divider_y + push_pixels;
+      if (divider_y_anim >= 0 && divider_y_anim < dh) {
+        this->display_->horizontal_line(0, divider_y_anim, dw, this->divider_color_);
+      }
+
+      // Unpinned section: pushes down with divider, clipped to below animated divider
+      int old_unpinned_y_start = y_base + old_pinned_rows * fh;
+      int animated_unpinned_y_start = old_unpinned_y_start + push_pixels;
+      this->display_->start_clipping(0, divider_y_anim + 1, dw, dh);
+      for (int i = unpinned_si; i < unpinned_ei; i++) {
+        int row = i - unpinned_si;
+        int y = animated_unpinned_y_start + row * fh;
+        if (y >= dh) break;
+        if (y + fh > 0) {
+          this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, false);
+        }
+      }
+      this->display_->end_clipping();
+
+      this->schedule_state_.mutex.unlock();
+      return;
+    }
+
+    // Pin transition phase 10 (expand pins): reveal new pinned rows from bottom
+    if (this->pin_transition_phase_ == 10) {
+      unsigned long phase10_elapsed = uptime - this->pin_transition_start_;
+      float reveal_t = std::min(1.0f, (float)phase10_elapsed / 500.0f);
+      reveal_t = reveal_t * reveal_t * (3.0f - 2.0f * reveal_t); // smoothstep
+
+      if (reveal_t >= 1.0f) {
+        ESP_LOGD(TAG, "Pin transition: phase 10 complete, entering phase 11 (dwell + unpinned scroll)");
+        this->pin_swap_old_unpinned_.clear(); // swap animation complete
+        this->pin_transition_phase_ = 11;
+        this->pin_transition_start_ = uptime;
+        // Don't return — render one more frame at fully revealed position.
+      }
+
+      int fh = nominal_font_height;
+      int dw = this->display_->get_width();
+      int dh = this->display_->get_height();
+      int new_pinned_rows = effective_pinned_count; // using TARGET partition now
+      int old_pinned_rows = this->pin_transition_old_eff_pinned_;
+
+      // Reset pinned page to show from start during expansion
+      int ph10_pinned_si = 0;
+      int ph10_pinned_ei = std::min(new_pinned_rows, (int)pinned_pool.size());
+
+      // Old pinned rows: static if same route, scroll-in if replaced
+      for (int i = ph10_pinned_si; i < std::min(ph10_pinned_si + old_pinned_rows, ph10_pinned_ei); i++) {
+        int row = i - ph10_pinned_si;
+        int row_top = y_base - 1 + row * fh;
+        bool was_old_pinned = this->pin_transition_old_pinned_routes_.find(pinned_pool[i].composite_key())
+                              != this->pin_transition_old_pinned_routes_.end();
+        if (was_old_pinned) {
+          // Truly old pinned trip — render static
+          this->draw_trip(pinned_pool[i], row_top, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, true);
+        } else {
+          // New route replacing old one — animate scroll-in from bottom
+          int row_bot = row_top + fh;
+          int y_anim = row_top + (int)((float)fh * (1.0f - reveal_t) + 0.5f);
+          this->display_->start_clipping(0, row_top, dw, row_bot);
+          this->draw_trip(pinned_pool[i], y_anim, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, true);
+          this->display_->end_clipping();
+        }
+      }
+
+      // New pinned rows: scroll in from bottom of each row
+      for (int i = ph10_pinned_si + old_pinned_rows; i < ph10_pinned_ei; i++) {
+        int row = i - ph10_pinned_si;
+        int row_top = y_base - 1 + row * fh;
+        int row_bot = row_top + fh;
+        // At reveal_t=0: trip at row_bot (hidden); at reveal_t=1: trip at row_top (visible)
+        int y_anim = row_top + (int)((float)fh * (1.0f - reveal_t) + 0.5f);
+        this->display_->start_clipping(0, row_top, dw, row_bot);
+        this->draw_trip(pinned_pool[i], y_anim, fh, uptime, rtc_now,
+                        false, nullptr, nullptr, 0, 0,
+                        uniform_clipping_start, uniform_clipping_end, true);
+        this->display_->end_clipping();
+      }
+
+      // Divider: static at new position
+      int divider_y = y_base - 1 + new_pinned_rows * fh - 1;
+      if (divider_y >= 0 && divider_y < dh) {
+        this->display_->horizontal_line(0, divider_y, dw, this->divider_color_);
+      }
+
+      // Unpinned section
+      int new_unpinned_rows = this->limit_ - new_pinned_rows;
+      int unpinned_y_start_ph10 = y_base + new_pinned_rows * fh;
+
+      if (!this->pin_swap_old_unpinned_.empty()) {
+        // Pin swap: animate unpinned section transition in sync with pinned reveal
+        // Newly-pinned trips collapse out, newly-unpinned trips expand in
+        std::set<std::string> newly_pinned_keys;
+        for (const auto &key : this->pin_transition_target_pinned_routes_) {
+          if (this->pin_transition_old_pinned_routes_.find(key) == this->pin_transition_old_pinned_routes_.end()) {
+            newly_pinned_keys.insert(key);
+          }
+        }
+        struct SwapEntry { const Trip *trip; float scale; };
+        std::vector<SwapEntry> swap_entries;
+        // Old unpinned trips: collapsing if newly pinned, static otherwise
+        for (const auto &trip : this->pin_swap_old_unpinned_) {
+          float s = newly_pinned_keys.count(trip.composite_key()) ? (1.0f - reveal_t) : 1.0f;
+          swap_entries.push_back({&trip, s});
+        }
+        // New unpinned trips not in old set: expanding
+        std::set<std::string> old_unp_keys;
+        for (const auto &trip : this->pin_swap_old_unpinned_)
+          old_unp_keys.insert(trip.composite_key());
+        int ph10_unpinned_ei = std::min(new_unpinned_rows, (int)unpinned_pool.size());
+        for (int i = 0; i < ph10_unpinned_ei; i++) {
+          if (old_unp_keys.find(unpinned_pool[i].composite_key()) == old_unp_keys.end()) {
+            swap_entries.push_back({&unpinned_pool[i], reveal_t});
+          }
+        }
+        // Render with clipping
+        this->display_->start_clipping(0, divider_y + 1, dw, dh);
+        float y_accum = (float)unpinned_y_start_ph10;
+        for (auto &entry : swap_entries) {
+          float row_height = (float)fh * entry.scale;
+          int y_int = (int)(y_accum + 0.5f);
+          if (entry.scale > 0.05f && y_int < dh) {
+            this->display_->start_clipping(0, std::max(y_int, divider_y + 1), dw, std::min(y_int + (int)(row_height + 0.5f), dh));
+            this->draw_trip(*entry.trip, y_int, fh, uptime, rtc_now,
+                            false, nullptr, nullptr, 0, 0,
+                            uniform_clipping_start, uniform_clipping_end, false);
+            this->display_->end_clipping();
+          }
+          y_accum += row_height;
+        }
+        this->display_->end_clipping();
+      } else {
+        // Normal: static at new position using target partition
+        int ph10_unpinned_si = 0;
+        int ph10_unpinned_ei = std::min(new_unpinned_rows, (int)unpinned_pool.size());
+        for (int i = ph10_unpinned_si; i < ph10_unpinned_ei; i++) {
+          int row = i - ph10_unpinned_si;
+          int y = unpinned_y_start_ph10 + row * fh;
+          if (y >= dh) break;
+          this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, false);
+        }
+      }
+
+      this->schedule_state_.mutex.unlock();
+      return;
+    }
+
+    // Pin transition phase 11 (expand pins): dwell for page_interval, then scroll
+    // unpinned rows and resume horizontal scrolling.
+    if (this->pin_transition_phase_ == 11) {
+      unsigned long phase11_elapsed = uptime - this->pin_transition_start_;
+
+      int fh = nominal_font_height;
+      int dw = this->display_->get_width();
+      int dh = this->display_->get_height();
+      int new_pinned_rows = effective_pinned_count; // using TARGET partition
+      int new_unpinned_rows = this->limit_ - new_pinned_rows;
+      int unpinned_pool_size_11 = (int)unpinned_pool.size();
+      bool needs_unpinned_scroll = (unpinned_pool_size_11 > new_unpinned_rows && this->scroll_routes_);
+
+      // Sub-stages:
+      //   A) 0..page_pause_duration_: dwell (show static new layout, no h-scroll)
+      //   B) page_pause_duration_..+page_scroll_duration_: scroll unpinned section (if needed)
+      //   C) +page_scroll_duration_..+page_pause_duration_: post-scroll pause
+      //   D) complete → snap to phase 0
+
+      unsigned long dwell_end = (unsigned long)this->page_pause_duration_;
+      unsigned long scroll_end = dwell_end + (needs_unpinned_scroll ? (unsigned long)this->page_scroll_duration_ : 0);
+      unsigned long pause_end = scroll_end + (needs_unpinned_scroll ? (unsigned long)this->page_pause_duration_ : 0);
+
+      bool phase11_complete = false;
+      float unpinned_scroll_t = 0.0f;
+      bool in_unpinned_scroll = false;
+      int ph11_unpinned_si = 0;
+      int ph11_unpinned_ei = std::min(new_unpinned_rows, unpinned_pool_size_11);
+
+      if (phase11_elapsed >= pause_end) {
+        // Complete — snap to new layout
+        phase11_complete = true;
+        // Update indices so the final "don't return" frame shows the scrolled position
+        if (needs_unpinned_scroll) {
+          int unpinned_pages = std::max(1, unpinned_pool_size_11 - new_unpinned_rows + 1);
+          ph11_unpinned_si = 1 % unpinned_pages;
+          ph11_unpinned_ei = std::min(ph11_unpinned_si + new_unpinned_rows, unpinned_pool_size_11);
+        }
+      } else if (needs_unpinned_scroll && phase11_elapsed >= dwell_end && phase11_elapsed < scroll_end) {
+        // Sub-stage B: scrolling unpinned section
+        unsigned long scroll_elapsed = phase11_elapsed - dwell_end;
+        unpinned_scroll_t = std::min(1.0f, (float)scroll_elapsed / (float)this->page_scroll_duration_);
+        unpinned_scroll_t = unpinned_scroll_t * unpinned_scroll_t * (3.0f - 2.0f * unpinned_scroll_t);
+        in_unpinned_scroll = true;
+        // Advance to next page for scroll animation
+        int unpinned_pages = std::max(1, unpinned_pool_size_11 - new_unpinned_rows + 1);
+        ph11_unpinned_si = 1 % unpinned_pages;  // scroll by one row
+        ph11_unpinned_ei = std::min(ph11_unpinned_si + new_unpinned_rows, unpinned_pool_size_11);
+      } else if (needs_unpinned_scroll && phase11_elapsed >= scroll_end) {
+        // Sub-stage C: post-scroll pause — show scrolled position
+        int unpinned_pages = std::max(1, unpinned_pool_size_11 - new_unpinned_rows + 1);
+        ph11_unpinned_si = 1 % unpinned_pages;
+        ph11_unpinned_ei = std::min(ph11_unpinned_si + new_unpinned_rows, unpinned_pool_size_11);
+      }
+      // Sub-stage A (dwell): ph11_unpinned_si/ei remain at 0..new_unpinned_rows
+
+      if (phase11_complete) {
+        ESP_LOGD(TAG, "Pin transition: phase 11 complete, snapping to expanded split layout");
+        this->pin_transition_phase_ = 0;
+        if (this->pin_transition_pending_restart_) {
+          ESP_LOGD(TAG, "Pin transition: pending restart after expand");
+          this->pin_transition_old_eff_pinned_ = this->pin_transition_target_eff_pinned_;
+          this->pin_transition_old_pinned_routes_ = this->pin_transition_target_pinned_routes_;
+          this->pin_transition_old_hidden_routes_ = this->pin_transition_target_hidden_routes_;
+          this->pin_transition_pending_restart_ = false;
+        } else {
+          this->pin_transition_old_eff_pinned_ = this->pin_transition_target_eff_pinned_;
+          this->pin_transition_old_pinned_routes_ = this->pin_transition_target_pinned_routes_;
+          this->pin_transition_old_hidden_routes_ = this->pin_transition_target_hidden_routes_;
+        }
+        // Reset split paging state for clean start
+        this->pinned_page_index_ = 0;
+        this->split_unpinned_page_index_ = needs_unpinned_scroll ? (1 % std::max(1, unpinned_pool_size_11 - new_unpinned_rows + 1)) : 0;
+        this->split_scroll_phase_ = 0;
+        this->split_unpinned_page_timer_ = 0;
+        this->pinned_page_timer_ = uptime;
+        this->pinned_h_scroll_start_ = uptime;
+        this->last_shared_scroll_dist_ = 0;
+        this->pin_swap_old_unpinned_.clear();
+        // Clear data transition state so the split path doesn't detect a false
+        // trip change (old keys are stale from before the pin transition started)
+        this->data_transition_old_keys_.clear();
+        this->data_transition_phase_ = 0;
+        this->data_transition_departing_.clear();
+        this->data_transition_pending_cycles_ = -1;
+        this->pinned_dt_phase_ = 0;
+        this->pinned_dt_old_trips_.clear();
+        this->pinned_dt_pending_cycles_ = -1;
+        // Don't return — render one final frame, then normal layout picks up.
+      }
+
+      // Draw pinned rows
+      int ph11_pinned_si = 0;
+      int ph11_pinned_ei = std::min(new_pinned_rows, (int)pinned_pool.size());
+      for (int i = ph11_pinned_si; i < ph11_pinned_ei; i++) {
+        int row = i - ph11_pinned_si;
+        int y_row = y_base - 1 + row * fh;
+        this->draw_trip(pinned_pool[i], y_row, fh, uptime, rtc_now,
+                        false, nullptr, nullptr, 0, 0,
+                        uniform_clipping_start, uniform_clipping_end, true);
+      }
+
+      // Divider
+      int divider_y = y_base - 1 + new_pinned_rows * fh - 1;
+      if (divider_y >= 0 && divider_y < dh) {
+        this->display_->horizontal_line(0, divider_y, dw, this->divider_color_);
+      }
+
+      // Unpinned section
+      int unpinned_y_start_ph11 = y_base + new_pinned_rows * fh;
+      this->display_->start_clipping(0, divider_y + 1, dw, dh);
+      if (in_unpinned_scroll) {
+        // Animate: scroll from old page (si=0) to new page (si=ph11_unpinned_si)
+        int pixel_shift = (int)(unpinned_scroll_t * fh);
+
+        // Draw old page (scrolling up/out)
+        int old_ei = std::min(new_unpinned_rows, unpinned_pool_size_11);
+        for (int i = 0; i < old_ei; i++) {
+          int y = unpinned_y_start_ph11 + i * fh - pixel_shift;
+          if (y + fh > divider_y && y < dh) {
+            this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                            false, nullptr, nullptr, 0, 0,
+                            uniform_clipping_start, uniform_clipping_end, false);
+          }
+        }
+        // Draw incoming row (scrolling in from bottom)
+        if (ph11_unpinned_ei > old_ei - 1) {
+          int new_trip_idx = ph11_unpinned_ei - 1;
+          if (new_trip_idx >= 0 && new_trip_idx < unpinned_pool_size_11) {
+            int y = unpinned_y_start_ph11 + new_unpinned_rows * fh - pixel_shift;
+            if (y + fh > divider_y && y < dh) {
+              this->draw_trip(unpinned_pool[new_trip_idx], y, fh, uptime, rtc_now,
+                              false, nullptr, nullptr, 0, 0,
+                              uniform_clipping_start, uniform_clipping_end, false);
+            }
+          }
+        }
+      } else {
+        // Static: draw current page
+        for (int i = ph11_unpinned_si; i < ph11_unpinned_ei; i++) {
+          int row = i - ph11_unpinned_si;
+          int y = unpinned_y_start_ph11 + row * fh;
+          if (y >= dh) break;
+          this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, false);
+        }
+      }
+      this->display_->end_clipping();
+
+      this->schedule_state_.mutex.unlock();
+      return;
+    }
+
+    // Pin transition phase 12 (shrink pins): compress extra pinned rows, raise barrier,
+    // and simultaneously scroll bottom container (old free rows out, new free rows in).
+    if (this->pin_transition_phase_ == 12) {
+      unsigned long phase12_elapsed = uptime - this->pin_transition_start_;
+      unsigned long pre_pause = (unsigned long)this->page_pause_duration_;
+
+      // Sub-stages: [0..pre_pause) = pre-pause, [pre_pause..pre_pause+500) = collapse anim
+      bool in_pre_pause = (phase12_elapsed < pre_pause);
+      unsigned long anim_elapsed = in_pre_pause ? 0 : (phase12_elapsed - pre_pause);
+      float anim_t = in_pre_pause ? 0.0f : std::min(1.0f, (float)anim_elapsed / 500.0f);
+      anim_t = anim_t * anim_t * (3.0f - 2.0f * anim_t); // smoothstep
+
+      bool anim_done = (!in_pre_pause && anim_t >= 1.0f);
+
+      int fh = nominal_font_height;
+      int dw = this->display_->get_width();
+      int dh = this->display_->get_height();
+
+      int old_pinned_rows = this->pin_transition_old_eff_pinned_;
+      int new_pinned_rows = this->pin_transition_target_eff_pinned_;
+      int old_unpinned_rows = this->limit_ - old_pinned_rows;
+      int new_unpinned_rows = this->limit_ - new_pinned_rows;
+      int delta_rows = old_pinned_rows - new_pinned_rows; // > 0 since pin count dropped
+
+      // Compute target unpinned pool (re-partition visible_trips with target routes)
+      std::vector<Trip> target_unpinned;
+      {
+        std::vector<Trip> target_visible;
+        for (const Trip &trip : this->schedule_state_.trips) {
+          if (this->pin_transition_target_hidden_routes_.find(trip.composite_key()) == this->pin_transition_target_hidden_routes_.end()) {
+            target_visible.push_back(trip);
+          }
+        }
+        if (!this->pin_transition_target_pinned_routes_.empty()) {
+          std::stable_partition(target_visible.begin(), target_visible.end(), [this](const Trip &trip) {
+            return this->pin_transition_target_pinned_routes_.find(trip.composite_key()) != this->pin_transition_target_pinned_routes_.end();
+          });
+          int tpc = 0;
+          for (const auto &trip : target_visible) {
+            if (this->pin_transition_target_pinned_routes_.find(trip.composite_key()) != this->pin_transition_target_pinned_routes_.end()) {
+              tpc++;
+            } else break;
+          }
+          // Deduplicate pinned section
+          {
+            std::set<std::string> seen_keys;
+            int write = 0;
+            for (int i = 0; i < tpc; i++) {
+              std::string key = target_visible[i].composite_key();
+              if (seen_keys.find(key) == seen_keys.end()) {
+                seen_keys.insert(key);
+                if (write != i) target_visible[write] = target_visible[i];
+                write++;
+              }
+            }
+            if (write < tpc) {
+              target_visible.erase(target_visible.begin() + write, target_visible.begin() + tpc);
+              tpc = write;
+            }
+          }
+          for (int i = tpc; i < (int)target_visible.size(); i++) {
+            target_unpinned.push_back(target_visible[i]);
+          }
+        } else {
+          target_unpinned = target_visible;
+        }
+      }
+
+      // Completion check (pre-pause + animation done + post-dwell)
+      if (anim_done && phase12_elapsed >= (unsigned long)(pre_pause + 500 + this->page_pause_duration_)) {
+        ESP_LOGD(TAG, "Pin transition: phase 12 complete, snapping to shrunk split layout");
+        this->pin_transition_phase_ = 0;
+        if (this->pin_transition_pending_restart_) {
+          ESP_LOGD(TAG, "Pin transition: pending restart after shrink");
+          this->pin_transition_old_eff_pinned_ = this->pin_transition_target_eff_pinned_;
+          this->pin_transition_old_pinned_routes_ = this->pin_transition_target_pinned_routes_;
+          this->pin_transition_old_hidden_routes_ = this->pin_transition_target_hidden_routes_;
+          this->pin_transition_pending_restart_ = false;
+        } else {
+          this->pin_transition_old_eff_pinned_ = this->pin_transition_target_eff_pinned_;
+          this->pin_transition_old_pinned_routes_ = this->pin_transition_target_pinned_routes_;
+          this->pin_transition_old_hidden_routes_ = this->pin_transition_target_hidden_routes_;
+        }
+        // Reset split paging state for clean start
+        this->pinned_page_index_ = 0;
+        this->split_unpinned_page_index_ = 0;
+        this->split_scroll_phase_ = 0;
+        this->split_unpinned_page_timer_ = 0;
+        this->pinned_page_timer_ = uptime;
+        this->pinned_h_scroll_start_ = uptime;
+        this->last_shared_scroll_dist_ = 0;
+        this->pin_swap_old_unpinned_.clear();
+        // Clear data transition state so the split path doesn't detect a false
+        // trip change (old keys are stale from before the pin transition started)
+        this->data_transition_old_keys_.clear();
+        this->data_transition_phase_ = 0;
+        this->data_transition_departing_.clear();
+        this->data_transition_pending_cycles_ = -1;
+        this->pinned_dt_phase_ = 0;
+        this->pinned_dt_old_trips_.clear();
+        this->pinned_dt_pending_cycles_ = -1;
+        // Don't return — render one final frame at destination, then normal picks up.
+      }
+
+      // --- Pinned section: rows 0..new_pinned_rows-1 static, rows new_pinned_rows..old_pinned_rows-1 collapsing ---
+      float y_accum_pin = (float)(y_base - 1);
+      for (int i = pinned_si; i < std::min(pinned_si + old_pinned_rows, (int)pinned_pool.size()); i++) {
+        int row = i - pinned_si;
+        bool collapsing = (row >= new_pinned_rows);
+        float row_scale = collapsing ? (1.0f - anim_t) : 1.0f;
+        float row_height = (float)fh * row_scale;
+        int y_int = (int)(y_accum_pin + 0.5f);
+
+        if (row_scale > 0.05f && y_int < dh) {
+          this->display_->start_clipping(0, y_int, dw, std::min(y_int + (int)(row_height + 0.5f), dh));
+          this->draw_trip(pinned_pool[i], y_int, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, true);
+          this->display_->end_clipping();
+        }
+        y_accum_pin += row_height;
+      }
+
+      // --- Animated divider: tracks bottom of compressed pinned section ---
+      int divider_y_anim = (int)(y_accum_pin + 0.5f) - 1;
+      if (divider_y_anim >= 0 && divider_y_anim < dh) {
+        this->display_->horizontal_line(0, divider_y_anim, dw, this->divider_color_);
+      }
+
+      // --- Unpinned section: scroll old content out, new content in ---
+      // Content anchored at old unpinned start, scrolled up by new_free rows total.
+      // old_unpinned_start = y_base + old_pinned_rows * fh (fixed reference point)
+      // pixel_shift = anim_t * new_unpinned_rows * fh
+      // The viewport clips to below the animated divider, so as the divider rises,
+      // rows naturally become visible in the expanding viewport.
+      int old_unpinned_start = y_base + old_pinned_rows * fh;
+      int pixel_shift_px = (int)(anim_t * (float)(new_unpinned_rows * fh) + 0.5f);
+
+      this->display_->start_clipping(0, divider_y_anim + 1, dw, dh);
+
+      // Draw old unpinned rows (scrolling up/out)
+      for (int i = unpinned_si; i < unpinned_ei; i++) {
+        int row = i - unpinned_si;
+        int y = old_unpinned_start + row * fh - pixel_shift_px;
+        if (y + fh > divider_y_anim && y < dh) {
+          this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, false);
+        }
+      }
+
+      // Draw new unpinned rows (scrolling in from below)
+      int new_content_base = old_unpinned_start + old_unpinned_rows * fh;
+      int target_unp_count = std::min(new_unpinned_rows, (int)target_unpinned.size());
+      for (int j = 0; j < target_unp_count; j++) {
+        int y = new_content_base + j * fh - pixel_shift_px;
+        if (y + fh > divider_y_anim && y < dh) {
+          this->draw_trip(target_unpinned[j], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, false);
+        }
+      }
+
+      this->display_->end_clipping();
+
+      this->schedule_state_.mutex.unlock();
+      return;
+    }
+
+    // ---- Paging trigger (only in phase 0, and not during data transition) ----
+    if (this->split_scroll_phase_ == 0 && this->data_transition_phase_ == 0 && needs_any_paging) {
       bool page_interval_elapsed = (uptime - this->pinned_page_timer_ >= (unsigned long)this->page_interval_);
       if (page_interval_elapsed && this->split_unpinned_page_timer_ == 0) {
+        ESP_LOGD(TAG, "Paging: interval elapsed (%lums since timer), setting pending",
+                 (unsigned long)(uptime - this->pinned_page_timer_));
         this->split_unpinned_page_timer_ = 1;
         this->split_unpinned_h_scroll_start_ = (unsigned long)shared_h_cycles;
       }
@@ -1987,6 +2762,7 @@ void HOT TransitTracker::draw_schedule() {
                           (shared_h_cycles > (int)this->split_unpinned_h_scroll_start_);
         if (can_change) {
           // Enter pre-scroll pause
+          ESP_LOGD(TAG, "Paging: starting split scroll phase 1 (pre-pause)");
           shared_h_offset = 0;
           this->split_unpinned_page_timer_ = 0;
           this->split_scroll_phase_ = 1;
@@ -1998,6 +2774,218 @@ void HOT TransitTracker::draw_schedule() {
       this->split_unpinned_page_index_ = 0;
       this->split_unpinned_page_timer_ = 0;
       this->pinned_page_timer_ = uptime;
+    }
+
+    // ====== SPLIT DATA TRANSITION: detect on-screen trip changes and animate ======
+    // Build current on-screen unpinned keys
+    std::vector<std::string> split_on_screen_keys;
+    for (int i = unpinned_si; i < unpinned_ei; i++)
+      split_on_screen_keys.push_back(unpinned_pool[i].composite_key());
+
+    // Detect changes (only in steady state: no split scroll, no pin transition)
+    if (this->data_transition_phase_ == 0 &&
+        !in_split_scroll && !in_split_pause &&
+        this->pin_transition_phase_ == 0 &&
+        !this->data_transition_old_keys_.empty()) {
+      bool keys_changed = (split_on_screen_keys.size() != this->data_transition_old_keys_.size());
+      if (!keys_changed) {
+        for (size_t i = 0; i < split_on_screen_keys.size(); i++) {
+          if (split_on_screen_keys[i] != this->data_transition_old_keys_[i]) {
+            keys_changed = true;
+            break;
+          }
+        }
+      }
+      if (keys_changed) {
+        std::set<std::string> new_key_set(split_on_screen_keys.begin(), split_on_screen_keys.end());
+        this->data_transition_departing_.clear();
+        for (const auto &old_key : this->data_transition_old_keys_) {
+          if (new_key_set.find(old_key) == new_key_set.end()) {
+            bool found = false;
+            for (const auto &trip : unpinned_pool) {
+              if (trip.composite_key() == old_key) { this->data_transition_departing_.push_back(trip); found = true; break; }
+            }
+            if (!found) {
+              for (const auto &trip : visible_trips) {
+                if (trip.composite_key() == old_key) { this->data_transition_departing_.push_back(trip); found = true; break; }
+              }
+            }
+            if (!found) {
+              Trip placeholder;
+              placeholder.route_id = old_key;
+              placeholder.route_name = "?";
+              placeholder.headsign = "";
+              placeholder.route_color = Color(0x333333);
+              placeholder.arrival_time = 0;
+              placeholder.departure_time = 0;
+              placeholder.is_realtime = false;
+              this->data_transition_departing_.push_back(placeholder);
+            }
+          }
+        }
+        if (!this->data_transition_departing_.empty()) {
+          for (const auto &dep : this->data_transition_departing_)
+            ESP_LOGD(TAG, "Split on-screen: DEPARTED '%s'", dep.composite_key().c_str());
+          std::set<std::string> old_set2(this->data_transition_old_keys_.begin(), this->data_transition_old_keys_.end());
+          for (const auto &key : split_on_screen_keys)
+            if (old_set2.find(key) == old_set2.end())
+              ESP_LOGD(TAG, "Split on-screen: APPEARED '%s'", key.c_str());
+
+          // Cancel any pending or in-progress paging scroll.
+          // The paging trigger runs BEFORE data-transition detection each frame,
+          // so split_scroll_phase_ may have just been set to 1 in this same frame.
+          this->split_unpinned_page_timer_ = 0;
+          this->pinned_page_timer_ = uptime;
+          if (this->split_scroll_phase_ != 0) {
+            ESP_LOGD(TAG, "Split data transition: cancelling active split scroll (phase %d)", this->split_scroll_phase_);
+            this->split_scroll_phase_ = 0;
+            this->split_scroll_start_ = 0;
+          }
+
+          if (shared_scroll_dist > 0 && shared_h_offset > 0) {
+            ESP_LOGD(TAG, "Split data transition: %d trip(s) departed, waiting for h-scroll",
+                     (int)this->data_transition_departing_.size());
+            this->data_transition_phase_ = 1;
+            this->data_transition_pending_cycles_ = shared_h_cycles;
+          } else {
+            ESP_LOGD(TAG, "Split data transition: %d trip(s) departed, starting collapse",
+                     (int)this->data_transition_departing_.size());
+            this->data_transition_phase_ = 2;
+            this->data_transition_start_ = uptime;
+          }
+        } else {
+          std::set<std::string> old_set(this->data_transition_old_keys_.begin(), this->data_transition_old_keys_.end());
+          for (const auto &key : split_on_screen_keys)
+            if (old_set.find(key) == old_set.end())
+              ESP_LOGD(TAG, "Split on-screen: APPEARED (no depart) '%s'", key.c_str());
+          this->data_transition_old_keys_ = split_on_screen_keys;
+        }
+      }
+    }
+
+    // Phase 1: waiting for h-scroll cycle to complete (split path)
+    if (this->data_transition_phase_ == 1 && this->pin_transition_phase_ == 0) {
+      bool scroll_idle = (shared_scroll_dist == 0) ||
+                         (shared_h_cycles > this->data_transition_pending_cycles_);
+      if (scroll_idle) {
+        ESP_LOGD(TAG, "Split data transition: h-scroll idle, starting collapse");
+        this->data_transition_phase_ = 2;
+        this->data_transition_start_ = uptime;
+        this->data_transition_pending_cycles_ = -1;
+      }
+    }
+
+    // Phase 2 completion check (split path)
+    if (this->data_transition_phase_ == 2 && this->pin_transition_phase_ == 0) {
+      unsigned long dt_elapsed = uptime - this->data_transition_start_;
+      float collapse_t = std::min(1.0f, (float)dt_elapsed / 500.0f);
+      if (collapse_t >= 1.0f) {
+        ESP_LOGD(TAG, "Split data transition: phase 2 collapse complete, resuming normal");
+        this->data_transition_phase_ = 0;
+        this->data_transition_departing_.clear();
+        this->data_transition_pending_cycles_ = -1;
+        this->data_transition_old_keys_ = split_on_screen_keys;
+        // Reset page timer so a full interval elapses before the next v-scroll,
+        // preventing a data-transition collapse from being immediately followed
+        // by a paging scroll on the unpinned section.
+        this->pinned_page_timer_ = uptime;
+        // Also cancel any pending paging scroll that was queued before the
+        // data transition started.
+        this->split_unpinned_page_timer_ = 0;
+        // Fall through to normal drawing
+      }
+    }
+
+    // Update cached keys (steady state only, not during transitions)
+    if (this->data_transition_phase_ == 0 && this->pin_transition_phase_ == 0 &&
+        this->pinned_dt_phase_ == 0 &&
+        !in_split_scroll && !in_split_pause) {
+      this->data_transition_old_keys_ = split_on_screen_keys;
+    }
+
+    // ====== PINNED DATA TRANSITION: detect on-screen pinned trip changes ======
+    // (e.g., "Now" trip departs and is replaced by "10m" for the same route)
+    if (this->pinned_dt_phase_ == 0 &&
+        !in_split_scroll && !in_split_pause &&
+        this->pin_transition_phase_ == 0 &&
+        !this->pinned_dt_old_trips_.empty()) {
+      bool pinned_changed = false;
+      int cur_pinned_count = pinned_ei - pinned_si;
+      if (cur_pinned_count != (int)this->pinned_dt_old_trips_.size()) {
+        pinned_changed = true;
+      } else {
+        for (int i = 0; i < cur_pinned_count; i++) {
+          const auto &cur = pinned_pool[pinned_si + i];
+          const auto &old_t = this->pinned_dt_old_trips_[i];
+          if (cur.departure_time != old_t.departure_time ||
+              cur.composite_key() != old_t.composite_key()) {
+            pinned_changed = true;
+            break;
+          }
+        }
+      }
+
+      if (pinned_changed) {
+        // Cancel any pending paging scroll
+        this->split_unpinned_page_timer_ = 0;
+        this->pinned_page_timer_ = uptime;
+        if (this->split_scroll_phase_ != 0) {
+          ESP_LOGD(TAG, "Pinned data transition: cancelling active split scroll (phase %d)", this->split_scroll_phase_);
+          this->split_scroll_phase_ = 0;
+          this->split_scroll_start_ = 0;
+        }
+
+        if (shared_scroll_dist > 0 && shared_h_offset > 0) {
+          ESP_LOGD(TAG, "Pinned data transition: trip changed, waiting for h-scroll");
+          this->pinned_dt_phase_ = 1;
+          this->pinned_dt_pending_cycles_ = shared_h_cycles;
+        } else {
+          ESP_LOGD(TAG, "Pinned data transition: trip changed, starting animation");
+          this->pinned_dt_phase_ = 2;
+          this->pinned_dt_start_ = uptime;
+        }
+      }
+    }
+
+    // Pinned data transition phase 1: wait for h-scroll cycle to complete
+    if (this->pinned_dt_phase_ == 1 && this->pin_transition_phase_ == 0) {
+      bool scroll_idle = (shared_scroll_dist == 0) ||
+                         (shared_h_cycles > this->pinned_dt_pending_cycles_);
+      if (scroll_idle) {
+        ESP_LOGD(TAG, "Pinned data transition: h-scroll idle, starting animation");
+        this->pinned_dt_phase_ = 2;
+        this->pinned_dt_start_ = uptime;
+        this->pinned_dt_pending_cycles_ = -1;
+      }
+    }
+
+    // Pinned data transition phase 2 completion check
+    if (this->pinned_dt_phase_ == 2 && this->pin_transition_phase_ == 0) {
+      unsigned long pdt_elapsed = uptime - this->pinned_dt_start_;
+      float pdt_t = std::min(1.0f, (float)pdt_elapsed / 500.0f);
+      if (pdt_t >= 1.0f) {
+        ESP_LOGD(TAG, "Pinned data transition: animation complete");
+        this->pinned_dt_phase_ = 0;
+        this->pinned_dt_old_trips_.clear();
+        for (int i = pinned_si; i < pinned_ei; i++) {
+          this->pinned_dt_old_trips_.push_back(pinned_pool[i]);
+        }
+        this->pinned_dt_pending_cycles_ = -1;
+        this->pinned_page_timer_ = uptime;
+        this->pinned_h_scroll_start_ = uptime;
+        this->last_shared_scroll_dist_ = 0;
+        // Fall through to normal drawing
+      }
+    }
+
+    // Update cached pinned trips (steady state only)
+    if (this->pinned_dt_phase_ == 0 && this->pin_transition_phase_ == 0 &&
+        this->data_transition_phase_ == 0 &&
+        !in_split_scroll && !in_split_pause) {
+      this->pinned_dt_old_trips_.clear();
+      for (int i = pinned_si; i < pinned_ei; i++) {
+        this->pinned_dt_old_trips_.push_back(pinned_pool[i]);
+      }
     }
 
     // ---- Drawing ----
@@ -2144,15 +3132,148 @@ void HOT TransitTracker::draw_schedule() {
       }
       this->display_->end_clipping();
 
+    } else if (this->data_transition_phase_ == 2 || this->pinned_dt_phase_ == 2) {
+      // Split data/pinned transition: animate one or both sections
+
+      // == Pinned section ==
+      this->display_->start_clipping(0, 0, dw, divider_y);
+      if (this->pinned_dt_phase_ == 2 && !this->pinned_dt_old_trips_.empty()) {
+        // Animate: old pinned trips scroll down out, new scroll in from above
+        unsigned long pdt_elapsed2 = uptime - this->pinned_dt_start_;
+        float pdt_t2 = std::min(1.0f, (float)pdt_elapsed2 / 500.0f);
+        pdt_t2 = pdt_t2 * pdt_t2 * (3.0f - 2.0f * pdt_t2); // smoothstep
+        int old_count = (int)this->pinned_dt_old_trips_.size();
+        int new_count = pinned_ei - pinned_si;
+        int max_count = std::max(old_count, new_count);
+        for (int ri = 0; ri < max_count; ri++) {
+          int row_top = y_base - 1 + ri * fh;
+          // Clip to this row within the pinned area
+          this->display_->start_clipping(0, std::max(row_top, 0), dw, std::min(row_top + fh, divider_y));
+          // Old trip scrolls down
+          if (ri < old_count) {
+            int old_y = row_top + (int)((float)fh * pdt_t2 + 0.5f);
+            this->draw_trip(this->pinned_dt_old_trips_[ri], old_y, fh, uptime, rtc_now,
+                            false, nullptr, nullptr, 0, 0,
+                            uniform_clipping_start, uniform_clipping_end, true);
+          }
+          // New trip scrolls in from above
+          if (ri < new_count) {
+            int new_y = row_top - fh + (int)((float)fh * pdt_t2 + 0.5f);
+            this->draw_trip(pinned_pool[pinned_si + ri], new_y, fh, uptime, rtc_now,
+                            false, nullptr, nullptr, 0, 0,
+                            uniform_clipping_start, uniform_clipping_end, true);
+          }
+          this->display_->end_clipping();
+        }
+      } else {
+        // Static pinned (no h-scroll during unpinned collapse)
+        // Use old trips if in pinned_dt phase 1 (waiting for h-scroll)
+        if (this->pinned_dt_phase_ == 1 && !this->pinned_dt_old_trips_.empty()) {
+          for (int ri = 0; ri < (int)this->pinned_dt_old_trips_.size() && ri < pinned_rows; ri++) {
+            int y = y_base - 1 + ri * fh;
+            this->draw_trip(this->pinned_dt_old_trips_[ri], y, fh, uptime, rtc_now,
+                            false, nullptr, nullptr, 0, 0,
+                            uniform_clipping_start, uniform_clipping_end, true);
+          }
+        } else {
+          for (int i = pinned_si; i < pinned_ei; i++) {
+            int row = i - pinned_si;
+            int y = y_base - 1 + row * fh;
+            this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
+                            false, nullptr, nullptr, 0, 0,
+                            uniform_clipping_start, uniform_clipping_end, true);
+          }
+        }
+      }
+      this->display_->end_clipping();
+      this->display_->horizontal_line(0, divider_y, dw, this->divider_color_);
+
+      // == Unpinned section ==
+      if (this->data_transition_phase_ == 2) {
+        // Unpinned collapse animation (departing rows shrink, others fill from below)
+        unsigned long dt_elapsed2 = uptime - this->data_transition_start_;
+        float collapse_t2 = std::min(1.0f, (float)dt_elapsed2 / 500.0f);
+        collapse_t2 = collapse_t2 * collapse_t2 * (3.0f - 2.0f * collapse_t2); // smoothstep
+
+        this->display_->start_clipping(0, divider_y + 1, dw, dh);
+        std::set<std::string> dep_keys;
+        for (const auto &dep : this->data_transition_departing_)
+          dep_keys.insert(dep.composite_key());
+
+        struct SplitDTEntry { const Trip *trip; float scale; };
+        std::vector<SplitDTEntry> dt_entries;
+
+        for (const auto &old_key : this->data_transition_old_keys_) {
+          bool is_departing = dep_keys.count(old_key) > 0;
+          if (is_departing) {
+            const Trip *dep_trip = nullptr;
+            for (const auto &dep : this->data_transition_departing_) {
+              if (dep.composite_key() == old_key) { dep_trip = &dep; break; }
+            }
+            if (dep_trip) dt_entries.push_back({dep_trip, 1.0f - collapse_t2});
+          } else {
+            for (int i = unpinned_si; i < unpinned_ei; i++) {
+              if (unpinned_pool[i].composite_key() == old_key) {
+                dt_entries.push_back({&unpinned_pool[i], 1.0f});
+                break;
+              }
+            }
+          }
+        }
+
+        std::set<std::string> old_key_set(this->data_transition_old_keys_.begin(), this->data_transition_old_keys_.end());
+        for (int i = unpinned_si; i < unpinned_ei; i++) {
+          if (old_key_set.find(unpinned_pool[i].composite_key()) == old_key_set.end()) {
+            dt_entries.push_back({&unpinned_pool[i], 1.0f});
+          }
+        }
+
+        float y_accum_dt = (float)unpinned_y_start;
+        for (auto &entry : dt_entries) {
+          float row_height = (float)fh * entry.scale;
+          int y_int = (int)(y_accum_dt + 0.5f);
+          if (entry.scale > 0.05f && y_int < dh) {
+            this->display_->start_clipping(0, std::max(y_int, divider_y + 1), dw, std::min(y_int + (int)(row_height + 0.5f), dh));
+            this->draw_trip(*entry.trip, y_int, fh, uptime, rtc_now,
+                            false, nullptr, nullptr, 0, 0,
+                            uniform_clipping_start, uniform_clipping_end, false);
+            this->display_->end_clipping();
+          }
+          y_accum_dt += row_height;
+        }
+        this->display_->end_clipping();
+      } else {
+        // Static unpinned (no h-scroll during pinned animation)
+        this->display_->start_clipping(0, divider_y + 1, dw, dh);
+        for (int i = unpinned_si; i < unpinned_ei; i++) {
+          int row = i - unpinned_si;
+          int y = unpinned_y_start + row * fh;
+          this->draw_trip(unpinned_pool[i], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, 0, 0,
+                          uniform_clipping_start, uniform_clipping_end, false);
+        }
+        this->display_->end_clipping();
+      }
+
     } else {
       // Phase 0: Normal — draw with h-scroll
       this->display_->start_clipping(0, 0, dw, divider_y);
-      for (int i = pinned_si; i < pinned_ei; i++) {
-        int row = i - pinned_si;
-        int y = y_base - 1 + row * fh;
-        this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
-                        false, nullptr, nullptr, shared_h_offset, shared_scroll_dist,
-                        uniform_clipping_start, uniform_clipping_end, true);
+      if (this->pinned_dt_phase_ == 1 && !this->pinned_dt_old_trips_.empty()) {
+        // Frozen: draw cached old pinned trips while waiting for h-scroll to complete
+        for (int ri = 0; ri < (int)this->pinned_dt_old_trips_.size() && ri < pinned_rows; ri++) {
+          int y = y_base - 1 + ri * fh;
+          this->draw_trip(this->pinned_dt_old_trips_[ri], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, shared_h_offset, shared_scroll_dist,
+                          uniform_clipping_start, uniform_clipping_end, true);
+        }
+      } else {
+        for (int i = pinned_si; i < pinned_ei; i++) {
+          int row = i - pinned_si;
+          int y = y_base - 1 + row * fh;
+          this->draw_trip(pinned_pool[i], y, fh, uptime, rtc_now,
+                          false, nullptr, nullptr, shared_h_offset, shared_scroll_dist,
+                          uniform_clipping_start, uniform_clipping_end, true);
+        }
       }
       this->display_->end_clipping();
       this->display_->horizontal_line(0, divider_y, dw, this->divider_color_);
@@ -2300,7 +3421,7 @@ void HOT TransitTracker::draw_schedule() {
       if (this->pin_transition_seen_nonzero_offset_ && h_scroll_offset < 3) {
         h_scroll_offset = 0;
         this->h_scroll_start_time_ = uptime;  // reset h-scroll to genuine 0
-        bool is_pin_up = (this->pin_transition_target_eff_pinned_ > this->pin_transition_old_eff_pinned_);
+        bool is_pin_up = (this->pin_transition_target_eff_pinned_ >= this->pin_transition_old_eff_pinned_);
         if (is_pin_up) {
           ESP_LOGD(TAG, "Pin transition: phase 1 complete (flat), entering phase 2 (collapse)");
           this->pin_transition_phase_ = 2;
@@ -2314,7 +3435,7 @@ void HOT TransitTracker::draw_schedule() {
       // No scrolling — wait 500ms
       unsigned long phase1_elapsed = uptime - this->pin_transition_start_;
       if (phase1_elapsed >= 500) {
-        bool is_pin_up = (this->pin_transition_target_eff_pinned_ > this->pin_transition_old_eff_pinned_);
+        bool is_pin_up = (this->pin_transition_target_eff_pinned_ >= this->pin_transition_old_eff_pinned_);
         if (is_pin_up) {
           ESP_LOGD(TAG, "Pin transition: phase 1 complete (flat no-scroll), entering phase 2");
           this->pin_transition_phase_ = 2;
@@ -2335,7 +3456,7 @@ void HOT TransitTracker::draw_schedule() {
     collapse_t = collapse_t * collapse_t * (3.0f - 2.0f * collapse_t);
 
     if (collapse_t >= 1.0f && phase2_elapsed >= 1000) { // 500ms collapse + 500ms dwell
-      bool is_pin_up = (this->pin_transition_target_eff_pinned_ > this->pin_transition_old_eff_pinned_);
+      bool is_pin_up = (this->pin_transition_target_eff_pinned_ >= this->pin_transition_old_eff_pinned_);
       if (is_pin_up) {
         // Phase 2 complete — enter phase 3 (push-divider)
         ESP_LOGD(TAG, "Pin transition: phase 2 complete (flat), entering phase 3 (push-divider)");
@@ -2363,9 +3484,9 @@ void HOT TransitTracker::draw_schedule() {
     int collapsing_count = 0;
     for (int i = phase2_base; i < on_screen_end; i++) {
       std::string ck = visible_trips[i].composite_key();
-      bool newly_pinned = (this->pinned_routes_.find(ck) != this->pinned_routes_.end()) &&
+      bool newly_pinned = (this->pin_transition_target_pinned_routes_.find(ck) != this->pin_transition_target_pinned_routes_.end()) &&
                           (this->pin_transition_old_pinned_routes_.find(ck) == this->pin_transition_old_pinned_routes_.end());
-      bool newly_unpinned = (this->pinned_routes_.find(ck) == this->pinned_routes_.end()) &&
+      bool newly_unpinned = (this->pin_transition_target_pinned_routes_.find(ck) == this->pin_transition_target_pinned_routes_.end()) &&
                             (this->pin_transition_old_pinned_routes_.find(ck) != this->pin_transition_old_pinned_routes_.end());
       bool collapsing = newly_pinned || newly_unpinned;
       phase2_entries.push_back({i, collapsing});
@@ -2376,9 +3497,9 @@ void HOT TransitTracker::draw_schedule() {
     // First scan: from on_screen_end to end of list
     for (int i = on_screen_end; i < (int)visible_trips.size() && fill_needed > 0; i++) {
       std::string ck = visible_trips[i].composite_key();
-      bool newly_pinned = (this->pinned_routes_.find(ck) != this->pinned_routes_.end()) &&
+      bool newly_pinned = (this->pin_transition_target_pinned_routes_.find(ck) != this->pin_transition_target_pinned_routes_.end()) &&
                           (this->pin_transition_old_pinned_routes_.find(ck) == this->pin_transition_old_pinned_routes_.end());
-      bool newly_unpinned = (this->pinned_routes_.find(ck) == this->pinned_routes_.end()) &&
+      bool newly_unpinned = (this->pin_transition_target_pinned_routes_.find(ck) == this->pin_transition_target_pinned_routes_.end()) &&
                             (this->pin_transition_old_pinned_routes_.find(ck) != this->pin_transition_old_pinned_routes_.end());
       if (!newly_pinned && !newly_unpinned) {
         phase2_entries.push_back({i, false});
@@ -2388,9 +3509,9 @@ void HOT TransitTracker::draw_schedule() {
     // Wrap around: if still need fill, scan from 0 up to phase2_base (like pager wrapping to page 1)
     for (int i = 0; i < phase2_base && fill_needed > 0; i++) {
       std::string ck = visible_trips[i].composite_key();
-      bool newly_pinned = (this->pinned_routes_.find(ck) != this->pinned_routes_.end()) &&
+      bool newly_pinned = (this->pin_transition_target_pinned_routes_.find(ck) != this->pin_transition_target_pinned_routes_.end()) &&
                           (this->pin_transition_old_pinned_routes_.find(ck) == this->pin_transition_old_pinned_routes_.end());
-      bool newly_unpinned = (this->pinned_routes_.find(ck) == this->pinned_routes_.end()) &&
+      bool newly_unpinned = (this->pin_transition_target_pinned_routes_.find(ck) == this->pin_transition_target_pinned_routes_.end()) &&
                             (this->pin_transition_old_pinned_routes_.find(ck) != this->pin_transition_old_pinned_routes_.end());
       if (!newly_pinned && !newly_unpinned) {
         phase2_entries.push_back({i, false});
@@ -2487,6 +3608,10 @@ void HOT TransitTracker::draw_schedule() {
           start_index = this->paging_rotate_ ? current_page : current_page * page_size;
           end_index = std::min(start_index + page_size, total_visible);
 
+          ESP_LOGD(TAG, "Page change: page %d->%d  showing [%d..%d) of %d visible",
+                   this->scroll_from_page_, this->current_page_index_,
+                   start_index, end_index, total_visible);
+
           old_start_index = this->paging_rotate_ ? this->scroll_from_page_ : this->scroll_from_page_ * page_size;
           old_end_index = std::min(old_start_index + page_size, total_visible);
 
@@ -2505,6 +3630,9 @@ void HOT TransitTracker::draw_schedule() {
           this->data_transition_phase_ = 0;
           this->data_transition_departing_.clear();
           this->data_transition_pending_cycles_ = -1;
+          this->pinned_dt_phase_ = 0;
+          this->pinned_dt_old_trips_.clear();
+          this->pinned_dt_pending_cycles_ = -1;
           h_scroll_offset = 0;
           h_scroll_cycles = 0;
         } else {
@@ -2635,6 +3763,17 @@ void HOT TransitTracker::draw_schedule() {
         }
       }
       if (!this->data_transition_departing_.empty()) {
+        // Log departing and arriving trips
+        for (const auto &dep : this->data_transition_departing_) {
+          ESP_LOGD(TAG, "On-screen: DEPARTED '%s'", dep.composite_key().c_str());
+        }
+        std::set<std::string> old_key_set2(this->data_transition_old_keys_.begin(), this->data_transition_old_keys_.end());
+        for (const auto &key : current_on_screen_keys) {
+          if (old_key_set2.find(key) == old_key_set2.end()) {
+            ESP_LOGD(TAG, "On-screen: APPEARED (replacing) '%s'", key.c_str());
+          }
+        }
+
         // Wait for h-scroll to finish current cycle before animating
         if (total_scroll_distance > 0 && h_scroll_offset > 0) {
           ESP_LOGD(TAG, "Data transition: %d trip(s) departed, waiting for h-scroll to finish",
@@ -2654,6 +3793,13 @@ void HOT TransitTracker::draw_schedule() {
         }
       } else {
         // Trips changed but nothing departed (new trips appeared) — just update keys
+        // Log which trips appeared
+        std::set<std::string> old_set(this->data_transition_old_keys_.begin(), this->data_transition_old_keys_.end());
+        for (const auto &key : current_on_screen_keys) {
+          if (old_set.find(key) == old_set.end()) {
+            ESP_LOGD(TAG, "On-screen: APPEARED (no depart) '%s'", key.c_str());
+          }
+        }
         this->data_transition_old_keys_ = current_on_screen_keys;
       }
     }
@@ -2765,7 +3911,10 @@ void HOT TransitTracker::draw_schedule() {
   }
 
   // Update cached keys for next frame (steady state)
-  if (this->data_transition_phase_ == 0) {
+  // Don't update during pin transitions — frozen partition makes keys unreliable,
+  // and we want the data transition detector to catch schedule changes that occurred
+  // during the pin transition once it completes.
+  if (this->data_transition_phase_ == 0 && this->pin_transition_phase_ == 0) {
     this->data_transition_old_keys_ = current_on_screen_keys;
   }
 

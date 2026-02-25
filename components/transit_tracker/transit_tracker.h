@@ -142,9 +142,13 @@ class TransitTracker : public Component {
     unsigned long pin_transition_start_{0};     // millis when current phase began
     int pin_transition_old_eff_pinned_{-1};     // effective_pinned_count before the change (-1 = uninitialized)
     std::set<std::string> pin_transition_old_pinned_routes_;  // snapshot of pinned_routes_ before change
+    std::set<std::string> pin_transition_target_pinned_routes_;  // snapshot of pinned_routes_ we're transitioning TO
+    std::set<std::string> pin_transition_old_hidden_routes_;    // snapshot of hidden_routes_ before change
+    std::set<std::string> pin_transition_target_hidden_routes_; // snapshot of hidden_routes_ at transition start
     bool pin_transition_seen_nonzero_offset_{false}; // true once h_scroll_offset > 0 during phase 1
     int pin_transition_target_eff_pinned_{0};   // effective_pinned_count we're transitioning toward
     bool pin_transition_pending_restart_{false}; // a NEW pin change arrived mid-transition
+    std::vector<Trip> pin_swap_old_unpinned_;    // cached on-screen unpinned trips for smooth swap animation
     bool frame_show_pin_icons_{false};          // per-frame flag: should draw_trip apply pin icon inset?
     int frame_pin_offset_override_{-1};         // per-frame: if >= 0, override pin_offset in draw_trip (no icon drawn)
 
@@ -156,6 +160,12 @@ class TransitTracker : public Component {
     int data_transition_old_start_{0};          // start_index when transition started
     int data_transition_old_end_{0};            // end_index when transition started
     int data_transition_pending_cycles_{-1};    // h_scroll_cycles when change detected (wait for next cycle)
+
+    // Pinned data transition (smooth transition when pinned trip content changes, e.g. "Now" departs)
+    int pinned_dt_phase_{0};                            // 0=idle, 1=wait-for-h-scroll, 2=animate
+    unsigned long pinned_dt_start_{0};                  // millis when phase 2 animation began
+    std::vector<Trip> pinned_dt_old_trips_;              // cached on-screen pinned Trip objects
+    int pinned_dt_pending_cycles_{-1};                   // h_scroll_cycles when change detected
 
     std::string from_now_(time_t unix_timestamp, uint rtc_now) const;
     void draw_text_centered_(const char *text, Color color);
@@ -219,9 +229,12 @@ class TransitTracker : public Component {
 #ifdef USE_MQTT
     std::set<std::string> mqtt_subscribed_routes_;
     std::set<std::string> mqtt_subscribed_route_colors_;
+    std::set<std::string> mqtt_published_routes_;           // composite keys with discovery already published
+    std::set<std::string> mqtt_published_route_color_ids_;  // route_ids with color discovery already published
     bool mqtt_routes_pending_{false};
     bool mqtt_divider_color_pending_{false};
     bool mqtt_divider_color_subscribed_{false};
+    bool mqtt_divider_published_{false};                    // true once divider color discovery is published
 #endif
 
     Color realtime_color_ = Color(0x20FF00);
