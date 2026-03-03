@@ -12,39 +12,33 @@ namespace transit_tracker {
 
 static const char *TAG = "transit_tracker.component";
 
+// =====================================================================
+// Setup / Loop / Lifecycle
+// =====================================================================
+
 void TransitTracker::setup() {
   this->ws_client_.onMessage([this](websockets::WebsocketsMessage message) {
     this->on_ws_message_(message);
   });
-
   this->ws_client_.onEvent([this](websockets::WebsocketsEvent event, String data) {
     this->on_ws_event_(event, data);
   });
-
+  this->rebuild_route_stop_map_();
   this->connect_ws_();
 
   this->set_interval("check_stale_trips", 10000, [this]() {
     if (this->ws_client_.available() && !this->schedule_state_.trips.empty()) {
-      bool has_stale_trips = false;
-
+      bool has_stale = false;
       this->schedule_state_.mutex.lock();
-
       auto now = this->rtc_->now();
       if (now.is_valid()) {
         for (auto &trip : this->schedule_state_.trips) {
-          if (now.timestamp - trip.departure_time > 60) {
-            has_stale_trips = true;
-            break;
-          }
+          if (now.timestamp - trip.departure_time > 60) { has_stale = true; break; }
         }
       }
-
       this->schedule_state_.mutex.unlock();
-
-      if (has_stale_trips) {
+      if (has_stale) {
         ESP_LOGD(TAG, "Stale trips detected, reconnecting");
-        ESP_LOGD(TAG, "  Current RTC time: %d", now.timestamp);
-        ESP_LOGD(TAG, "  Last heartbeat: %d", this->last_heartbeat_);
         this->reconnect();
       }
     }
@@ -53,6 +47,15 @@ void TransitTracker::setup() {
 
 void TransitTracker::loop() {
   this->ws_client_.poll();
+
+#ifdef USE_MQTT
+  if (mqtt::global_mqtt_client != nullptr && mqtt::global_mqtt_client->is_connected()) {
+    if (this->mqtt_routes_pending_) {
+      this->publish_mqtt_routes_();
+      this->publish_mqtt_route_colors_();
+    }
+  }
+#endif
 
   if (this->last_heartbeat_ != 0 && millis() - this->last_heartbeat_ > 60000) {
     ESP_LOGW(TAG, "Heartbeat timeout, reconnecting");
@@ -69,18 +72,14 @@ void TransitTracker::dump_config() {
   ESP_LOGCONFIG(TAG, "  List mode: %s", this->list_mode_.c_str());
   ESP_LOGCONFIG(TAG, "  Display departure times: %s", this->display_departure_times_ ? "true" : "false");
   ESP_LOGCONFIG(TAG, "  Scroll Headsigns: %s", this->scroll_headsigns_ ? "true" : "false");
+  ESP_LOGCONFIG(TAG, "  Scroll Routes: %s", this->scroll_routes_ ? "true" : "false");
+  ESP_LOGCONFIG(TAG, "  Show Pin Icon: %s", this->show_pin_icon_ ? "true" : "false");
 }
 
-void TransitTracker::reconnect() {
-  this->close();
-  this->connect_ws_();
-}
+void TransitTracker::reconnect() { this->close(); this->connect_ws_(); }
 
 void TransitTracker::close(bool fully) {
-  if (fully) {
-    this->fully_closed_ = true;
-  }
-
+  if (fully) this->fully_closed_ = true;
   this->ws_client_.close();
 }
 
@@ -88,6 +87,10 @@ void TransitTracker::on_shutdown() {
   this->cancel_interval("check_stale_trips");
   this->close(true);
 }
+
+// =====================================================================
+// WebSocket
+// =====================================================================
 
 void TransitTracker::on_ws_message_(websockets::WebsocketsMessage message) {
   ESP_LOGV(TAG, "Received message: %s", message.rawData().c_str());
@@ -98,27 +101,19 @@ void TransitTracker::on_ws_message_(websockets::WebsocketsMessage message) {
       this->last_heartbeat_ = millis();
       return true;
     }
-
-    if (root["event"].as<std::string>() != "schedule") {
-      return true;
-    }
+    if (root["event"].as<std::string>() != "schedule") return true;
 
     ESP_LOGD(TAG, "Received schedule update");
-
     this->schedule_state_.mutex.lock();
-
     this->schedule_state_.trips.clear();
 
     auto data = root["data"].as<JsonObject>();
-
     for (auto trip : data["trips"].as<JsonArray>()) {
       std::string headsign = trip["headsign"].as<std::string>();
       for (const auto &abbr : this->abbreviations_) {
         size_t pos = headsign.find(abbr.first);
-        if (pos != std::string::npos) {
-          ESP_LOGV(TAG, "Applying abbreviation '%s' -> '%s' in headsign", abbr.first.c_str(), abbr.second.c_str());
+        if (pos != std::string::npos)
           headsign.replace(pos, abbr.first.length(), abbr.second);
-        }
       }
 
       auto route_id = trip["routeId"].as<std::string>();
@@ -134,55 +129,72 @@ void TransitTracker::on_ws_message_(websockets::WebsocketsMessage message) {
         route_color = Color(std::stoul(trip["routeColor"].as<std::string>(), nullptr, 16));
       }
 
+      // Apply MQTT color override (highest priority)
+      auto color_override = this->route_color_overrides_.find(route_id);
+      if (color_override != this->route_color_overrides_.end()) {
+        route_color = color_override->second;
+      }
+
+      std::string stop_id;
+      if (!trip["stopId"].isNull()) {
+        stop_id = trip["stopId"].as<std::string>();
+      } else {
+        auto it = this->route_stop_map_.find(route_id);
+        if (it != this->route_stop_map_.end()) stop_id = it->second;
+      }
+
+      std::string stop_name;
+      if (!trip["stopName"].isNull()) stop_name = trip["stopName"].as<std::string>();
+
       this->schedule_state_.trips.push_back({
         .route_id = route_id,
         .route_name = route_name,
         .route_color = route_color,
         .headsign = headsign,
+        .stop_id = stop_id,
+        .stop_name = stop_name,
         .arrival_time = trip["arrivalTime"].as<time_t>(),
         .departure_time = trip["departureTime"].as<time_t>(),
         .is_realtime = trip["isRealtime"].as<bool>(),
       });
     }
 
+    ESP_LOGD(TAG, "Schedule update: %d trip(s)", (int)this->schedule_state_.trips.size());
+    for (size_t i = 0; i < this->schedule_state_.trips.size(); i++) {
+      const auto &t = this->schedule_state_.trips[i];
+      ESP_LOGD(TAG, "  [%d] %s  dep=%ld  rt=%s",
+               (int)i, t.composite_key().c_str(), (long)t.departure_time, t.is_realtime ? "Y" : "N");
+    }
+
     this->schedule_state_.mutex.unlock();
 
+#ifdef USE_MQTT
+    this->mqtt_routes_pending_ = true;
+#endif
     return true;
   });
 
-  if (!valid) {
-    this->status_set_error("Failed to parse schedule data");
-    return;
-  }
+  if (!valid) this->status_set_error(LOG_STR("Failed to parse schedule data"));
 }
 
 void TransitTracker::on_ws_event_(websockets::WebsocketsEvent event, String data) {
   if (event == websockets::WebsocketsEvent::ConnectionOpened) {
     ESP_LOGD(TAG, "WebSocket connection opened");
-
     auto message = json::build_json([this](JsonObject root) {
       root["event"] = "schedule:subscribe";
-
-      auto data = root.createNestedObject("data");
-
-      if (!this->feed_code_.empty()) {
-        data["feedCode"] = this->feed_code_;
-      }
-
+      auto data = root["data"].to<JsonObject>();
+      if (!this->feed_code_.empty()) data["feedCode"] = this->feed_code_;
       data["routeStopPairs"] = this->schedule_string_;
-      data["limit"] = this->limit_;
+      data["limit"] = this->scroll_routes_ ? this->limit_ * 3 : this->limit_;
       data["sortByDeparture"] = this->display_departure_times_;
       data["listMode"] = this->list_mode_;
     });
-
     ESP_LOGV(TAG, "Sending message: %s", message.c_str());
     this->ws_client_.send(message.c_str());
   } else if (event == websockets::WebsocketsEvent::ConnectionClosed) {
     ESP_LOGD(TAG, "WebSocket connection closed");
     if (!this->fully_closed_ && this->connection_attempts_ == 0) {
-      this->defer([this]() {
-        this->connect_ws_();
-      });
+      this->defer([this]() { this->connect_ws_(); });
     }
   } else if (event == websockets::WebsocketsEvent::GotPing) {
     ESP_LOGV(TAG, "Received ping");
@@ -192,53 +204,32 @@ void TransitTracker::on_ws_event_(websockets::WebsocketsEvent event, String data
 }
 
 void TransitTracker::connect_ws_() {
-  if (this->base_url_.empty()) {
-    ESP_LOGW(TAG, "No base URL set, not connecting");
-    return;
-  }
-
-  if (this->fully_closed_) {
-    ESP_LOGW(TAG, "Connection fully closed, not reconnecting");
-    return;
-  }
-
-  if (this->ws_client_.available(true)) {
-    ESP_LOGV(TAG, "Not reconnecting, already connected");
-    return;
-  }
+  if (this->base_url_.empty()) { ESP_LOGW(TAG, "No base URL set, not connecting"); return; }
+  if (this->fully_closed_) { ESP_LOGW(TAG, "Connection fully closed, not reconnecting"); return; }
+  if (this->ws_client_.available(true)) { ESP_LOGV(TAG, "Already connected"); return; }
 
   watchdog::WatchdogManager wdm(20000);
-
   this->last_heartbeat_ = 0;
+  ESP_LOGD(TAG, "Connecting to WebSocket (attempt %d): %s", this->connection_attempts_, this->base_url_.c_str());
 
-  ESP_LOGD(TAG, "Connecting to WebSocket server (attempt %d): %s", this->connection_attempts_, this->base_url_.c_str());
-
-  bool connection_success = false;
+  bool ok = false;
   if (esphome::network::is_connected()) {
-    connection_success = this->ws_client_.connect(this->base_url_.c_str());
+    ok = this->ws_client_.connect(this->base_url_.c_str());
   } else {
     ESP_LOGW(TAG, "Not connected to network; skipping connection attempt");
   }
 
-  if (!connection_success) {
+  if (!ok) {
     this->connection_attempts_++;
-
-    if (this->connection_attempts_ >= 3) {
-      this->status_set_error("Failed to connect to WebSocket server");
-    }
-
+    if (this->connection_attempts_ >= 3)
+      this->status_set_error(LOG_STR("Failed to connect to WebSocket server"));
     if (this->connection_attempts_ >= 15) {
-      ESP_LOGE(TAG, "Could not connect to WebSocket server within 15 attempts.");
-      ESP_LOGE(TAG, "It's likely that the network is not truly connected; rebooting the device to try to recover.");
+      ESP_LOGE(TAG, "Could not connect within 15 attempts; rebooting");
       App.reboot();
     }
-
     auto timeout = std::min(15000, this->connection_attempts_ * 5000);
     ESP_LOGW(TAG, "Failed to connect, retrying in %ds", timeout / 1000);
-
-    this->set_timeout("reconnect", timeout, [this]() {
-      this->connect_ws_();
-    });
+    this->set_timeout("reconnect", timeout, [this]() { this->connect_ws_(); });
   } else {
     this->has_ever_connected_ = true;
     this->connection_attempts_ = 0;
@@ -246,22 +237,16 @@ void TransitTracker::connect_ws_() {
   }
 }
 
+// =====================================================================
+// Text Parsers & Config Setters
+// =====================================================================
+
 void TransitTracker::set_abbreviations_from_text(const std::string &text) {
   this->abbreviations_.clear();
   for (const auto &line : split(text, '\n')) {
     auto parts = split(line, ';');
-
-    if (parts.size() == 1) {
-      // If only one part is provided, treat it as a removal (replace with empty string)
-      this->add_abbreviation(parts[0], "");
-      continue;
-    }
-
-    if (parts.size() != 2) {
-      ESP_LOGW(TAG, "Invalid abbreviation line: %s", line.c_str());
-      continue;
-    }
-
+    if (parts.size() == 1) { this->add_abbreviation(parts[0], ""); continue; }
+    if (parts.size() != 2) { ESP_LOGW(TAG, "Invalid abbreviation: %s", line.c_str()); continue; }
     this->add_abbreviation(parts[0], parts[1]);
   }
 }
@@ -270,29 +255,389 @@ void TransitTracker::set_route_styles_from_text(const std::string &text) {
   this->route_styles_.clear();
   for (const auto &line : split(text, '\n')) {
     auto parts = split(line, ';');
-    if (parts.size() != 3) {
-      ESP_LOGW(TAG, "Invalid route style line: %s", line.c_str());
-      continue;
+    if (parts.size() != 3) continue;
+    this->add_route_style(parts[0], parts[1], Color(std::stoul(parts[2], nullptr, 16)));
+  }
+}
+
+void TransitTracker::set_hidden_routes_from_text(const std::string &text) {
+  this->hidden_routes_.clear();
+  if (text.empty()) return;
+  for (const auto &id : split(text, ';')) {
+    if (!id.empty()) { this->hidden_routes_.insert(id); ESP_LOGD(TAG, "Hiding route: %s", id.c_str()); }
+  }
+}
+
+void TransitTracker::set_pinned_routes_from_text(const std::string &text) {
+  this->pinned_routes_.clear();
+  if (text.empty()) return;
+  for (const auto &id : split(text, ';')) {
+    if (!id.empty()) { this->pinned_routes_.insert(id); ESP_LOGD(TAG, "Pinning route: %s", id.c_str()); }
+  }
+}
+
+void TransitTracker::set_next_only_routes_from_text(const std::string &text) {
+  this->next_only_routes_.clear();
+  if (text.empty()) return;
+  for (const auto &id : split(text, ';')) {
+    if (!id.empty()) this->next_only_routes_.insert(id);
+  }
+}
+
+void TransitTracker::rebuild_route_stop_map_() {
+  this->route_stop_map_.clear();
+  std::set<std::string> ambiguous;
+  for (const auto &pair : split(this->schedule_string_, ';')) {
+    auto parts = split(pair, ',');
+    if (parts.size() >= 2) {
+      auto it = this->route_stop_map_.find(parts[0]);
+      if (it != this->route_stop_map_.end() && it->second != parts[1]) {
+        ambiguous.insert(parts[0]);
+      } else {
+        this->route_stop_map_[parts[0]] = parts[1];
+      }
     }
-    uint32_t color = std::stoul(parts[2], nullptr, 16);
-    this->add_route_style(parts[0], parts[1], Color(color));
+  }
+  for (const auto &r : ambiguous) {
+    this->route_stop_map_.erase(r);
+    ESP_LOGD(TAG, "Route %s at multiple stops, stop_id omitted from key", r.c_str());
+  }
+}
+
+void TransitTracker::set_route_color_overrides_from_text(const std::string &text) {
+  this->route_color_overrides_.clear();
+  if (text.empty()) return;
+  for (const auto &entry : split(text, ';')) {
+    auto cp = entry.find(':');
+    if (cp == std::string::npos) continue;
+    int r, g, b;
+    if (sscanf(entry.substr(cp + 1).c_str(), "%d,%d,%d", &r, &g, &b) == 3)
+      this->route_color_overrides_[entry.substr(0, cp)] = Color(r, g, b);
   }
 }
 
 void TransitTracker::draw_text_centered_(const char *text, Color color) {
-  int display_center_x = this->display_->get_width() / 2;
-  int display_center_y = this->display_->get_height() / 2;
-  this->display_->print(display_center_x, display_center_y, this->font_, color, display::TextAlign::CENTER, text);
+  this->display_->print(this->display_->get_width() / 2, this->display_->get_height() / 2,
+                        this->font_, color, display::TextAlign::CENTER, text);
 }
 
 void TransitTracker::set_realtime_color(const Color &color) {
   this->realtime_color_ = color;
   this->realtime_color_dark_ = Color(
-    (color.r * 0.5),
-    (color.g * 0.5),
-    (color.b * 0.5)
-  );
+    (uint8_t)(color.r * 0.5f),
+    (uint8_t)(color.g * 0.5f),
+    (uint8_t)(color.b * 0.5f));
 }
+
+void TransitTracker::set_scroll_routes(bool v) {
+  if (this->scroll_routes_ != v) {
+    this->scroll_routes_ = v;
+    this->pinned_pager_.reset();
+    this->unpinned_pager_.reset();
+    if (this->ws_client_.available()) this->reconnect();
+  }
+}
+
+void TransitTracker::set_scroll_speed(const std::string &speed) {
+  int new_speed = 10;
+  if (speed == "slow") new_speed = 5;
+  else if (speed == "medium") new_speed = 10;
+  else if (speed == "fast") new_speed = 20;
+  else if (speed == "fastest") new_speed = 40;
+  else {
+    char *end = nullptr;
+    long val = strtol(speed.c_str(), &end, 10);
+    if (end != speed.c_str() && *end == '\0') new_speed = (int)val;
+  }
+  this->h_scroll_.pending_speed = new_speed;
+}
+
+// =====================================================================
+// MQTT Auto-Discovery
+// =====================================================================
+
+#ifdef USE_MQTT
+
+std::string TransitTracker::slugify_(const std::string &input) {
+  std::string slug = input;
+  for (auto &c : slug) {
+    if (c == ':' || c == ' ' || c == '|') c = '_';
+    else c = tolower(c);
+  }
+  return slug;
+}
+
+void TransitTracker::publish_mqtt_routes_() {
+  if (mqtt::global_mqtt_client == nullptr || !mqtt::global_mqtt_client->is_connected()) return;
+  this->mqtt_routes_pending_ = false;
+
+  std::string node = App.get_name();
+  std::string topic_prefix = mqtt::global_mqtt_client->get_topic_prefix();
+
+  std::set<std::string> seen_keys;
+  for (const auto &t : this->schedule_state_.trips) {
+    std::string key = t.composite_key();
+    if (seen_keys.count(key)) continue;
+    seen_keys.insert(key);
+
+    if (this->mqtt_published_routes_.count(key)) continue;
+    this->mqtt_published_routes_.insert(key);
+
+    std::string slug = slugify_(key);
+    std::string object_id = node + "_route_" + slug;
+    std::string state_topic = topic_prefix + "/route/" + slug + "/state";
+    std::string command_topic = topic_prefix + "/route/" + slug + "/set";
+
+    std::string friendly_name = t.route_name;
+    if (!t.headsign.empty()) friendly_name += " - " + t.headsign;
+    if (!t.stop_name.empty()) friendly_name += " - " + t.stop_name;
+
+    // Discovery JSON (select entity: Off/On/Pinned)
+    std::string discovery_topic = "homeassistant/select/" + object_id + "/config";
+    auto payload = json::build_json([&](JsonObject root) {
+      root["name"] = friendly_name;
+      root["unique_id"] = object_id;
+      root["default_entity_id"] = "select." + object_id;
+      root["state_topic"] = state_topic;
+      root["command_topic"] = command_topic;
+      root["icon"] = "mdi:bus";
+
+      auto options = root["options"].to<JsonArray>();
+      options.add("Off");
+      options.add("On");
+      options.add("Pinned");
+
+      const auto &avail = mqtt::global_mqtt_client->get_availability();
+      if (!avail.topic.empty()) {
+        root["availability_topic"] = avail.topic;
+        root["payload_available"] = avail.payload_available;
+        root["payload_not_available"] = avail.payload_not_available;
+      }
+
+      auto device = root["device"].to<JsonObject>();
+      auto ids = device["identifiers"].to<JsonArray>();
+      ids.add(node);
+      device["name"] = App.get_friendly_name().empty() ? node : App.get_friendly_name();
+    });
+    mqtt::global_mqtt_client->publish(discovery_topic, payload, 0, true);
+
+    // Remove any stale switch discovery from before the conversion
+    mqtt::global_mqtt_client->publish("homeassistant/switch/" + object_id + "/config", std::string(""), 0, true);
+
+    // Publish current state
+    bool hidden = this->hidden_routes_.count(key) > 0;
+    bool pinned = this->pinned_routes_.count(key) > 0;
+    std::string state = hidden ? "Off" : (pinned ? "Pinned" : "On");
+    mqtt::global_mqtt_client->publish(state_topic, state, 0, true);
+
+    // Subscribe to commands
+    if (!this->mqtt_subscribed_routes_.count(key)) {
+      this->mqtt_subscribed_routes_.insert(key);
+      std::string cap_key = key, cap_st = state_topic;
+      mqtt::global_mqtt_client->subscribe(
+        command_topic,
+        [this, cap_key, cap_st](const std::string &topic, const std::string &payload) {
+          if (payload == "Off") {
+            // Enforce at least one route visible
+            int visible_count = 0;
+            std::set<std::string> current_keys;
+            for (const auto &trip : this->schedule_state_.trips) {
+              std::string k = trip.composite_key();
+              if (current_keys.count(k)) continue;
+              current_keys.insert(k);
+              if (!this->hidden_routes_.count(k)) visible_count++;
+            }
+            if (visible_count <= 1) {
+              ESP_LOGW(TAG, "Cannot hide last visible route %s", cap_key.c_str());
+              bool is_pinned = this->pinned_routes_.count(cap_key) > 0;
+              mqtt::global_mqtt_client->publish(cap_st, std::string(is_pinned ? "Pinned" : "On"), 0, true);
+              return;
+            }
+            this->hidden_routes_.insert(cap_key);
+            this->pinned_routes_.erase(cap_key);
+          } else if (payload == "On") {
+            this->hidden_routes_.erase(cap_key);
+            this->pinned_routes_.erase(cap_key);
+          } else if (payload == "Pinned") {
+            this->hidden_routes_.erase(cap_key);
+            this->pinned_routes_.insert(cap_key);
+          } else {
+            ESP_LOGW(TAG, "Unknown route command: %s", payload.c_str());
+            return;
+          }
+
+          mqtt::global_mqtt_client->publish(cap_st, payload, 0, true);
+          ESP_LOGD(TAG, "Route %s set to %s via MQTT", cap_key.c_str(), payload.c_str());
+          this->persist_hidden_routes_();
+          this->persist_pinned_routes_();
+        },
+        0
+      );
+    }
+  }
+}
+
+void TransitTracker::persist_hidden_routes_() {
+  std::string s;
+  for (const auto &k : this->hidden_routes_) { if (!s.empty()) s += ";"; s += k; }
+#ifdef USE_TEXT
+  if (this->hidden_routes_text_) {
+    auto call = this->hidden_routes_text_->make_call();
+    call.set_value(s);
+    call.perform();
+    ESP_LOGD(TAG, "Persisted hidden routes: %s", s.c_str());
+  }
+#endif
+}
+
+void TransitTracker::persist_pinned_routes_() {
+  std::string s;
+  for (const auto &k : this->pinned_routes_) { if (!s.empty()) s += ";"; s += k; }
+#ifdef USE_TEXT
+  if (this->pinned_routes_text_) {
+    auto call = this->pinned_routes_text_->make_call();
+    call.set_value(s);
+    call.perform();
+    ESP_LOGD(TAG, "Persisted pinned routes: %s", s.c_str());
+  }
+#endif
+}
+
+void TransitTracker::persist_next_only_routes_() {
+  std::string s;
+  for (const auto &k : this->next_only_routes_) { if (!s.empty()) s += ";"; s += k; }
+#ifdef USE_TEXT
+  if (this->next_only_routes_text_) {
+    auto call = this->next_only_routes_text_->make_call();
+    call.set_value(s);
+    call.perform();
+  }
+#endif
+}
+
+void TransitTracker::persist_route_color_overrides_() {
+  std::string result;
+  for (const auto &entry : this->route_color_overrides_) {
+    if (!result.empty()) result += ";";
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%s:%d,%d,%d",
+             entry.first.c_str(), entry.second.r, entry.second.g, entry.second.b);
+    result += buf;
+  }
+#ifdef USE_TEXT
+  if (this->route_color_overrides_text_) {
+    auto call = this->route_color_overrides_text_->make_call();
+    call.set_value(result);
+    call.perform();
+  }
+#endif
+}
+
+void TransitTracker::publish_mqtt_route_colors_() {
+  if (mqtt::global_mqtt_client == nullptr || !mqtt::global_mqtt_client->is_connected()) return;
+
+  std::string node = App.get_name();
+  std::string topic_prefix = mqtt::global_mqtt_client->get_topic_prefix();
+
+  for (const auto &t : this->schedule_state_.trips) {
+    if (this->mqtt_published_route_color_ids_.count(t.route_id)) continue;
+    this->mqtt_published_route_color_ids_.insert(t.route_id);
+
+    std::string slug = slugify_(t.route_id);
+    std::string object_id = node + "_route_color_" + slug;
+    std::string state_topic = topic_prefix + "/route_color/" + slug + "/state";
+    std::string command_topic = topic_prefix + "/route_color/" + slug + "/set";
+    Color current_color = t.route_color;
+
+    // Light discovery JSON (RGB only, no brightness)
+    std::string discovery_topic = "homeassistant/light/" + object_id + "/config";
+    auto payload = json::build_json([&](JsonObject root) {
+      root["name"] = t.route_name + " Color";
+      root["unique_id"] = object_id;
+      root["default_entity_id"] = "light." + object_id;
+      root["schema"] = "json";
+      root["state_topic"] = state_topic;
+      root["command_topic"] = command_topic;
+      root["icon"] = "mdi:palette";
+      root["brightness"] = false;
+
+      auto modes = root["supported_color_modes"].to<JsonArray>();
+      modes.add("rgb");
+
+      const auto &avail = mqtt::global_mqtt_client->get_availability();
+      if (!avail.topic.empty()) {
+        root["availability_topic"] = avail.topic;
+        root["payload_available"] = avail.payload_available;
+        root["payload_not_available"] = avail.payload_not_available;
+      }
+
+      auto device = root["device"].to<JsonObject>();
+      auto ids = device["identifiers"].to<JsonArray>();
+      ids.add(node);
+      device["name"] = App.get_friendly_name().empty() ? node : App.get_friendly_name();
+    });
+    mqtt::global_mqtt_client->publish(discovery_topic, payload, 0, true);
+
+    // Publish current color state
+    auto state_payload = json::build_json([&](JsonObject root) {
+      root["state"] = "ON";
+      auto c = root["color"].to<JsonObject>();
+      c["r"] = current_color.r;
+      c["g"] = current_color.g;
+      c["b"] = current_color.b;
+      root["color_mode"] = "rgb";
+    });
+    mqtt::global_mqtt_client->publish(state_topic, state_payload, 0, true);
+
+    // Subscribe to command topic
+    if (!this->mqtt_subscribed_route_colors_.count(t.route_id)) {
+      this->mqtt_subscribed_route_colors_.insert(t.route_id);
+      std::string cap_rid = t.route_id, cap_st = state_topic;
+      mqtt::global_mqtt_client->subscribe(
+        command_topic,
+        [this, cap_rid, cap_st](const std::string &topic, const std::string &cmd_payload) {
+          bool parsed = json::parse_json(cmd_payload, [this, &cap_rid](JsonObject root) -> bool {
+            if (root["color"].is<JsonObject>()) {
+              JsonObject color = root["color"];
+              uint8_t r = color["r"] | 255;
+              uint8_t g = color["g"] | 0;
+              uint8_t b = color["b"] | 0;
+              Color new_color(r, g, b);
+              this->route_color_overrides_[cap_rid] = new_color;
+              this->schedule_state_.mutex.lock();
+              for (auto &trip : this->schedule_state_.trips)
+                if (trip.route_id == cap_rid) trip.route_color = new_color;
+              this->schedule_state_.mutex.unlock();
+            }
+            return true;
+          });
+          if (parsed) {
+            auto override_it = this->route_color_overrides_.find(cap_rid);
+            if (override_it != this->route_color_overrides_.end()) {
+              auto new_state = json::build_json([&](JsonObject root) {
+                root["state"] = "ON";
+                auto c = root["color"].to<JsonObject>();
+                c["r"] = override_it->second.r;
+                c["g"] = override_it->second.g;
+                c["b"] = override_it->second.b;
+                root["color_mode"] = "rgb";
+              });
+              mqtt::global_mqtt_client->publish(cap_st, new_state, 0, true);
+            }
+            this->persist_route_color_overrides_();
+          }
+        },
+        0
+      );
+    }
+  }
+}
+
+#endif  // USE_MQTT
+
+// =====================================================================
+// Drawing Helpers
+// =====================================================================
 
 const uint8_t realtime_icon[6][6] = {
   {0, 0, 0, 3, 3, 3},
@@ -303,16 +648,15 @@ const uint8_t realtime_icon[6][6] = {
   {3, 0, 2, 0, 1, 1}
 };
 
-void HOT TransitTracker::draw_realtime_icon_(int bottom_right_x, int bottom_right_y, unsigned long uptime) {
+void HOT TransitTracker::draw_realtime_icon_(int bottom_right_x, int bottom_right_y, unsigned long now) {
   const int num_frames = 6;
   const int idle_frame_duration = 3000;
   const int anim_frame_duration = 200;
   const int cycle_duration = idle_frame_duration + (num_frames - 1) * anim_frame_duration;
 
-  unsigned long cycle_time = uptime % cycle_duration;
-
+  unsigned long cycle_time = now % cycle_duration;
   int frame;
-  if (cycle_time < idle_frame_duration) {
+  if (cycle_time < (unsigned long)idle_frame_duration) {
     frame = 0;
   } else {
     frame = 1 + (cycle_time - idle_frame_duration) / anim_frame_duration;
@@ -330,10 +674,7 @@ void HOT TransitTracker::draw_realtime_icon_(int bottom_right_x, int bottom_righ
   for (uint8_t i = 0; i < 6; ++i) {
     for (uint8_t j = 0; j < 6; ++j) {
       uint8_t segment_number = realtime_icon[i][j];
-      if (segment_number == 0) {
-        continue;
-      }
-
+      if (segment_number == 0) continue;
       Color icon_color = is_segment_lit(segment_number) ? this->realtime_color_ : this->realtime_color_dark_;
       this->display_->draw_pixel_at(bottom_right_x - (5 - j), bottom_right_y - (5 - i), icon_color);
     }
@@ -341,162 +682,534 @@ void HOT TransitTracker::draw_realtime_icon_(int bottom_right_x, int bottom_righ
 }
 
 void TransitTracker::draw_trip(
-    const Trip &trip, int y_offset, int font_height, unsigned long uptime, uint rtc_now,
-    bool no_draw, int *headsign_overflow_out, int scroll_cycle_duration
-) {
-    if (!no_draw) {
-      this->display_->print(0, y_offset, this->font_, trip.route_color, display::TextAlign::TOP_LEFT, trip.route_name.c_str());
-    }
+    const Trip &trip, int y_offset, int fh, unsigned long uptime, uint rtc_now,
+    bool no_draw, int *headsign_overflow_out, int *headsign_width_out,
+    int h_scroll_offset, int total_scroll_distance, bool is_pinned) {
 
-    int route_width, _;
-    this->font_->measure(trip.route_name.c_str(), &route_width, &_, &_, &_);
+  int x_start = this->frame_pin_inset_;
+  int dw = this->display_->get_width();
+  int dh = this->display_->get_height();
 
-    auto time_display = this->localization_.fmt_duration_from_now(
-      this->display_departure_times_ ? trip.departure_time : trip.arrival_time,
-      rtc_now
-    );
+  // Pin icon (drawn in the inset margin if this row is pinned)
+  if (is_pinned && x_start > 0 && this->show_pin_icon_ && !no_draw) {
+    int px = 1, py = y_offset + 1;
+    Color pc(0x808080);
+    // Simple pushpin glyph (5px wide)
+    this->display_->draw_pixel_at(px + 1, py, pc);
+    this->display_->draw_pixel_at(px + 2, py, pc);
+    this->display_->draw_pixel_at(px + 3, py, pc);
+    this->display_->draw_pixel_at(px + 1, py + 1, pc);
+    this->display_->draw_pixel_at(px + 2, py + 1, pc);
+    this->display_->draw_pixel_at(px + 3, py + 1, pc);
+    this->display_->draw_pixel_at(px + 2, py + 2, pc);
+    this->display_->draw_pixel_at(px + 2, py + 3, pc);
+  }
 
-    int time_width;
-    this->font_->measure(time_display.c_str(), &time_width, &_, &_, &_);
+  // Route name
+  if (!no_draw)
+    this->display_->print(x_start, y_offset, this->font_, trip.route_color,
+                          display::TextAlign::TOP_LEFT, trip.route_name.c_str());
 
-    int headsign_clipping_start = route_width + 3;
-    int headsign_clipping_end = this->display_->get_width() - time_width - 2;
+  int route_width, _;
+  this->font_->measure(trip.route_name.c_str(), &route_width, &_, &_, &_);
+  route_width += x_start;
 
-    if (!no_draw) {
-      Color time_color = trip.is_realtime ? this->realtime_color_ : Color(0xa7a7a7);
-      this->display_->print(this->display_->get_width() + 1, y_offset, this->font_, time_color, display::TextAlign::TOP_RIGHT, time_display.c_str());
-    }
+  // Time display
+  auto time_str = this->localization_.fmt_duration_from_now(
+      this->display_departure_times_ ? trip.departure_time : trip.arrival_time, rtc_now);
+  int time_width;
+  this->font_->measure(time_str.c_str(), &time_width, &_, &_, &_);
 
-    if (trip.is_realtime) {
-      headsign_clipping_end -= 8;
+  // Headsign clipping bounds (uniform overrides per-trip bounds)
+  int clip_start = (this->frame_uniform_clip_start_ >= 0) ? this->frame_uniform_clip_start_ : route_width + 3;
+  int clip_end = (this->frame_uniform_clip_end_ >= 0) ? this->frame_uniform_clip_end_ : dw - time_width - 2;
 
-      if(!no_draw) {
-        int icon_bottom_right_x = this->display_->get_width() - time_width - 2;
-        int icon_bottom_right_y = y_offset + font_height - 6;
+  // Time
+  if (!no_draw) {
+    Color time_color = trip.is_realtime ? this->realtime_color_ : Color(0xa7a7a7);
+    this->display_->print(dw + 1, y_offset, this->font_, time_color,
+                          display::TextAlign::TOP_RIGHT, time_str.c_str());
+  }
 
-        this->draw_realtime_icon_(icon_bottom_right_x, icon_bottom_right_y, uptime);
-      }
-    }
+  // Realtime icon
+  if (trip.is_realtime) {
+    if (this->frame_uniform_clip_end_ < 0) clip_end -= 8;
+    if (!no_draw)
+      this->draw_realtime_icon_(dw - time_width - 2, y_offset + fh - 6, uptime);
+  }
 
-    int headsign_max_width = headsign_clipping_end - headsign_clipping_start;
+  // Headsign measurement
+  int hw;
+  this->font_->measure(trip.headsign.c_str(), &hw, &_, &_, &_);
+  int overflow = hw - (clip_end - clip_start);
+  if (headsign_overflow_out) *headsign_overflow_out = overflow;
+  if (headsign_width_out) *headsign_width_out = hw;
+  if (no_draw) return;
 
-    int headsign_actual_width;
-    this->font_->measure(trip.headsign.c_str(), &headsign_actual_width, &_, &_, &_);
-
-    int headsign_overflow = headsign_actual_width - headsign_max_width;
-    if (headsign_overflow_out) {
-      *headsign_overflow_out = headsign_overflow;
-    }
-
-    if (no_draw) {
-      return;
-    }
-
-    int scroll_offset = 0;
-    if (headsign_overflow > 0 && scroll_cycle_duration > 0) {
-      /// Note: The scroll may jump if headsign_clipping_end changes (e.g. due to the width of the arrival time changing).
-      /// This is probably not a big deal, since the display makes sudden changes anyway (e.g. when routes are updated)
-      /// and this happens relatively infrequently.
-
-      int scroll_time = headsign_overflow * 1000 / scroll_speed;
-      int scroll_cycle_time = uptime % scroll_cycle_duration;
-
-      // Scroll idle (left side - default)
-      if(scroll_cycle_time < idle_time_left) {
-        // scroll_offset = 0; do nothing
-      } else if (scroll_cycle_time < idle_time_left + scroll_time) {
-        // Scrolling left
-        int time_since_scroll_start = scroll_cycle_time - idle_time_left;
-        scroll_offset = time_since_scroll_start * scroll_speed / 1000;
-      } else if (scroll_cycle_time < idle_time_left + scroll_time + idle_time_right) {
-        // Scroll idle (right side)
-        scroll_offset = headsign_overflow;
-      } else if (scroll_cycle_time < idle_time_left + 2 * scroll_time + idle_time_right){
-        // Scrolling right
-        int time_since_scroll_start = scroll_cycle_time - (idle_time_left + scroll_time + idle_time_right);
-        scroll_offset = headsign_overflow - (time_since_scroll_start * scroll_speed / 1000);
-      } else {
-        // Waiting for other headsigns to finish scrolling
-        // scroll_offset = 0; do nothing
-      }
-    }
-
-    this->display_->start_clipping(headsign_clipping_start, 0, headsign_clipping_end, this->display_->get_height());
-    this->display_->print(headsign_clipping_start - scroll_offset, y_offset, this->font_, trip.headsign.c_str());
-    this->display_->end_clipping();
+  // Headsign rendering (continuous marquee when scrolling)
+  this->display_->start_clipping(clip_start, 0, clip_end, dh);
+  if (overflow > 0 && h_scroll_offset >= 0 && total_scroll_distance > 0) {
+    int x = clip_start - h_scroll_offset;
+    this->display_->print(x, y_offset, this->font_, trip.headsign.c_str());
+    this->display_->print(x + total_scroll_distance, y_offset, this->font_, trip.headsign.c_str());
+  } else {
+    this->display_->print(clip_start, y_offset, this->font_, trip.headsign.c_str());
+  }
+  this->display_->end_clipping();
 }
 
-void HOT TransitTracker::draw_schedule() {
-  if (this->display_ == nullptr) {
-    ESP_LOGW(TAG, "No display attached, cannot draw schedule");
+// =====================================================================
+// draw_schedule Helpers
+// =====================================================================
+
+void TransitTracker::compute_uniform_clipping_(const std::vector<Trip> &trips, uint rtc_now) {
+  this->frame_uniform_clip_start_ = -1;
+  this->frame_uniform_clip_end_ = -1;
+  if (!this->uniform_headsign_start_ && !this->uniform_headsign_end_) return;
+
+  int max_route_w = 0, max_time_w = 0;
+  bool any_rt = false;
+  int _;
+  for (const auto &t : trips) {
+    int rw;
+    this->font_->measure(t.route_name.c_str(), &rw, &_, &_, &_);
+    max_route_w = std::max(max_route_w, rw);
+
+    auto ts = this->localization_.fmt_duration_from_now(
+        this->display_departure_times_ ? t.departure_time : t.arrival_time, rtc_now);
+    int tw;
+    this->font_->measure(ts.c_str(), &tw, &_, &_, &_);
+    max_time_w = std::max(max_time_w, tw);
+    if (t.is_realtime) any_rt = true;
+  }
+
+  if (this->uniform_headsign_start_)
+    this->frame_uniform_clip_start_ = this->frame_pin_inset_ + max_route_w + 3;
+
+  if (this->uniform_headsign_end_) {
+    int reserve = max_time_w + 2;
+    if (any_rt) reserve += 8;
+    this->frame_uniform_clip_end_ = this->display_->get_width() - reserve;
+  }
+}
+
+void TransitTracker::compute_h_scroll_(const std::vector<Trip> &trips, int fh,
+                                        unsigned long now, uint rtc_now) {
+  if (!this->scroll_headsigns_) {
+    this->h_scroll_.total_distance = 0;
+    this->h_scroll_.prev_total_distance = 0;
+    this->h_scroll_.offset = 0;
+    this->h_scroll_.idle = true;
     return;
   }
 
+  // Freeze h-scroll during collapse/expand/post-pause animations
+  bool anim_active = (this->transition_.phase >= Transition::COLLAPSE &&
+                      this->transition_.phase <= Transition::POST_PAUSE);
+  if (anim_active || (this->post_pause_end_ != 0 && now < this->post_pause_end_)) {
+    this->h_scroll_.offset = 0;
+    this->h_scroll_.idle = true;
+    return;
+  }
+
+  // Restart h-scroll timer after post-pause ends
+  if (this->post_pause_end_ != 0 && now >= this->post_pause_end_) {
+    this->post_pause_end_ = 0;
+    this->h_scroll_.reset(now);
+  }
+
+  // Find max headsign width and check overflow
+  int max_hw = 0;
+  bool any_overflow = false;
+  for (const auto &t : trips) {
+    int ov = 0, hw = 0;
+    this->draw_trip(t, 0, fh, now, rtc_now, true, &ov, &hw);
+    if (ov > 0) any_overflow = true;
+    max_hw = std::max(max_hw, hw);
+  }
+
+  this->h_scroll_.update_distance(max_hw, any_overflow);
+  this->h_scroll_.compute(now);
+}
+
+void TransitTracker::begin_transition_(
+    const std::vector<Trip> &old_trips, const std::vector<bool> &old_is_pinned,
+    int old_eff_pinned, bool layout_or_swap, unsigned long now) {
+
+  this->transition_.reset();
+  this->transition_.old_trips = old_trips;
+  this->transition_.old_is_pinned = old_is_pinned;
+  this->transition_.old_eff_pinned = old_eff_pinned;
+
+  // Animate all rows for all change types (simple and robust)
+  this->transition_.animate_pinned = true;
+  this->transition_.animate_unpinned = true;
+  this->transition_.stagger_rows = std::max(1, (int)old_trips.size());
+
+  // Start WAIT_SCROLL if h-scroll is active and not near zero
+  bool scroll_active = (this->h_scroll_.total_distance > 0 || this->h_scroll_.prev_total_distance > 0);
+  if (scroll_active && this->h_scroll_.offset >= kScrollNearZeroPx) {
+    this->transition_.phase = Transition::WAIT_SCROLL;
+    this->transition_.phase_start = now;
+  } else {
+    this->transition_.phase = Transition::COLLAPSE;
+    this->transition_.phase_start = now;
+    if (scroll_active) this->h_scroll_.reset(now);
+  }
+}
+
+void TransitTracker::begin_page_transition_(
+    const std::vector<Trip> &pinned_pool, const std::vector<Trip> &unpinned_pool,
+    int eff_pinned, int eff_unpinned,
+    bool pinned_due, bool unpinned_due,
+    const std::vector<Trip> &old_trips, const std::vector<bool> &old_is_pinned,
+    unsigned long now) {
+
+  // Snapshot current display before advancing pages
+  this->transition_.reset();
+  this->transition_.old_trips = old_trips;
+  this->transition_.old_is_pinned = old_is_pinned;
+  this->transition_.old_eff_pinned = eff_pinned;
+  this->transition_.animate_pinned = pinned_due;
+  this->transition_.animate_unpinned = unpinned_due;
+  this->transition_.stagger_rows = std::max(1, (int)old_trips.size());
+
+  // Advance page indices (EXPAND will use the new page content)
+  if (pinned_due)
+    this->pinned_pager_.advance_page((int)pinned_pool.size(), eff_pinned);
+  if (unpinned_due)
+    this->unpinned_pager_.advance_page((int)unpinned_pool.size(), eff_unpinned);
+
+  // Use collapse/expand (replace mode)
+  bool scroll_active = (this->h_scroll_.total_distance > 0 || this->h_scroll_.prev_total_distance > 0);
+  if (scroll_active && this->h_scroll_.offset >= kScrollNearZeroPx) {
+    this->transition_.phase = Transition::WAIT_SCROLL;
+    this->transition_.phase_start = now;
+  } else {
+    this->transition_.phase = Transition::COLLAPSE;
+    this->transition_.phase_start = now;
+    if (scroll_active) this->h_scroll_.reset(now);
+  }
+}
+
+void TransitTracker::tick_transition_(unsigned long now, int fh,
+                                       const std::vector<Trip> &pinned_pool,
+                                       const std::vector<Trip> &unpinned_pool,
+                                       int eff_pinned, int eff_unpinned) {
+  if (this->transition_.phase == Transition::IDLE) return;
+  unsigned long elapsed = now - this->transition_.phase_start;
+
+  switch (this->transition_.phase) {
+    case Transition::WAIT_SCROLL:
+      // Wait for h-scroll to reach near-zero, then start collapse
+      if (this->h_scroll_.idle || this->h_scroll_.total_distance == 0) {
+        this->transition_.phase = Transition::COLLAPSE;
+        this->transition_.phase_start = now;
+        this->h_scroll_.reset(now);
+      } else if (elapsed > 10000) {
+        // Safety timeout: don't wait forever
+        ESP_LOGW(TAG, "WAIT_SCROLL timeout, forcing collapse");
+        this->transition_.phase = Transition::COLLAPSE;
+        this->transition_.phase_start = now;
+        this->h_scroll_.reset(now);
+      }
+      break;
+
+    case Transition::COLLAPSE:
+      if ((int)elapsed >= this->transition_.collapse_duration_ms()) {
+        this->transition_.phase = Transition::MID_PAUSE;
+        this->transition_.phase_start = now;
+      }
+      break;
+
+    case Transition::MID_PAUSE:
+      if ((int)elapsed >= kReplaceMidPauseMs) {
+        this->transition_.phase = Transition::EXPAND;
+        this->transition_.phase_start = now;
+        // Update stagger_rows for expand (layout may have changed)
+        int new_total = eff_pinned + std::min((int)unpinned_pool.size(), eff_unpinned);
+        this->transition_.stagger_rows = std::max(1, std::min(new_total, this->limit_));
+      }
+      break;
+
+    case Transition::EXPAND:
+      if ((int)elapsed >= this->transition_.expand_duration_ms()) {
+        this->transition_.phase = Transition::POST_PAUSE;
+        this->transition_.phase_start = now;
+      }
+      break;
+
+    case Transition::POST_PAUSE:
+      if ((int)elapsed >= this->page_pause_duration_) {
+        this->transition_.reset();
+        // Brief h-scroll hold after animation
+        this->post_pause_end_ = now + 500;
+        this->pinned_pager_.page_timer = now;
+        this->unpinned_pager_.page_timer = now;
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+void TransitTracker::render_frame_(
+    const std::vector<Trip> &rows, const std::vector<bool> &row_pinned,
+    int eff_pinned, unsigned long now, uint rtc_now, int fh, int y_base) {
+
+  auto phase = this->transition_.phase;
+  bool use_old = (phase == Transition::WAIT_SCROLL ||
+                  phase == Transition::COLLAPSE ||
+                  phase == Transition::MID_PAUSE);
+
+  const auto &draw_rows = use_old ? this->transition_.old_trips : rows;
+  const auto &draw_pinned = use_old ? this->transition_.old_is_pinned : row_pinned;
+
+  // Save/restore pin inset based on current phase
+  int save_inset = this->frame_pin_inset_;
+  if (use_old) {
+    this->frame_pin_inset_ = (this->transition_.old_eff_pinned > 0 && this->show_pin_icon_)
+                                 ? kPinIconWidth : 0;
+  }
+
+  // H-scroll: active only in IDLE and WAIT_SCROLL
+  int h_off = 0, h_dist = 0;
+  if (phase == Transition::IDLE || phase == Transition::WAIT_SCROLL) {
+    if (this->h_scroll_.total_distance > 0 || this->h_scroll_.prev_total_distance > 0) {
+      h_off = this->h_scroll_.offset;
+      h_dist = this->h_scroll_.total_distance > 0
+                   ? this->h_scroll_.total_distance
+                   : this->h_scroll_.prev_total_distance;
+    }
+  }
+
+  unsigned long phase_elapsed = now - this->transition_.phase_start;
+  int dw = this->display_->get_width();
+
+  for (size_t i = 0; i < draw_rows.size() && (int)i < this->limit_; i++) {
+    int y = y_base + (int)i * fh;
+
+    if (phase == Transition::COLLAPSE) {
+      // Rows shrink from bottom up (top stays visible longest)
+      float scale = this->transition_.row_scale((int)i, phase_elapsed, false);
+      if (scale <= kMinRowScale) continue;
+      int clip_h = std::max(1, (int)(fh * scale));
+      this->display_->start_clipping(0, y, dw, y + clip_h);
+      this->draw_trip(draw_rows[i], y, fh, now, rtc_now, false, nullptr, nullptr, -1, 0, draw_pinned[i]);
+      this->display_->end_clipping();
+
+    } else if (phase == Transition::MID_PAUSE) {
+      // Nothing visible during mid-pause
+      continue;
+
+    } else if (phase == Transition::EXPAND) {
+      // Rows grow from top down (bottom appears last)
+      float scale = this->transition_.row_scale((int)i, phase_elapsed, true);
+      if (scale <= kMinRowScale) continue;
+      int clip_h = std::max(1, (int)(fh * scale));
+      int clip_top = y + fh - clip_h;
+      this->display_->start_clipping(0, std::max(0, clip_top), dw, y + fh);
+      this->draw_trip(draw_rows[i], y, fh, now, rtc_now, false, nullptr, nullptr, -1, 0, draw_pinned[i]);
+      this->display_->end_clipping();
+
+    } else {
+      // IDLE, WAIT_SCROLL, POST_PAUSE — full rows with optional h-scroll
+      this->draw_trip(draw_rows[i], y, fh, now, rtc_now, false, nullptr, nullptr, h_off, h_dist, draw_pinned[i]);
+    }
+  }
+
+  this->frame_pin_inset_ = save_inset;
+}
+
+// =====================================================================
+// draw_schedule — the main orchestrator
+// =====================================================================
+
+void HOT TransitTracker::draw_schedule() {
+  // ---- Early returns ----
+  if (!this->display_) return;
   if (!esphome::network::is_connected()) {
     this->draw_text_centered_("Waiting for network", Color(0x252627));
     return;
   }
-
   if (!this->rtc_->now().is_valid()) {
     this->draw_text_centered_("Waiting for time sync", Color(0x252627));
     return;
   }
-
   if (this->base_url_.empty()) {
     this->draw_text_centered_("No base URL set", Color(0x252627));
     return;
   }
-
   if (this->status_has_error()) {
     this->draw_text_centered_("Error loading schedule", Color(0xFE4C5C));
     return;
   }
-
   if (!this->has_ever_connected_) {
     this->draw_text_centered_("Loading...", Color(0x252627));
     return;
   }
-
   if (this->schedule_state_.trips.empty()) {
-    auto message = "No upcoming arrivals";
-    if (this->display_departure_times_) {
-      message = "No upcoming departures";
-    }
-
-    this->draw_text_centered_(message, Color(0x252627));
+    auto msg = this->display_departure_times_ ? "No upcoming departures" : "No upcoming arrivals";
+    this->draw_text_centered_(msg, Color(0x252627));
     return;
   }
 
+  // ---- 1. Snapshot trips ----
   this->schedule_state_.mutex.lock();
-
-  int nominal_font_height = this->font_->get_ascender() + this->font_->get_descender();
-  unsigned long uptime = millis();
-  uint rtc_now = this->rtc_->now().timestamp;
-
-  int scroll_cycle_duration = 0;
-  if (this->scroll_headsigns_) {
-    int largest_headsign_overflow = 0;
-    for (const Trip &trip : this->schedule_state_.trips) {
-      int headsign_overflow;
-      this->draw_trip(trip, 0, nominal_font_height, uptime, rtc_now, true, &headsign_overflow);
-      largest_headsign_overflow = max(largest_headsign_overflow, headsign_overflow);
-    }
-
-    if (largest_headsign_overflow > 0) {
-      int longest_scroll_time = largest_headsign_overflow * 1000 / scroll_speed;
-      scroll_cycle_duration = idle_time_left + idle_time_right + 2*longest_scroll_time;
-    }
-  }
-
-  int max_trips_height = (this->limit_ * this->font_->get_ascender()) + ((this->limit_ - 1) * this->font_->get_descender());
-  int y_offset = (this->display_->get_height() % max_trips_height) / 2;
-
-  for (const Trip &trip : this->schedule_state_.trips) {
-    this->draw_trip(trip, y_offset, nominal_font_height, uptime, rtc_now, false, nullptr, scroll_cycle_duration);
-    y_offset += nominal_font_height;
-  }
-
+  auto all_trips = this->schedule_state_.trips;
   this->schedule_state_.mutex.unlock();
+
+  // ---- 2. Filter hidden routes ----
+  std::vector<Trip> visible;
+  for (const auto &t : all_trips) {
+    if (this->hidden_routes_.count(t.composite_key())) continue;
+    visible.push_back(t);
+  }
+
+  // ---- 3. Apply next-only filter ----
+  if (!this->next_only_routes_.empty()) {
+    std::set<std::string> seen;
+    std::vector<Trip> filtered;
+    for (const auto &t : visible) {
+      auto key = t.composite_key();
+      if (this->next_only_routes_.count(key)) {
+        if (seen.count(key)) continue;
+        seen.insert(key);
+      }
+      filtered.push_back(t);
+    }
+    visible = std::move(filtered);
+  }
+
+  if (visible.empty()) {
+    auto msg = this->display_departure_times_ ? "No upcoming departures" : "No upcoming arrivals";
+    this->draw_text_centered_(msg, Color(0x252627));
+    return;
+  }
+
+  // ---- 4. Partition: pinned first, then unpinned ----
+  int actual_pinned = 0;
+  if (!this->pinned_routes_.empty()) {
+    std::stable_partition(visible.begin(), visible.end(), [this](const Trip &t) {
+      return this->pinned_routes_.count(t.composite_key()) > 0;
+    });
+    for (const auto &t : visible) {
+      if (this->pinned_routes_.count(t.composite_key())) actual_pinned++;
+      else break;
+    }
+    dedup_pinned_section(visible, actual_pinned);
+  }
+
+  int eff_pinned = (actual_pinned > 0) ? std::min(this->pinned_rows_count_, actual_pinned) : 0;
+  int eff_unpinned = this->limit_ - eff_pinned;
+
+  // Split into pools
+  std::vector<Trip> pinned_pool(visible.begin(), visible.begin() + actual_pinned);
+  std::vector<Trip> unpinned_pool(visible.begin() + actual_pinned, visible.end());
+
+  // ---- 5. Paginate ----
+  if (eff_pinned > 0) this->pinned_pager_.clamp((int)pinned_pool.size(), eff_pinned);
+  else this->pinned_pager_.reset();
+
+  if (this->scroll_routes_) this->unpinned_pager_.clamp((int)unpinned_pool.size(), eff_unpinned);
+  else this->unpinned_pager_.reset();
+
+  int p_si = eff_pinned > 0 ? this->pinned_pager_.start_index((int)pinned_pool.size(), eff_pinned) : 0;
+  int p_ei = eff_pinned > 0 ? this->pinned_pager_.end_index((int)pinned_pool.size(), eff_pinned) : 0;
+  int u_si = this->unpinned_pager_.start_index((int)unpinned_pool.size(), eff_unpinned);
+  int u_ei = this->unpinned_pager_.end_index((int)unpinned_pool.size(), eff_unpinned);
+
+  // ---- 6. Build display rows ----
+  std::vector<Trip> rows;
+  std::vector<bool> row_pinned;
+  std::vector<std::string> keys;
+  std::vector<time_t> deps;
+
+  for (int i = p_si; i < p_ei; i++) {
+    rows.push_back(pinned_pool[i]); row_pinned.push_back(true);
+    keys.push_back(pinned_pool[i].composite_key()); deps.push_back(pinned_pool[i].departure_time);
+  }
+  for (int i = u_si; i < u_ei; i++) {
+    rows.push_back(unpinned_pool[i]); row_pinned.push_back(false);
+    keys.push_back(unpinned_pool[i].composite_key()); deps.push_back(unpinned_pool[i].departure_time);
+  }
+
+  // ---- 7. Timing ----
+  unsigned long now = millis();
+  uint rtc_now = this->rtc_->now().timestamp;
+  int fh = this->font_->get_ascender() + this->font_->get_descender();
+  int max_h = (this->limit_ * this->font_->get_ascender()) + ((this->limit_ - 1) * this->font_->get_descender());
+  int y_base = (this->display_->get_height() % max_h) / 2;
+
+  // ---- 8. Per-frame state ----
+  this->frame_pin_inset_ = (eff_pinned > 0 && this->show_pin_icon_) ? kPinIconWidth : 0;
+
+  // ---- 9. H-scroll ----
+  bool use_old_for_scroll = (this->transition_.phase == Transition::WAIT_SCROLL &&
+                             !this->transition_.old_trips.empty());
+  this->compute_h_scroll_(use_old_for_scroll ? this->transition_.old_trips : rows, fh, now, rtc_now);
+
+  // ---- 10. Uniform clipping ----
+  this->compute_uniform_clipping_(rows, rtc_now);
+
+  // ---- 11. Change detection & transition planning (only when idle) ----
+  if (this->transition_.phase == Transition::IDLE) {
+    this->diff_.compute(keys, deps, eff_pinned, this->pinned_routes_);
+
+    if (this->diff_.has_changes() && this->diff_.prev_pinned_count >= 0) {
+      // Data/layout changed — start transition
+      bool layout_swap = this->diff_.layout_changed || this->diff_.pinned_set_changed;
+      this->begin_transition_(this->diff_.prev_trips, this->diff_.prev_is_pinned,
+                              this->diff_.prev_pinned_count, layout_swap, now);
+    } else if (this->scroll_routes_ && this->diff_.prev_pinned_count >= 0) {
+      // Check page timers
+      bool pinned_due = false, unpinned_due = false;
+
+      if (this->pinned_pager_.needs_paging((int)pinned_pool.size(), eff_pinned)) {
+        if (this->pinned_pager_.page_timer == 0) this->pinned_pager_.page_timer = now;
+        bool interval_met = (now - this->pinned_pager_.page_timer >= (unsigned long)this->page_interval_);
+        pinned_due = interval_met && (this->h_scroll_.total_distance == 0 || this->h_scroll_.idle);
+      }
+
+      if (this->unpinned_pager_.needs_paging((int)unpinned_pool.size(), eff_unpinned)) {
+        if (this->unpinned_pager_.page_timer == 0) this->unpinned_pager_.page_timer = now;
+        bool interval_met = (now - this->unpinned_pager_.page_timer >= (unsigned long)this->page_interval_);
+        unpinned_due = interval_met && (this->h_scroll_.total_distance == 0 || this->h_scroll_.idle);
+      }
+
+      if (pinned_due || unpinned_due) {
+        this->begin_page_transition_(pinned_pool, unpinned_pool, eff_pinned, eff_unpinned,
+                                     pinned_due, unpinned_due, rows, row_pinned, now);
+
+        // Re-compute rows with new page indices
+        rows.clear(); row_pinned.clear(); keys.clear(); deps.clear();
+        p_si = eff_pinned > 0 ? this->pinned_pager_.start_index((int)pinned_pool.size(), eff_pinned) : 0;
+        p_ei = eff_pinned > 0 ? this->pinned_pager_.end_index((int)pinned_pool.size(), eff_pinned) : 0;
+        u_si = this->unpinned_pager_.start_index((int)unpinned_pool.size(), eff_unpinned);
+        u_ei = this->unpinned_pager_.end_index((int)unpinned_pool.size(), eff_unpinned);
+        for (int i = p_si; i < p_ei; i++) {
+          rows.push_back(pinned_pool[i]); row_pinned.push_back(true);
+          keys.push_back(pinned_pool[i].composite_key()); deps.push_back(pinned_pool[i].departure_time);
+        }
+        for (int i = u_si; i < u_ei; i++) {
+          rows.push_back(unpinned_pool[i]); row_pinned.push_back(false);
+          keys.push_back(unpinned_pool[i].composite_key()); deps.push_back(unpinned_pool[i].departure_time);
+        }
+      }
+    }
+  }
+
+  // ---- 12. Tick transition ----
+  this->tick_transition_(now, fh, pinned_pool, unpinned_pool, eff_pinned, eff_unpinned);
+
+  // ---- 13. Render ----
+  this->render_frame_(rows, row_pinned, eff_pinned, now, rtc_now, fh, y_base);
+
+  // ---- 14. Commit diff (only when idle) ----
+  if (this->transition_.phase == Transition::IDLE) {
+    this->diff_.commit(keys, deps, rows, row_pinned, eff_pinned, this->pinned_routes_);
+  }
 }
 
 }  // namespace transit_tracker

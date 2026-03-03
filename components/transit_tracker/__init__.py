@@ -7,6 +7,12 @@ from esphome.components.time import RealTimeClock
 from esphome.components import color
 from esphome.const import CONF_ID, CONF_DISPLAY_ID, CONF_TIME_ID, CONF_SHOW_UNITS, __version__ as ESPHOME_VERSION
 
+try:
+    from esphome.components import text as text_comp
+    TextEntity = text_comp.Text
+except Exception:
+    TextEntity = None
+
 _MINIMUM_ESPHOME_VERSION = "2025.7.0"
 
 DEPENDENCIES = ["network"]
@@ -35,6 +41,12 @@ CONF_REALTIME_COLOR = "realtime_color"
 CONF_TIME_DISPLAY = "time_display"
 CONF_LIST_MODE = "list_mode"
 CONF_SCROLL_HEADSIGNS = "scroll_headsigns"
+CONF_HIDDEN_ROUTES_TEXT = "hidden_routes_text"
+CONF_PINNED_ROUTES_TEXT = "pinned_routes_text"
+CONF_NEXT_ONLY_ROUTES_TEXT = "next_only_routes_text"
+CONF_ROUTE_COLOR_OVERRIDES_TEXT = "route_color_overrides_text"
+CONF_SHOW_PIN_ICON = "show_pin_icon"
+CONF_PREFER_REPLACE_OVER_SCROLL = "prefer_replace_over_scroll"
 
 
 def validate_ws_url(value):
@@ -71,7 +83,13 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_LIST_MODE, default="sequential"): cv.one_of(
                 "sequential", "nextPerRoute"
             ),
-            cv.Optional(CONF_SCROLL_HEADSIGNS, default=False) : cv.boolean,
+            cv.Optional(CONF_SCROLL_HEADSIGNS, default=False): cv.boolean,
+            cv.Optional(CONF_SHOW_PIN_ICON, default=True): cv.boolean,
+            cv.Optional(CONF_PREFER_REPLACE_OVER_SCROLL, default=True): cv.boolean,
+            cv.Optional(CONF_HIDDEN_ROUTES_TEXT): cv.use_id(TextEntity) if TextEntity else cv.string,
+            cv.Optional(CONF_PINNED_ROUTES_TEXT): cv.use_id(TextEntity) if TextEntity else cv.string,
+            cv.Optional(CONF_NEXT_ONLY_ROUTES_TEXT): cv.use_id(TextEntity) if TextEntity else cv.string,
+            cv.Optional(CONF_ROUTE_COLOR_OVERRIDES_TEXT): cv.use_id(TextEntity) if TextEntity else cv.string,
             cv.Optional(CONF_STOPS, default=[]): cv.ensure_list(
                 cv.Schema(
                     {
@@ -139,10 +157,27 @@ async def to_code(config):
 
     cg.add(var.set_list_mode(config[CONF_LIST_MODE]))
     cg.add(var.set_scroll_headsigns(config[CONF_SCROLL_HEADSIGNS]))
+    cg.add(var.set_show_pin_icon(config[CONF_SHOW_PIN_ICON]))
+    cg.add(var.set_prefer_replace_over_scroll(config[CONF_PREFER_REPLACE_OVER_SCROLL]))
 
     cg.add(var.set_limit(config[CONF_LIMIT]))
-
     cg.add(var.set_unit_display(config[CONF_SHOW_UNITS]))
+
+    if CONF_HIDDEN_ROUTES_TEXT in config and TextEntity is not None:
+        text_entity = await cg.get_variable(config[CONF_HIDDEN_ROUTES_TEXT])
+        cg.add(var.set_hidden_routes_text(text_entity))
+
+    if CONF_PINNED_ROUTES_TEXT in config and TextEntity is not None:
+        text_entity = await cg.get_variable(config[CONF_PINNED_ROUTES_TEXT])
+        cg.add(var.set_pinned_routes_text(text_entity))
+
+    if CONF_NEXT_ONLY_ROUTES_TEXT in config and TextEntity is not None:
+        text_entity = await cg.get_variable(config[CONF_NEXT_ONLY_ROUTES_TEXT])
+        cg.add(var.set_next_only_routes_text(text_entity))
+
+    if CONF_ROUTE_COLOR_OVERRIDES_TEXT in config and TextEntity is not None:
+        text_entity = await cg.get_variable(config[CONF_ROUTE_COLOR_OVERRIDES_TEXT])
+        cg.add(var.set_route_color_overrides_text(text_entity))
 
     if CONF_ABBREVIATIONS in config:
         for abbreviation in config[CONF_ABBREVIATIONS]:
@@ -169,6 +204,7 @@ async def to_code(config):
 
     await cg.register_component(var, config)
 
+    cg.add_library("WiFi", None)
     cg.add_library("NetworkClientSecure", None)
     cg.add_library("HTTPClient", None)
 
