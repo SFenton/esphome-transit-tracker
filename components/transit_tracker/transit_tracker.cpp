@@ -1158,17 +1158,59 @@ void HOT TransitTracker::draw_schedule() {
   // ---- 8. Per-frame state ----
   this->frame_pin_inset_ = (eff_pinned > 0 && this->show_pin_icon_) ? kPinIconWidth : 0;
 
-  // ---- 9. H-scroll ----
-  bool use_old_for_scroll = (this->transition_.phase == Transition::WAIT_SCROLL &&
-                             !this->transition_.old_trips.empty());
-  this->compute_h_scroll_(use_old_for_scroll ? this->transition_.old_trips : rows, fh, now, rtc_now);
+  // ---- 9. Determine rendering context (old vs new layout) ----
+  // H-scroll and uniform clipping must measure against the layout actually
+  // visible this frame.  When a transition renders old content (or is about to
+  // start), the visible rows and pin inset come from the previous frame.
+  // Computing measurements with the *new* inset would shift the headsign
+  // mid-marquee on the very first frame of a pin change.
+  const std::vector<Trip> *measure_rows = &rows;
+  int measure_eff_pinned = eff_pinned;
+  bool rendering_old_layout = false;
 
-  // ---- 10. Uniform clipping ----
-  this->compute_uniform_clipping_(rows, rtc_now);
-
-  // ---- 11. Change detection & transition planning (only when idle) ----
-  if (this->transition_.phase == Transition::IDLE) {
+  if (this->transition_.phase != Transition::IDLE) {
+    // Mid-transition: phases that render old content
+    bool phase_uses_old = (this->transition_.phase == Transition::WAIT_SCROLL ||
+                           this->transition_.phase == Transition::COLLAPSE ||
+                           this->transition_.phase == Transition::MID_PAUSE);
+    if (phase_uses_old && !this->transition_.old_trips.empty()) {
+      measure_rows = &this->transition_.old_trips;
+      measure_eff_pinned = this->transition_.old_eff_pinned;
+      rendering_old_layout = true;
+    }
+  } else {
+    // IDLE: peek at diff to detect an impending layout change so that the
+    // measurements below (and begin_transition_'s WAIT vs COLLAPSE decision)
+    // use h-scroll / clipping state consistent with the old layout.
     this->diff_.compute(keys, deps, eff_pinned, this->pinned_routes_);
+    if (this->diff_.has_changes() && this->diff_.prev_pinned_count >= 0) {
+      measure_rows = &this->diff_.prev_trips;
+      measure_eff_pinned = this->diff_.prev_pinned_count;
+      rendering_old_layout = true;
+    }
+  }
+
+  // ---- 10. H-scroll ----
+  {
+    int saved_inset = this->frame_pin_inset_;
+    if (rendering_old_layout)
+      this->frame_pin_inset_ = (measure_eff_pinned > 0 && this->show_pin_icon_) ? kPinIconWidth : 0;
+    this->compute_h_scroll_(*measure_rows, fh, now, rtc_now);
+    this->frame_pin_inset_ = saved_inset;
+  }
+
+  // ---- 11. Uniform clipping ----
+  {
+    int saved_inset = this->frame_pin_inset_;
+    if (rendering_old_layout)
+      this->frame_pin_inset_ = (measure_eff_pinned > 0 && this->show_pin_icon_) ? kPinIconWidth : 0;
+    this->compute_uniform_clipping_(*measure_rows, rtc_now);
+    this->frame_pin_inset_ = saved_inset;
+  }
+
+  // ---- 12. Change detection & transition planning (only when idle) ----
+  if (this->transition_.phase == Transition::IDLE) {
+    // diff_.compute() already ran above in step 9
 
     if (this->diff_.has_changes() && this->diff_.prev_pinned_count >= 0) {
       // Data/layout changed — start transition
@@ -1234,13 +1276,13 @@ void HOT TransitTracker::draw_schedule() {
     }
   }
 
-  // ---- 12. Tick transition ----
+  // ---- 13. Tick transition ----
   this->tick_transition_(now, fh, pinned_pool, unpinned_pool, eff_pinned, eff_unpinned);
 
-  // ---- 13. Render ----
+  // ---- 14. Render ----
   this->render_frame_(rows, row_pinned, eff_pinned, now, rtc_now, fh, y_base);
 
-  // ---- 14. Commit diff (only when idle) ----
+  // ---- 15. Commit diff (only when idle) ----
   if (this->transition_.phase == Transition::IDLE) {
     this->diff_.commit(keys, deps, rows, row_pinned, eff_pinned, this->pinned_routes_);
   }

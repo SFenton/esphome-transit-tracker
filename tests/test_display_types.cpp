@@ -440,3 +440,733 @@ TEST_SUITE("split") {
     CHECK(r[1] == "b");
   }
 }
+
+// =====================================================================
+// DisplayDiff — pin-change edge cases
+// =====================================================================
+
+TEST_SUITE("DisplayDiff — pin transitions") {
+  // helper: commit a frame into the diff
+  static void commit_frame(DisplayDiff &diff,
+                           const std::vector<Trip> &trips,
+                           int pinned_count,
+                           const std::set<std::string> &pinned_routes) {
+    std::vector<std::string> keys;
+    std::vector<time_t> deps;
+    std::vector<bool> is_p;
+    for (size_t i = 0; i < trips.size(); i++) {
+      keys.push_back(trips[i].composite_key());
+      deps.push_back(trips[i].departure_time);
+      is_p.push_back((int)i < pinned_count);
+    }
+    diff.commit(keys, deps, trips, is_p, pinned_count, pinned_routes);
+  }
+
+  static void compute_frame(DisplayDiff &diff,
+                             const std::vector<Trip> &trips,
+                             int pinned_count,
+                             const std::set<std::string> &pinned_routes) {
+    std::vector<std::string> keys;
+    std::vector<time_t> deps;
+    for (const auto &t : trips) {
+      keys.push_back(t.composite_key());
+      deps.push_back(t.departure_time);
+    }
+    diff.compute(keys, deps, pinned_count, pinned_routes);
+  }
+
+  TEST_CASE("add first pin — layout_changed") {
+    DisplayDiff diff;
+    std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::set<std::string> no_pins;
+
+    commit_frame(diff, trips, 0, no_pins);
+
+    // Pin R1 — pinned count goes from 0→1
+    std::set<std::string> pin_r1 = {"R1:A"};
+    std::vector<Trip> reordered = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    compute_frame(diff, reordered, 1, pin_r1);
+
+    CHECK(diff.layout_changed);
+    CHECK(diff.has_changes());
+    // Snapshot preserves old trips for transition
+    CHECK(diff.prev_pinned_count == 0);
+    CHECK(diff.prev_trips.size() == 2);
+  }
+
+  TEST_CASE("remove last pin — layout_changed") {
+    DisplayDiff diff;
+    std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::set<std::string> pin_r1 = {"R1:A"};
+
+    commit_frame(diff, trips, 1, pin_r1);
+
+    // Remove pin
+    std::set<std::string> no_pins;
+    compute_frame(diff, trips, 0, no_pins);
+
+    CHECK(diff.layout_changed);
+    CHECK(diff.has_changes());
+    CHECK(diff.prev_pinned_count == 1);
+  }
+
+  TEST_CASE("swap pinned route — pinned_set_changed (count stays same)") {
+    DisplayDiff diff;
+    std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200), make_trip("R3", "C", 300)};
+    std::set<std::string> pin_v1 = {"R1:A"};
+
+    commit_frame(diff, trips, 1, pin_v1);
+
+    // Swap R1 for R2 — count still 1 but set changed
+    std::set<std::string> pin_v2 = {"R2:B"};
+    std::vector<Trip> reordered = {make_trip("R2", "B", 200), make_trip("R1", "A", 100), make_trip("R3", "C", 300)};
+    compute_frame(diff, reordered, 1, pin_v2);
+
+    CHECK(diff.pinned_set_changed);
+    CHECK(!diff.layout_changed);  // count didn't change
+    CHECK(diff.has_changes());
+  }
+
+  TEST_CASE("rapid add then remove before commit — sees layout change each time") {
+    DisplayDiff diff;
+    std::vector<Trip> trips = {make_trip("R1", "A"), make_trip("R2", "B")};
+    std::set<std::string> no_pins;
+
+    // Frame 0: commit with no pins
+    commit_frame(diff, trips, 0, no_pins);
+
+    // Frame 1: compute with pin added (but don't commit — simulates transition active)
+    std::set<std::string> pin_r1 = {"R1:A"};
+    compute_frame(diff, trips, 1, pin_r1);
+    CHECK(diff.layout_changed);
+
+    // Frame 2: compute again with pin removed (still haven't committed)
+    // diff.prev_pinned_count is still 0 from the commit
+    compute_frame(diff, trips, 0, no_pins);
+    CHECK(!diff.has_changes());  // same as committed state
+  }
+
+  TEST_CASE("commit preserves snapshot trips for transition old_trips") {
+    DisplayDiff diff;
+    Trip t1 = make_trip("R1", "A", 100);
+    Trip t2 = make_trip("R2", "B", 200);
+    std::vector<Trip> trips = {t1, t2};
+    std::set<std::string> no_pins;
+
+    commit_frame(diff, trips, 0, no_pins);
+
+    // Verify snapshot
+    REQUIRE(diff.prev_trips.size() == 2);
+    CHECK(diff.prev_trips[0].route_id == "R1");
+    CHECK(diff.prev_trips[1].route_id == "R2");
+    CHECK(diff.prev_is_pinned[0] == false);
+    CHECK(diff.prev_is_pinned[1] == false);
+
+    // Modify original trips — snapshot should be independent
+    trips[0] = make_trip("R3", "C", 300);
+    CHECK(diff.prev_trips[0].route_id == "R1");
+  }
+
+  TEST_CASE("size change detected as data_changed") {
+    DisplayDiff diff;
+    std::vector<Trip> trips2 = {make_trip("R1", "A"), make_trip("R2", "B")};
+    std::set<std::string> no_pins;
+    commit_frame(diff, trips2, 0, no_pins);
+
+    // Now 3 rows instead of 2
+    std::vector<Trip> trips3 = {make_trip("R1", "A"), make_trip("R2", "B"), make_trip("R3", "C")};
+    compute_frame(diff, trips3, 0, no_pins);
+    CHECK(diff.data_changed);
+  }
+
+  TEST_CASE("multiple pins added at once — layout_changed") {
+    DisplayDiff diff;
+    std::vector<Trip> trips = {make_trip("R1", "A"), make_trip("R2", "B"), make_trip("R3", "C")};
+    std::set<std::string> no_pins;
+    commit_frame(diff, trips, 0, no_pins);
+
+    std::set<std::string> pin_both = {"R1:A", "R2:B"};
+    compute_frame(diff, trips, 2, pin_both);
+    CHECK(diff.layout_changed);
+    CHECK(diff.has_changes());
+  }
+}
+
+// =====================================================================
+// Transition — mid-animation interrupts
+// =====================================================================
+
+TEST_SUITE("Transition — mid-animation") {
+  TEST_CASE("reset mid-collapse clears phase and snapshots") {
+    Transition tr;
+    tr.phase = Transition::COLLAPSE;
+    tr.phase_start = 1000;
+    tr.stagger_rows = 3;
+    tr.animate_pinned = true;
+    tr.animate_unpinned = true;
+    tr.old_trips = {make_trip("R1", "A"), make_trip("R2", "B"), make_trip("R3", "C")};
+    tr.old_is_pinned = {false, false, false};
+    tr.old_eff_pinned = 0;
+
+    // Simulate pin change mid-collapse → reset + re-enter
+    tr.reset();
+    CHECK(tr.phase == Transition::IDLE);
+    CHECK(tr.old_trips.empty());
+    CHECK(tr.stagger_rows == 0);
+
+    // Re-populate for new transition
+    tr.old_trips = {make_trip("R1", "A"), make_trip("R2", "B")};
+    tr.old_is_pinned = {true, false};
+    tr.old_eff_pinned = 1;
+    tr.stagger_rows = 2;
+    tr.phase = Transition::WAIT_SCROLL;
+    tr.phase_start = 2000;
+
+    CHECK(tr.phase == Transition::WAIT_SCROLL);
+    CHECK(tr.old_eff_pinned == 1);
+    CHECK(tr.old_trips.size() == 2);
+  }
+
+  TEST_CASE("reset mid-expand preserves ability to restart") {
+    Transition tr;
+    tr.phase = Transition::EXPAND;
+    tr.phase_start = 5000;
+    tr.stagger_rows = 3;
+    tr.old_trips = {make_trip("R1", "A"), make_trip("R2", "B"), make_trip("R3", "C")};
+
+    // Row 0 mid-expand: at t=250 into expand, partially visible
+    float scale = tr.row_scale(0, 250, true);
+    CHECK(scale > 0.0f);
+    CHECK(scale < 1.0f);
+
+    // Interrupted — reset
+    tr.reset();
+    CHECK(tr.phase == Transition::IDLE);
+
+    // New transition can start cleanly
+    tr.phase = Transition::COLLAPSE;
+    tr.phase_start = 6000;
+    tr.stagger_rows = 2;
+    CHECK(tr.collapse_duration_ms() == kReplacePerRowMs + kReplaceStaggerMs);
+  }
+
+  TEST_CASE("single-row stagger has zero cascade") {
+    Transition tr;
+    tr.stagger_rows = 1;
+    CHECK(tr.cascade_ms() == 0);
+    CHECK(tr.collapse_duration_ms() == kReplacePerRowMs);
+    CHECK(tr.expand_duration_ms() == kReplacePerRowMs);
+    CHECK(tr.total_replace_ms() == 2 * kReplacePerRowMs + kReplaceMidPauseMs);
+  }
+
+  TEST_CASE("row_scale at exact phase boundaries") {
+    Transition tr;
+    tr.stagger_rows = 2;
+
+    // Row 0, t=0, collapse: should be fully visible (about to start shrinking)
+    CHECK(tr.row_scale(0, 0, false) == doctest::Approx(1.0f));
+
+    // Row 0, t=kReplacePerRowMs, collapse: should be fully collapsed
+    CHECK(tr.row_scale(0, kReplacePerRowMs, false) == doctest::Approx(0.0f));
+
+    // Row 1, t=kReplaceStaggerMs, collapse: just starting — still visible
+    CHECK(tr.row_scale(1, kReplaceStaggerMs, false) == doctest::Approx(1.0f));
+
+    // Row 1, t=kReplaceStaggerMs + kReplacePerRowMs: fully collapsed
+    CHECK(tr.row_scale(1, kReplaceStaggerMs + kReplacePerRowMs, false) == doctest::Approx(0.0f));
+
+    // Row 0, t=0, expand: fully invisible (about to start growing)
+    CHECK(tr.row_scale(0, 0, true) == doctest::Approx(0.0f));
+
+    // Row 0, t=kReplacePerRowMs, expand: fully visible
+    CHECK(tr.row_scale(0, kReplacePerRowMs, true) == doctest::Approx(1.0f));
+  }
+
+  TEST_CASE("row_scale with many rows — last row starts late") {
+    Transition tr;
+    tr.stagger_rows = 5;
+
+    int last_row = 4;
+    int last_row_start = last_row * kReplaceStaggerMs;  // 4 * 250 = 1000
+
+    // Before its start time: still fully visible (collapse) or invisible (expand)
+    CHECK(tr.row_scale(last_row, last_row_start - 1, false) == doctest::Approx(1.0f));
+    CHECK(tr.row_scale(last_row, last_row_start - 1, true) == doctest::Approx(0.0f));
+
+    // At its start time
+    CHECK(tr.row_scale(last_row, last_row_start, false) == doctest::Approx(1.0f));
+    CHECK(tr.row_scale(last_row, last_row_start, true) == doctest::Approx(0.0f));
+
+    // At its end time
+    CHECK(tr.row_scale(last_row, last_row_start + kReplacePerRowMs, false) == doctest::Approx(0.0f));
+    CHECK(tr.row_scale(last_row, last_row_start + kReplacePerRowMs, true) == doctest::Approx(1.0f));
+  }
+
+  TEST_CASE("vscroll fields reset properly") {
+    Transition tr;
+    tr.is_vscroll = true;
+    tr.vscroll_section_y = 10;
+    tr.vscroll_section_rows = 3;
+    tr.vscroll_is_pinned = true;
+    tr.reset();
+    CHECK(!tr.is_vscroll);
+    // Note: vscroll fields aren't explicitly zeroed by reset(), but is_vscroll
+    // being false means they won't be read.
+  }
+}
+
+// =====================================================================
+// HScrollState — pin inset / total_distance change scenarios
+// =====================================================================
+
+TEST_SUITE("HScrollState — pin-change disruption") {
+  TEST_CASE("total_distance change mid-scroll causes offset jump") {
+    // This is the exact bug: if total_distance changes because pin inset
+    // widens the measurement, offset = total_px % new_dist jumps.
+    HScrollState hs;
+    hs.scroll_speed = 100;  // 100 px/s
+    hs.reset(1);            // start_time=1 (0 is treated as uninitialized)
+
+    // Initial: headsign width 80 → total=100 (80+20 gap)
+    hs.update_distance(80, true);
+    CHECK(hs.total_distance == 100);
+
+    // Scroll to elapsed=750ms → 75px into a 100-cycle
+    hs.compute(751);
+    CHECK(hs.offset == 75);
+
+    // Now simulate pin change making headsign 7px narrower → width 73, total=93
+    // (In real code this happens because frame_pin_inset_ was set to new
+    //  value before measuring)
+    hs.update_distance(73, true);
+    CHECK(hs.total_distance == 93);
+
+    // At elapsed=1000ms: with old dist 100 → 100%100=0 (cycle boundary, idle).
+    // But with new dist 93 → 100%93=7, which is NOT a cycle boundary.
+    hs.compute(1001);
+    CHECK(hs.offset == 7);
+    // This is NOT 0 (where it should be at a cycle boundary), proving the jump
+    CHECK(hs.offset != 0);
+  }
+
+  TEST_CASE("stable total_distance means smooth scrolling across cycles") {
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(0);
+    hs.update_distance(80, true);  // total=100
+
+    // Sample many frames — offset should increase monotonically within a cycle
+    int prev_offset = -1;
+    int prev_cycle = 0;
+    for (unsigned long t = 0; t <= 2500; t += 50) {
+      hs.compute(t);
+      if (hs.cycle_count == prev_cycle) {
+        CHECK(hs.offset >= prev_offset);
+      }
+      prev_offset = hs.offset;
+      prev_cycle = hs.cycle_count;
+    }
+  }
+
+  TEST_CASE("reset then immediately compute gives zero offset") {
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);
+    hs.update_distance(80, true);
+
+    // Scroll for a while
+    hs.compute(501);  // elapsed=500 → 50px
+    CHECK(hs.offset > 0);
+
+    // Reset (simulating transition entering COLLAPSE)
+    hs.reset(501);
+    hs.compute(501);  // elapsed=0 → 0px
+    CHECK(hs.offset == 0);
+    CHECK(hs.idle);
+  }
+
+  TEST_CASE("wind-down followed by new overflow restarts cleanly") {
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);
+
+    // Start scrolling
+    hs.update_distance(80, true);
+    CHECK(hs.total_distance == 100);
+
+    // Remove overflow (wind-down)
+    hs.update_distance(0, false);
+
+    // Reach cycle boundary → wind-down clears prev
+    hs.compute(1001);  // elapsed=1000, 100%100=0, near zero
+    CHECK(hs.idle);
+    CHECK(hs.prev_total_distance == 0);
+
+    // In real code, a post-pause reset happens here
+    hs.reset(1001);
+
+    // New overflow appears (different route)
+    hs.update_distance(60, true);  // total=80
+    CHECK(hs.total_distance == 80);
+
+    // Should scroll normally from offset 0
+    hs.compute(1051);  // elapsed=50ms at 100px/s = 5px
+    CHECK(hs.offset == 5);
+  }
+
+  TEST_CASE("zero distance throughout stays idle") {
+    HScrollState hs;
+    hs.reset(0);
+    hs.update_distance(0, false);
+    for (unsigned long t = 0; t < 5000; t += 100) {
+      hs.compute(t);
+      CHECK(hs.idle);
+      CHECK(hs.offset == 0);
+    }
+  }
+
+  TEST_CASE("update_distance with overflow=false but positive width has no effect") {
+    HScrollState hs;
+    hs.reset(0);
+    // Width > 0 but no overflow — should not start scrolling
+    hs.update_distance(80, false);
+    CHECK(hs.total_distance == 0);
+    hs.compute(1000);
+    CHECK(hs.idle);
+    CHECK(hs.offset == 0);
+  }
+}
+
+// =====================================================================
+// ScrollContainer — edge cases during transitions
+// =====================================================================
+
+TEST_SUITE("ScrollContainer — transition edge cases") {
+  TEST_CASE("clamp with drastically shrunk pool") {
+    ScrollContainer sc;
+    // Was on page 4 of a 10-item pool with 3 slots
+    sc.page_offset = 4;
+    CHECK(sc.start_index(10, 3) == 4);
+
+    // Pool shrinks to 3 items — only 1 page
+    sc.clamp(3, 3);
+    CHECK(sc.page_offset == 0);
+    CHECK(sc.start_index(3, 3) == 0);
+    CHECK(sc.end_index(3, 3) == 3);
+  }
+
+  TEST_CASE("clamp with pool shrunk but still multi-page") {
+    ScrollContainer sc;
+    sc.page_offset = 5;
+    // pool=8, slots=3 → 6 pages (0..5), offset 5 is still valid
+    sc.clamp(8, 3);
+    CHECK(sc.page_offset == 5);
+
+    // pool shrinks to 6, slots=3 → 4 pages (0..3)
+    sc.clamp(6, 3);
+    CHECK(sc.page_offset == 3);
+  }
+
+  TEST_CASE("advance during an ongoing transition is safe") {
+    ScrollContainer sc;
+    sc.page_offset = 0;
+    // Simulate: transition starts, page advances, new content prepared
+    sc.advance_page(5, 3);  // goes to page 1
+    CHECK(sc.page_offset == 1);
+    CHECK(sc.start_index(5, 3) == 1);
+    CHECK(sc.end_index(5, 3) == 4);
+
+    // Another advance before the first transition completes
+    sc.advance_page(5, 3);  // goes to page 2
+    CHECK(sc.page_offset == 2);
+    CHECK(sc.start_index(5, 3) == 2);
+    CHECK(sc.end_index(5, 3) == 5);
+  }
+
+  TEST_CASE("reset clears page state for fresh pin layout") {
+    ScrollContainer sc;
+    sc.page_offset = 3;
+    sc.page_timer = 999;
+    sc.last_cycle_count = 5;
+
+    sc.reset();
+    CHECK(sc.page_offset == 0);
+    CHECK(sc.page_timer == 0);
+    CHECK(sc.last_cycle_count == 0);
+  }
+
+  TEST_CASE("start_index clamped when page_offset exceeds max") {
+    ScrollContainer sc;
+    sc.page_offset = 100;  // absurdly high
+    // pool=5, slots=3 → max start=2
+    int si = sc.start_index(5, 3);
+    CHECK(si == 2);
+    int ei = sc.end_index(5, 3);
+    CHECK(ei == 5);
+  }
+
+  TEST_CASE("single-item pool, single slot — always page 0") {
+    ScrollContainer sc;
+    CHECK(sc.page_count(1, 1) == 1);
+    CHECK(!sc.needs_paging(1, 1));
+    CHECK(sc.start_index(1, 1) == 0);
+    CHECK(sc.end_index(1, 1) == 1);
+  }
+
+  TEST_CASE("zero slots — no paging, safe indices") {
+    ScrollContainer sc;
+    CHECK(!sc.needs_paging(5, 0));
+    CHECK(sc.page_count(5, 0) == 1);
+  }
+}
+
+// =====================================================================
+// Integration: DisplayDiff + Transition simulated multi-frame sequences
+// =====================================================================
+
+TEST_SUITE("Multi-frame integration") {
+
+  /// Simulates the diff→commit→transition lifecycle for a single frame
+  struct FrameContext {
+    DisplayDiff diff;
+    Transition transition;
+    HScrollState h_scroll;
+    ScrollContainer pinned_pager;
+    ScrollContainer unpinned_pager;
+
+    // Simulate frame_pin_inset_ calculation
+    int pin_inset(int eff_pinned, bool show_pin_icon) const {
+      return (eff_pinned > 0 && show_pin_icon) ? kPinIconWidth : 0;
+    }
+  };
+
+  TEST_CASE("full lifecycle: idle → pin added → transition → idle") {
+    FrameContext ctx;
+    std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::set<std::string> no_pins;
+
+    // Frame 0: no pins, commit
+    {
+      std::vector<std::string> keys = {"R1:A", "R2:B"};
+      std::vector<time_t> deps = {100, 200};
+      std::vector<bool> is_p = {false, false};
+
+      ctx.diff.compute(keys, deps, 0, no_pins);
+      CHECK(!ctx.diff.has_changes());  // first frame
+      ctx.diff.commit(keys, deps, trips, is_p, 0, no_pins);
+    }
+
+    // Frame 1: pin R1 — should detect layout change
+    std::set<std::string> pin_r1 = {"R1:A"};
+    {
+      std::vector<std::string> keys = {"R1:A", "R2:B"};
+      std::vector<time_t> deps = {100, 200};
+
+      ctx.diff.compute(keys, deps, 1, pin_r1);
+      CHECK(ctx.diff.layout_changed);
+
+      // Start transition from old state
+      ctx.transition.reset();
+      ctx.transition.old_trips = ctx.diff.prev_trips;
+      ctx.transition.old_is_pinned = ctx.diff.prev_is_pinned;
+      ctx.transition.old_eff_pinned = ctx.diff.prev_pinned_count;
+      ctx.transition.stagger_rows = (int)ctx.diff.prev_trips.size();
+      ctx.transition.phase = Transition::COLLAPSE;
+      ctx.transition.phase_start = 1000;
+
+      CHECK(ctx.transition.old_eff_pinned == 0);
+      CHECK(ctx.transition.phase == Transition::COLLAPSE);
+      // Should NOT commit during transition
+    }
+
+    // Frame 2..N: still in COLLAPSE — diff.compute should still detect change
+    // but we don't act on it (transition is not IDLE)
+    {
+      CHECK(ctx.transition.phase != Transition::IDLE);
+      // Verify old snapshot is still from frame 0
+      CHECK(ctx.transition.old_trips[0].route_id == "R1");
+    }
+
+    // Simulate collapse completing
+    {
+      unsigned long elapsed = ctx.transition.collapse_duration_ms();
+      // Advance to MID_PAUSE
+      ctx.transition.phase = Transition::MID_PAUSE;
+      ctx.transition.phase_start = 1000 + elapsed;
+    }
+
+    // Simulate expand completing
+    {
+      ctx.transition.phase = Transition::EXPAND;
+      ctx.transition.phase_start = 2500;
+    }
+
+    // Simulate POST_PAUSE completing → back to IDLE
+    {
+      ctx.transition.phase = Transition::POST_PAUSE;
+      ctx.transition.phase_start = 4000;
+      // After pause duration → reset
+      ctx.transition.reset();
+      CHECK(ctx.transition.phase == Transition::IDLE);
+
+      // Now commit current state
+      std::vector<std::string> keys = {"R1:A", "R2:B"};
+      std::vector<time_t> deps = {100, 200};
+      std::vector<bool> is_p = {true, false};
+      ctx.diff.commit(keys, deps, trips, is_p, 1, pin_r1);
+      CHECK(ctx.diff.prev_pinned_count == 1);
+    }
+  }
+
+  TEST_CASE("pin change during COLLAPSE — reset and restart") {
+    FrameContext ctx;
+
+    // Initial state: R1 pinned
+    std::vector<Trip> trips_v1 = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::set<std::string> pin_r1 = {"R1:A"};
+    {
+      std::vector<std::string> keys = {"R1:A", "R2:B"};
+      std::vector<time_t> deps = {100, 200};
+      std::vector<bool> is_p = {true, false};
+      ctx.diff.commit(keys, deps, trips_v1, is_p, 1, pin_r1);
+    }
+
+    // Remove pin → triggers transition
+    std::set<std::string> no_pins;
+    {
+      std::vector<std::string> keys = {"R1:A", "R2:B"};
+      std::vector<time_t> deps = {100, 200};
+      ctx.diff.compute(keys, deps, 0, no_pins);
+      CHECK(ctx.diff.layout_changed);
+
+      ctx.transition.reset();
+      ctx.transition.old_trips = ctx.diff.prev_trips;
+      ctx.transition.old_is_pinned = ctx.diff.prev_is_pinned;
+      ctx.transition.old_eff_pinned = 1;
+      ctx.transition.stagger_rows = 2;
+      ctx.transition.phase = Transition::COLLAPSE;
+      ctx.transition.phase_start = 1000;
+    }
+
+    // Mid-collapse (250ms in) — add a DIFFERENT pin
+    {
+      CHECK(ctx.transition.phase == Transition::COLLAPSE);
+      float row0_scale = ctx.transition.row_scale(0, 250, false);
+      CHECK(row0_scale > 0.0f);  // partially collapsed
+      CHECK(row0_scale < 1.0f);
+
+      // New pin change arrives — must reset transition
+      std::set<std::string> pin_r2 = {"R2:B"};
+
+      // Snapshot the partially-collapsed state for the new transition
+      // In real code, diff.prev_trips still holds the last committed state
+      CHECK(ctx.diff.prev_pinned_count == 1);
+      CHECK(ctx.diff.prev_trips.size() == 2);
+
+      ctx.transition.reset();
+      CHECK(ctx.transition.phase == Transition::IDLE);
+
+      // Start new transition
+      ctx.transition.old_trips = ctx.diff.prev_trips;
+      ctx.transition.old_is_pinned = ctx.diff.prev_is_pinned;
+      ctx.transition.old_eff_pinned = ctx.diff.prev_pinned_count;
+      ctx.transition.stagger_rows = 2;
+      ctx.transition.phase = Transition::COLLAPSE;
+      ctx.transition.phase_start = 1250;
+      ctx.transition.animate_pinned = true;
+      ctx.transition.animate_unpinned = true;
+
+      CHECK(ctx.transition.old_eff_pinned == 1);
+    }
+  }
+
+  TEST_CASE("pin change during EXPAND — reset and restart from current state") {
+    FrameContext ctx;
+
+    std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200), make_trip("R3", "C", 300)};
+    std::set<std::string> no_pins;
+    {
+      std::vector<std::string> keys = {"R1:A", "R2:B", "R3:C"};
+      std::vector<time_t> deps = {100, 200, 300};
+      std::vector<bool> is_p = {false, false, false};
+      ctx.diff.commit(keys, deps, trips, is_p, 0, no_pins);
+    }
+
+    // Add pin — start transition
+    std::set<std::string> pin_r1 = {"R1:A"};
+    {
+      ctx.transition.reset();
+      ctx.transition.old_trips = trips;
+      ctx.transition.old_is_pinned = {false, false, false};
+      ctx.transition.old_eff_pinned = 0;
+      ctx.transition.stagger_rows = 3;
+      ctx.transition.phase = Transition::COLLAPSE;
+      ctx.transition.phase_start = 0;
+    }
+
+    // Advance through collapse → mid_pause → expand
+    {
+      ctx.transition.phase = Transition::EXPAND;
+      ctx.transition.phase_start = 2000;
+      ctx.transition.stagger_rows = 3;
+    }
+
+    // Mid-expand: rows are partially grown
+    {
+      float scale0 = ctx.transition.row_scale(0, 300, true);
+      CHECK(scale0 > 0.0f);
+      CHECK(scale0 < 1.0f);
+
+      // Second pin change arrives mid-expand — reset
+      ctx.transition.reset();
+      CHECK(ctx.transition.phase == Transition::IDLE);
+      CHECK(ctx.transition.old_trips.empty());
+    }
+  }
+
+  TEST_CASE("pin inset consistency: old layout should use old eff_pinned") {
+    // This tests the logic our fix implements: when transition is rendering
+    // old content, the pin inset used for measurement should match old state.
+    FrameContext ctx;
+
+    // Scenario 1: had pins (inset=7), removing last pin
+    int old_inset = ctx.pin_inset(1, true);  // 7
+    int new_inset = ctx.pin_inset(0, true);  // 0
+    CHECK(old_inset == kPinIconWidth);
+    CHECK(new_inset == 0);
+    CHECK(old_inset != new_inset);
+
+    // Scenario 2: had no pins, adding first pin
+    old_inset = ctx.pin_inset(0, true);  // 0
+    new_inset = ctx.pin_inset(1, true);  // 7
+    CHECK(old_inset == 0);
+    CHECK(new_inset == kPinIconWidth);
+    CHECK(old_inset != new_inset);
+
+    // Scenario 3: show_pin_icon=false → inset always 0
+    CHECK(ctx.pin_inset(1, false) == 0);
+    CHECK(ctx.pin_inset(0, false) == 0);
+  }
+
+  TEST_CASE("h-scroll total_distance preserved when measuring with old trips") {
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);
+
+    // Measure with initial distance
+    hs.update_distance(80, true);  // total=100
+    hs.compute(501);  // elapsed=500 → 50px
+    int offset_before = hs.offset;
+    CHECK(offset_before == 50);
+
+    // If we re-measure with the SAME width, offset stays consistent
+    hs.update_distance(80, true);  // still total=100
+    hs.compute(501);
+    CHECK(hs.offset == offset_before);
+
+    // But if width changes (wrong inset used), offset differs at cycle boundary
+    hs.update_distance(73, true);  // total=93 (bug scenario)
+    hs.compute(1001);  // elapsed=1000, 100px: 100%93=7 instead of 100%100=0
+    CHECK(hs.offset == 7);  // would have been 0 with total=100
+  }
+}
