@@ -74,6 +74,16 @@ struct HScrollState {
   int total_distance{0};
   int prev_total_distance{0};
 
+  // Deferred start: when overflow newly appears while idle, dwell at the
+  // home position for one cycle duration before scrolling begins.
+  // This is symmetric with the wind-down logic (overflow disappearing
+  // finishes the current cycle before stopping).
+  bool deferred_start{false};
+  unsigned long deferred_since{0};
+  // Set by reset() so that the first update_distance() after a transition
+  // does not re-trigger deferral (the transition already provided a visual break).
+  bool skip_next_defer{false};
+
   // Updated each frame by compute()
   int offset{0};
   int cycle_count{0};
@@ -85,14 +95,31 @@ struct HScrollState {
     cycle_count = 0;
     idle = true;
     prev_total_distance = 0;
+    deferred_start = false;
+    deferred_since = 0;
+    skip_next_defer = true;
   }
 
   void update_distance(int max_headsign_width, bool any_overflow) {
     if (any_overflow && max_headsign_width > 0) {
-      total_distance = max_headsign_width + kMarqueeGap;
-    } else if (total_distance > 0) {
-      prev_total_distance = total_distance;
-      total_distance = 0;
+      int new_dist = max_headsign_width + kMarqueeGap;
+      bool was_fully_idle = (total_distance <= 0 && prev_total_distance <= 0 && !deferred_start);
+      total_distance = new_dist;
+      if (was_fully_idle && !skip_next_defer) {
+        deferred_start = true;
+      }
+      skip_next_defer = false;
+    } else {
+      skip_next_defer = false;
+      if (deferred_start) {
+        // Overflow disappeared during deferred dwell — cancel without wind-down
+        deferred_start = false;
+        deferred_since = 0;
+        total_distance = 0;
+      } else if (total_distance > 0) {
+        prev_total_distance = total_distance;
+        total_distance = 0;
+      }
     }
   }
 
@@ -100,6 +127,24 @@ struct HScrollState {
     if (start_time == 0) { start_time = now; idle = true; offset = 0; cycle_count = 0; return; }
     int dist = total_distance > 0 ? total_distance : prev_total_distance;
     if (dist <= 0) { idle = true; offset = 0; cycle_count = 0; return; }
+
+    // Deferred start: dwell at home position for one full cycle duration
+    // before scrolling begins.  Symmetric with the wind-down logic that
+    // finishes the current cycle before stopping when overflow disappears.
+    if (deferred_start) {
+      if (deferred_since == 0) deferred_since = now;
+      unsigned long dwell_ms = (unsigned long)dist * 1000 / scroll_speed;
+      if (now - deferred_since >= dwell_ms) {
+        // Dwell complete — begin actual scrolling
+        deferred_start = false;
+        deferred_since = 0;
+        start_time = now;
+      }
+      offset = 0;
+      cycle_count = 0;
+      idle = true;
+      return;
+    }
 
     unsigned long elapsed = now - start_time;
     int total_px = (int)(elapsed * scroll_speed / 1000);

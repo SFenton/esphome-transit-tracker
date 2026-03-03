@@ -838,6 +838,8 @@ void TransitTracker::compute_h_scroll_(const std::vector<Trip> &trips, int fh,
     this->h_scroll_.prev_total_distance = 0;
     this->h_scroll_.offset = 0;
     this->h_scroll_.idle = true;
+    this->h_scroll_.deferred_start = false;
+    this->h_scroll_.deferred_since = 0;
     return;
   }
 

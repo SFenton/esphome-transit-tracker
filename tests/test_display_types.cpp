@@ -848,6 +848,233 @@ TEST_SUITE("HScrollState — pin-change disruption") {
 }
 
 // =====================================================================
+// HScrollState — deferred start
+// =====================================================================
+
+TEST_SUITE("HScrollState — deferred start") {
+  TEST_CASE("overflow appearing while fully idle defers scrolling") {
+    // Simulates: headsign fit, then Wi-Fi icon shrinks available space
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.compute(1);           // init start_time (use 1, not 0 — 0 is sentinel)
+    hs.update_distance(0, false);
+
+    // Run idle for a while (no overflow)
+    for (unsigned long t = 1; t <= 5000; t += 100) {
+      hs.compute(t);
+      CHECK(hs.idle);
+      CHECK(hs.offset == 0);
+    }
+
+    // At t=5000, overflow appears (e.g. Wi-Fi icon reduces clip area)
+    hs.update_distance(80, true);  // total_distance = 100
+    CHECK(hs.total_distance == 100);
+    CHECK(hs.deferred_start);
+
+    // First compute after deferred_start sets deferred_since = 5100
+    // Dwell duration = dist * 1000 / speed = 100 * 1000 / 100 = 1000ms
+    // So dwell ends at 5100 + 1000 = 6100
+    hs.compute(5100);
+    CHECK(hs.offset == 0);
+    CHECK(hs.idle);
+
+    hs.compute(5500);
+    CHECK(hs.offset == 0);
+    CHECK(hs.idle);
+
+    // Still dwelling at t=6099 (just before dwell ends)
+    hs.compute(6099);
+    CHECK(hs.offset == 0);
+    CHECK(hs.idle);
+    CHECK(hs.deferred_start);
+
+    // At t=6100, dwell ends → scrolling begins from offset 0
+    hs.compute(6100);
+    CHECK(!hs.deferred_start);
+    CHECK(hs.offset == 0);  // start_time was just set to 6100
+
+    // At t=6200, scrolling is underway: 100ms * 100px/s = 10px
+    hs.compute(6200);
+    CHECK(hs.offset == 10);
+    CHECK(!hs.idle);
+  }
+
+  TEST_CASE("overflow disappearing during dwell cancels without wind-down") {
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.compute(1);  // init start_time (use 1 not 0)
+    hs.update_distance(0, false);
+    hs.compute(1000);
+
+    // Overflow appears → enters deferral
+    hs.update_distance(80, true);  // total=100
+    CHECK(hs.deferred_start);
+
+    hs.compute(1200);  // mid-dwell
+    CHECK(hs.offset == 0);
+    CHECK(hs.deferred_start);
+
+    // Overflow disappears before dwell finishes
+    hs.update_distance(0, false);
+    CHECK(!hs.deferred_start);
+    CHECK(hs.total_distance == 0);
+    CHECK(hs.prev_total_distance == 0);  // no wind-down queued
+
+    // Stays fully idle
+    hs.compute(2000);
+    CHECK(hs.idle);
+    CHECK(hs.offset == 0);
+  }
+
+  TEST_CASE("reset after transition suppresses deferral on next overflow") {
+    // Simulates: data change → transition → post-pause → reset → overflow
+    // The transition already provided a visual break, so no dwell needed.
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.compute(0);
+
+    // Transition happens, reset at t=3000
+    hs.reset(3000);
+    CHECK(hs.skip_next_defer);
+
+    // Overflow detected on first measurement after reset
+    hs.update_distance(80, true);  // total=100
+    CHECK(hs.total_distance == 100);
+    CHECK(!hs.deferred_start);     // skip_next_defer consumed
+    CHECK(!hs.skip_next_defer);
+
+    // Scrolling starts immediately
+    hs.compute(3100);  // elapsed=100ms → 10px
+    CHECK(hs.offset == 10);
+    CHECK(!hs.idle);
+  }
+
+  TEST_CASE("skip_next_defer consumed even when no overflow") {
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1000);
+    CHECK(hs.skip_next_defer);
+
+    // No overflow on first measurement
+    hs.update_distance(0, false);
+    CHECK(!hs.skip_next_defer);  // consumed
+
+    // Later, overflow appears — should now defer
+    hs.compute(2000);
+    hs.update_distance(80, true);
+    CHECK(hs.deferred_start);
+  }
+
+  TEST_CASE("already scrolling + distance changes — no deferral") {
+    // If we're already scrolling and the overflow magnitude changes
+    // (e.g. different headsign), no deferral should happen.
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);  // use 1 not 0 (0 is sentinel in compute)
+    hs.update_distance(80, true);  // skip_next_defer consumed, no defer
+
+    hs.compute(501);  // scrolling: elapsed=500, offset=50
+    CHECK(hs.offset == 50);
+    CHECK(!hs.idle);
+
+    // Distance changes (longer headsign)
+    hs.update_distance(120, true);  // total=140
+    CHECK(hs.total_distance == 140);
+    CHECK(!hs.deferred_start);  // was_fully_idle is false
+
+    // Scrolling continues
+    hs.compute(601);
+    CHECK(hs.offset > 0);
+  }
+
+  TEST_CASE("dwell duration scales with distance and speed") {
+    HScrollState hs;
+    hs.scroll_speed = 50;  // slower
+    hs.compute(1);  // init start_time
+    hs.update_distance(0, false);
+    hs.compute(1000);
+
+    hs.update_distance(80, true);  // total=100
+    CHECK(hs.deferred_start);
+
+    // First compute sets deferred_since=1100
+    // Dwell = 100 * 1000 / 50 = 2000ms → ends at 1100+2000=3100
+    hs.compute(1100);
+    CHECK(hs.deferred_start);
+    CHECK(hs.offset == 0);
+
+    hs.compute(3099);
+    CHECK(hs.deferred_start);
+
+    hs.compute(3100);
+    CHECK(!hs.deferred_start);
+    CHECK(hs.offset == 0);  // start_time just set to 3100
+
+    // Now scrolling at 50px/s: at t=3300, elapsed=200ms → 10px
+    hs.compute(3300);
+    CHECK(hs.offset == 10);
+  }
+
+  TEST_CASE("repeated overflow toggle only defers on 0→positive transition") {
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.compute(1);  // init start_time
+    hs.update_distance(0, false);
+    hs.compute(1000);
+
+    // First overflow → deferred
+    hs.update_distance(80, true);
+    CHECK(hs.deferred_start);
+
+    // First compute sets deferred_since=1100, dwell=1000ms, ends at 2100
+    hs.compute(1100);
+    CHECK(hs.deferred_start);
+    hs.compute(2100);
+    CHECK(!hs.deferred_start);
+
+    // Scroll a full cycle (1000ms at 100px/s for dist=100)
+    // start_time was set to 2100, so cycle boundary at 2100+1000=3100
+    hs.compute(3100);
+    CHECK(hs.idle);
+
+    // Remove overflow — wind-down
+    hs.update_distance(0, false);
+    // Need to reach next cycle boundary for wind-down to clear
+    // prev_total_distance=100, so next boundary at offset=0
+    // Current: elapsed=3100-2100=1000, 1000%100=0 → already at boundary, idle
+    hs.compute(3101);
+    // 3101-2100=1001, 1001*100/1000=100, 100%100=0 → near zero
+    CHECK(hs.prev_total_distance == 0);
+
+    // Second overflow → should defer again (fully idle)
+    hs.update_distance(80, true);
+    CHECK(hs.deferred_start);
+  }
+
+  TEST_CASE("wind-down followed by reset then overflow — no deferral") {
+    // This is the existing "wind-down followed by new overflow" scenario
+    // but verifying skip_next_defer prevents deferral.
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);
+
+    hs.update_distance(80, true);  // skip_next_defer consumed, no defer
+    CHECK(!hs.deferred_start);
+
+    hs.update_distance(0, false);  // wind-down
+    hs.compute(1001);              // reach boundary
+    CHECK(hs.prev_total_distance == 0);
+
+    hs.reset(1001);
+    hs.update_distance(60, true);  // skip_next_defer consumed
+    CHECK(!hs.deferred_start);
+
+    hs.compute(1051);
+    CHECK(hs.offset == 5);
+  }
+}
+
+// =====================================================================
 // ScrollContainer — edge cases during transitions
 // =====================================================================
 
