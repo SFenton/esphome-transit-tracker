@@ -143,7 +143,13 @@ TEST_SUITE("HScrollState") {
     hs.update_distance(80, true);  // total = 100
     CHECK(hs.total_distance == 100);
 
-    hs.compute(1501);  // elapsed=1500 => 150px at 100px/s, 150 % 100 = 50
+    // After reset: first cycle has no dwell (scroll_phase=1000ms).
+    // Then start_time advances by 1000, standard cycles begin
+    // (scroll_phase=1000ms + dwell=3000ms = 4000ms each).
+    // To land in second cycle scroll phase at offset=50:
+    //   first cycle ends at t=1001, standard start_time=1001
+    //   t=1501: cycle_elapsed=500, offset=50, cycle_count=1+0=1
+    hs.compute(1501);
     CHECK(hs.offset == 50);
     CHECK(hs.cycle_count == 1);
   }
@@ -730,9 +736,9 @@ TEST_SUITE("Transition — mid-animation") {
 // =====================================================================
 
 TEST_SUITE("HScrollState — pin-change disruption") {
-  TEST_CASE("total_distance change mid-scroll causes offset jump") {
-    // This is the exact bug: if total_distance changes because pin inset
-    // widens the measurement, offset = total_px % new_dist jumps.
+  TEST_CASE("total_distance change mid-scroll after reset") {
+    // After reset, first cycle skips dwell.  Changing total_distance
+    // mid-scroll shifts the first cycle’s scroll_phase_ms.
     HScrollState hs;
     hs.scroll_speed = 100;  // 100 px/s
     hs.reset(1);            // start_time=1 (0 is treated as uninitialized)
@@ -741,22 +747,20 @@ TEST_SUITE("HScrollState — pin-change disruption") {
     hs.update_distance(80, true);
     CHECK(hs.total_distance == 100);
 
-    // Scroll to elapsed=750ms → 75px into a 100-cycle
+    // Scroll to elapsed=750ms → 75px into first (no-dwell) cycle
     hs.compute(751);
     CHECK(hs.offset == 75);
 
     // Now simulate pin change making headsign 7px narrower → width 73, total=93
-    // (In real code this happens because frame_pin_inset_ was set to new
-    //  value before measuring)
     hs.update_distance(73, true);
     CHECK(hs.total_distance == 93);
 
-    // At elapsed=1000ms: with old dist 100 → 100%100=0 (cycle boundary, idle).
-    // But with new dist 93 → 100%93=7, which is NOT a cycle boundary.
+    // At elapsed=1000ms with new dist 93:
+    // scroll_phase_ms = 930. First no-dwell cycle ends at elapsed=930.
+    // start_time advances to 931, standard timing begins.
+    // elapsed from 931 = 70ms, offset = 7px (in second cycle scroll phase).
     hs.compute(1001);
     CHECK(hs.offset == 7);
-    // This is NOT 0 (where it should be at a cycle boundary), proving the jump
-    CHECK(hs.offset != 0);
   }
 
   TEST_CASE("stable total_distance means smooth scrolling across cycles") {
@@ -1032,18 +1036,15 @@ TEST_SUITE("HScrollState — deferred start") {
     hs.compute(2100);
     CHECK(!hs.deferred_start);
 
-    // Scroll a full cycle (1000ms at 100px/s for dist=100)
-    // start_time was set to 2100, so cycle boundary at 2100+1000=3100
+    // Scroll phase completes at 2100+1000=3100 (enters dwell)
+    // start_time was set to 2100, scroll_phase_ms=1000, cycle_total_ms=4000
     hs.compute(3100);
     CHECK(hs.idle);
 
     // Remove overflow — wind-down
     hs.update_distance(0, false);
-    // Need to reach next cycle boundary for wind-down to clear
-    // prev_total_distance=100, so next boundary at offset=0
-    // Current: elapsed=3100-2100=1000, 1000%100=0 → already at boundary, idle
+    // In dwell phase — wind-down clears prev_total_distance immediately
     hs.compute(3101);
-    // 3101-2100=1001, 1001*100/1000=100, 100%100=0 → near zero
     CHECK(hs.prev_total_distance == 0);
 
     // Second overflow → should defer again (fully idle)
@@ -1401,10 +1402,12 @@ TEST_SUITE("Multi-frame integration") {
     hs.compute(501);
     CHECK(hs.offset == offset_before);
 
-    // But if width changes (wrong inset used), offset differs at cycle boundary
+    // If width changes (wrong inset used), after reset the first cycle
+    // has no dwell, so the scroll wraps into the next cycle.
     hs.update_distance(73, true);  // total=93 (bug scenario)
-    hs.compute(1001);  // elapsed=1000, 100px: 100%93=7 instead of 100%100=0
-    CHECK(hs.offset == 7);  // would have been 0 with total=100
+    hs.compute(1001);  // elapsed=1000, scroll_phase=930 → first cycle ends,
+                       // enters second cycle at offset=7
+    CHECK(hs.offset == 7);
   }
 }
 

@@ -39,6 +39,8 @@ static constexpr float kMinRowScale = 0.05f;
 static constexpr int kScrollNearZeroPx = 3;
 /// Pixel gap between marquee repetitions.
 static constexpr int kMarqueeGap = 20;
+/// Dwell time at home position between scroll cycles (ms).
+static constexpr int kScrollCycleDwellMs = 3000;
 
 // =====================================================================
 // Dedup helper
@@ -84,6 +86,11 @@ struct HScrollState {
   // does not re-trigger deferral (the transition already provided a visual break).
   bool skip_next_defer{false};
 
+  // After a transition reset, the first scroll cycle skips the inter-cycle
+  // dwell — the transition's own animation already provided a visual pause.
+  bool skip_first_dwell{false};
+  int base_cycle_count{0};
+
   // Updated each frame by compute()
   int offset{0};
   int cycle_count{0};
@@ -98,6 +105,8 @@ struct HScrollState {
     deferred_start = false;
     deferred_since = 0;
     skip_next_defer = true;
+    skip_first_dwell = true;
+    base_cycle_count = 0;
   }
 
   void update_distance(int max_headsign_width, bool any_overflow) {
@@ -146,25 +155,80 @@ struct HScrollState {
       return;
     }
 
+    // Each cycle = scroll phase + dwell phase (paused at home position).
+    // After a transition reset, the first cycle skips the dwell.
+    unsigned long scroll_phase_ms = (unsigned long)dist * 1000 / scroll_speed;
+
+    // --- First cycle after reset: no dwell ---
+    if (skip_first_dwell) {
+      unsigned long elapsed = now - start_time;
+      if (elapsed < scroll_phase_ms) {
+        offset = (int)(elapsed * scroll_speed / 1000);
+        idle = (offset < kScrollNearZeroPx);
+        cycle_count = base_cycle_count;
+        return;
+      }
+      // First scroll phase complete — switch to standard timing with dwell
+      skip_first_dwell = false;
+      start_time += scroll_phase_ms;
+      base_cycle_count++;
+
+      // Wind-down at first cycle boundary
+      if (total_distance <= 0 && prev_total_distance > 0) {
+        prev_total_distance = 0;
+        offset = 0;
+        idle = true;
+        cycle_count = base_cycle_count;
+        return;
+      }
+      // Pending speed at first cycle boundary
+      if (pending_speed != 0) {
+        scroll_speed = pending_speed;
+        pending_speed = 0;
+        start_time = now;
+        offset = 0;
+        idle = true;
+        cycle_count = base_cycle_count;
+        return;
+      }
+      // Fall through to standard cycle computation
+    }
+
+    // --- Standard cycles with dwell ---
+    unsigned long cycle_total_ms = scroll_phase_ms + kScrollCycleDwellMs;
+
     unsigned long elapsed = now - start_time;
-    int total_px = (int)(elapsed * scroll_speed / 1000);
-    offset = total_px % dist;
-    cycle_count = total_px / dist;
-    idle = (offset < kScrollNearZeroPx);
+    int full_cycles = (int)(elapsed / cycle_total_ms);
+    unsigned long cycle_elapsed = elapsed % cycle_total_ms;
+    bool in_dwell = (cycle_elapsed >= scroll_phase_ms);
+
+    if (!in_dwell) {
+      // Scrolling phase
+      offset = (int)(cycle_elapsed * scroll_speed / 1000);
+      idle = (offset < kScrollNearZeroPx);
+    } else {
+      // Dwell phase — paused at home position between cycles
+      offset = 0;
+      idle = true;
+    }
+
+    // cycle_count = completed scroll phases (increments when entering dwell)
+    cycle_count = base_cycle_count + (in_dwell ? full_cycles + 1 : full_cycles);
 
     // Wind-down: if real overflow is gone, finish the current cycle then stop
-    if (total_distance <= 0 && prev_total_distance > 0 && idle) {
+    if (total_distance <= 0 && prev_total_distance > 0 && in_dwell) {
       prev_total_distance = 0;
       offset = 0;
     }
 
-    // Apply pending speed change at cycle boundary
-    if (pending_speed != 0 && idle) {
+    // Apply pending speed change at cycle boundary (during dwell)
+    if (pending_speed != 0 && in_dwell) {
       scroll_speed = pending_speed;
       pending_speed = 0;
       start_time = now;
+      base_cycle_count = cycle_count;
       offset = 0;
-      cycle_count = 0;
+      cycle_count = base_cycle_count;
     }
   }
 };
