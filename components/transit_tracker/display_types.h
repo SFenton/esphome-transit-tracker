@@ -251,6 +251,7 @@ struct Transition {
   std::vector<Trip> old_trips;
   std::vector<bool> old_is_pinned;
   int old_eff_pinned{0};
+  bool old_respect_pin_inset{true};
 
   // For vertical scroll page changes
   bool is_vscroll{false};
@@ -291,6 +292,7 @@ struct Transition {
     old_trips.clear();
     old_is_pinned.clear();
     old_eff_pinned = 0;
+    old_respect_pin_inset = true;
     is_vscroll = false;
     stagger_rows = 0;
   }

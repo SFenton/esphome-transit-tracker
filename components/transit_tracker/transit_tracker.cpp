@@ -79,6 +79,7 @@ void TransitTracker::dump_config() {
   ESP_LOGCONFIG(TAG, "  Scroll Headsigns: %s", this->scroll_headsigns_ ? "true" : "false");
   ESP_LOGCONFIG(TAG, "  Scroll Routes: %s", this->scroll_routes_ ? "true" : "false");
   ESP_LOGCONFIG(TAG, "  Show Pin Icon: %s", this->show_pin_icon_ ? "true" : "false");
+  ESP_LOGCONFIG(TAG, "  Respect Pin Inset: %s", this->respect_pin_inset_ ? "true" : "false");
 }
 
 void TransitTracker::reconnect() { this->close(); this->connect_ws_(); }
@@ -710,6 +711,9 @@ void TransitTracker::draw_trip(
     int h_scroll_offset, int total_scroll_distance, bool is_pinned) {
 
   int x_start = this->frame_pin_inset_;
+  if (!is_pinned && !this->frame_respect_pin_inset_ && x_start > 0) {
+    x_start = 1;  // 1px margin when pin icon column is visible
+  }
   int dw = this->display_->get_width();
   int dh = this->display_->get_height();
 
@@ -857,7 +861,8 @@ void TransitTracker::compute_h_scroll_(const std::vector<Trip> &trips, int fh,
   bool any_overflow = false;
   for (const auto &t : trips) {
     int ov = 0, hw = 0;
-    this->draw_trip(t, 0, fh, now, rtc_now, true, &ov, &hw);
+    // Use is_pinned=true for worst-case measurement (pin inset reduces clip area)
+    this->draw_trip(t, 0, fh, now, rtc_now, true, &ov, &hw, -1, 0, true);
     if (ov > 0) any_overflow = true;
     max_hw = std::max(max_hw, hw);
   }
@@ -874,6 +879,7 @@ void TransitTracker::begin_transition_(
   this->transition_.old_trips = old_trips;
   this->transition_.old_is_pinned = old_is_pinned;
   this->transition_.old_eff_pinned = old_eff_pinned;
+  this->transition_.old_respect_pin_inset = this->committed_respect_pin_inset_;
 
   // Animate all rows for all change types (simple and robust)
   this->transition_.animate_pinned = true;
@@ -904,6 +910,7 @@ void TransitTracker::begin_page_transition_(
   this->transition_.old_trips = old_trips;
   this->transition_.old_is_pinned = old_is_pinned;
   this->transition_.old_eff_pinned = eff_pinned;
+  this->transition_.old_respect_pin_inset = this->committed_respect_pin_inset_;
   this->transition_.animate_pinned = pinned_due;
   this->transition_.animate_unpinned = unpinned_due;
   this->transition_.stagger_rows = std::max(1, (int)old_trips.size());
@@ -1004,9 +1011,11 @@ void TransitTracker::render_frame_(
 
   // Save/restore pin inset based on current phase
   int save_inset = this->frame_pin_inset_;
+  bool save_respect = this->frame_respect_pin_inset_;
   if (use_old) {
     this->frame_pin_inset_ = (this->transition_.old_eff_pinned > 0 && this->show_pin_icon_)
                                  ? kPinIconWidth : 0;
+    this->frame_respect_pin_inset_ = this->transition_.old_respect_pin_inset;
   }
 
   // H-scroll: active only in IDLE and WAIT_SCROLL
@@ -1056,6 +1065,7 @@ void TransitTracker::render_frame_(
   }
 
   this->frame_pin_inset_ = save_inset;
+  this->frame_respect_pin_inset_ = save_respect;
 }
 
 // =====================================================================
@@ -1180,6 +1190,7 @@ void HOT TransitTracker::draw_schedule() {
 
   // ---- 8. Per-frame state ----
   this->frame_pin_inset_ = (eff_pinned > 0 && this->show_pin_icon_) ? kPinIconWidth : 0;
+  this->frame_respect_pin_inset_ = this->respect_pin_inset_;
 
   // ---- 9. Determine rendering context (old vs new layout) ----
   // H-scroll and uniform clipping must measure against the layout actually
@@ -1206,7 +1217,9 @@ void HOT TransitTracker::draw_schedule() {
     // measurements below (and begin_transition_'s WAIT vs COLLAPSE decision)
     // use h-scroll / clipping state consistent with the old layout.
     this->diff_.compute(keys, deps, eff_pinned, this->pinned_routes_);
-    if (this->diff_.has_changes() && this->diff_.prev_pinned_count >= 0) {
+    bool respect_inset_changed = (this->respect_pin_inset_ != this->committed_respect_pin_inset_)
+                                 && eff_pinned > 0;
+    if ((this->diff_.has_changes() || respect_inset_changed) && this->diff_.prev_pinned_count >= 0) {
       measure_rows = &this->diff_.prev_trips;
       measure_eff_pinned = this->diff_.prev_pinned_count;
       rendering_old_layout = true;
@@ -1216,28 +1229,39 @@ void HOT TransitTracker::draw_schedule() {
   // ---- 10. H-scroll ----
   {
     int saved_inset = this->frame_pin_inset_;
-    if (rendering_old_layout)
+    bool saved_respect = this->frame_respect_pin_inset_;
+    if (rendering_old_layout) {
       this->frame_pin_inset_ = (measure_eff_pinned > 0 && this->show_pin_icon_) ? kPinIconWidth : 0;
+      this->frame_respect_pin_inset_ = this->committed_respect_pin_inset_;
+    }
     this->compute_h_scroll_(*measure_rows, fh, now, rtc_now);
     this->frame_pin_inset_ = saved_inset;
+    this->frame_respect_pin_inset_ = saved_respect;
   }
 
   // ---- 11. Uniform clipping ----
   {
     int saved_inset = this->frame_pin_inset_;
-    if (rendering_old_layout)
+    bool saved_respect = this->frame_respect_pin_inset_;
+    if (rendering_old_layout) {
       this->frame_pin_inset_ = (measure_eff_pinned > 0 && this->show_pin_icon_) ? kPinIconWidth : 0;
+      this->frame_respect_pin_inset_ = this->committed_respect_pin_inset_;
+    }
     this->compute_uniform_clipping_(*measure_rows, rtc_now);
     this->frame_pin_inset_ = saved_inset;
+    this->frame_respect_pin_inset_ = saved_respect;
   }
 
   // ---- 12. Change detection & transition planning (only when idle) ----
   if (this->transition_.phase == Transition::IDLE) {
     // diff_.compute() already ran above in step 9
 
-    if (this->diff_.has_changes() && this->diff_.prev_pinned_count >= 0) {
+    bool respect_inset_changed = (this->respect_pin_inset_ != this->committed_respect_pin_inset_)
+                                 && eff_pinned > 0;
+
+    if ((this->diff_.has_changes() || respect_inset_changed) && this->diff_.prev_pinned_count >= 0) {
       // Data/layout changed — start transition
-      bool layout_swap = this->diff_.layout_changed || this->diff_.pinned_set_changed;
+      bool layout_swap = this->diff_.layout_changed || this->diff_.pinned_set_changed || respect_inset_changed;
       this->begin_transition_(this->diff_.prev_trips, this->diff_.prev_is_pinned,
                               this->diff_.prev_pinned_count, layout_swap, now);
     } else if (this->scroll_routes_ && this->diff_.prev_pinned_count >= 0) {
@@ -1308,6 +1332,7 @@ void HOT TransitTracker::draw_schedule() {
   // ---- 15. Commit diff (only when idle) ----
   if (this->transition_.phase == Transition::IDLE) {
     this->diff_.commit(keys, deps, rows, row_pinned, eff_pinned, this->pinned_routes_);
+    this->committed_respect_pin_inset_ = this->respect_pin_inset_;
   }
 }
 

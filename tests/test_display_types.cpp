@@ -713,6 +713,16 @@ TEST_SUITE("Transition — mid-animation") {
     // Note: vscroll fields aren't explicitly zeroed by reset(), but is_vscroll
     // being false means they won't be read.
   }
+
+  TEST_CASE("old_respect_pin_inset defaults to true and resets") {
+    Transition tr;
+    CHECK(tr.old_respect_pin_inset == true);
+
+    tr.old_respect_pin_inset = false;
+    tr.phase = Transition::COLLAPSE;
+    tr.reset();
+    CHECK(tr.old_respect_pin_inset == true);
+  }
 }
 
 // =====================================================================
@@ -1168,5 +1178,188 @@ TEST_SUITE("Multi-frame integration") {
     hs.update_distance(73, true);  // total=93 (bug scenario)
     hs.compute(1001);  // elapsed=1000, 100px: 100%93=7 instead of 100%100=0
     CHECK(hs.offset == 7);  // would have been 0 with total=100
+  }
+}
+
+// =====================================================================
+// Respect Pin Inset — x_start and transition tests
+// =====================================================================
+
+TEST_SUITE("Respect Pin Inset") {
+
+  // Helper: simulate the x_start logic from draw_trip
+  static int compute_x_start(int frame_pin_inset, bool is_pinned, bool respect_pin_inset) {
+    int x_start = frame_pin_inset;
+    if (!is_pinned && !respect_pin_inset && x_start > 0) {
+      x_start = 1;  // 1px margin when pin icon column is visible
+    }
+    return x_start;
+  }
+
+  TEST_CASE("respect=true: all rows use pin inset") {
+    int inset = kPinIconWidth;
+    CHECK(compute_x_start(inset, true, true) == kPinIconWidth);
+    CHECK(compute_x_start(inset, false, true) == kPinIconWidth);
+  }
+
+  TEST_CASE("respect=false: pinned rows keep inset, unpinned get 1px margin") {
+    int inset = kPinIconWidth;
+    CHECK(compute_x_start(inset, true, false) == kPinIconWidth);
+    CHECK(compute_x_start(inset, false, false) == 1);
+  }
+
+  TEST_CASE("respect=false with no pins: all rows at 0 (no-op)") {
+    int inset = 0;  // no pins active
+    CHECK(compute_x_start(inset, false, false) == 0);
+    CHECK(compute_x_start(inset, true, false) == 0);
+  }
+
+  TEST_CASE("transition stores old_respect_pin_inset for collapse") {
+    Transition tr;
+    CHECK(tr.old_respect_pin_inset == true);  // default
+
+    // Simulate storing old state when starting transition
+    tr.old_respect_pin_inset = true;  // was respecting inset
+    tr.old_eff_pinned = 1;
+    tr.old_trips = {make_trip("R1", "A"), make_trip("R2", "B")};
+    tr.old_is_pinned = {true, false};
+    tr.phase = Transition::COLLAPSE;
+    tr.phase_start = 1000;
+    tr.stagger_rows = 2;
+
+    // During COLLAPSE: old_respect_pin_inset should be used
+    // Pinned row keeps inset, unpinned row keeps inset (old respect=true)
+    CHECK(compute_x_start(kPinIconWidth, true, tr.old_respect_pin_inset) == kPinIconWidth);
+    CHECK(compute_x_start(kPinIconWidth, false, tr.old_respect_pin_inset) == kPinIconWidth);
+
+    // After transition, new respect=false would be active
+    bool new_respect = false;
+    CHECK(compute_x_start(kPinIconWidth, true, new_respect) == kPinIconWidth);
+    CHECK(compute_x_start(kPinIconWidth, false, new_respect) == 1);
+  }
+
+  TEST_CASE("respect_pin_inset change detected as layout change") {
+    // Simulates the detection logic in draw_schedule step 12
+    DisplayDiff diff;
+    std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::set<std::string> pin_r1 = {"R1:A"};
+
+    // Commit initial frame with 1 pin, respect=true
+    std::vector<std::string> keys = {"R1:A", "R2:B"};
+    std::vector<time_t> deps = {100, 200};
+    std::vector<bool> is_p = {true, false};
+    int eff_pinned = 1;
+    diff.commit(keys, deps, trips, is_p, eff_pinned, pin_r1);
+
+    bool committed_respect = true;
+    bool desired_respect = false;  // user changed it
+
+    // diff.compute finds no data change
+    diff.compute(keys, deps, eff_pinned, pin_r1);
+    CHECK(!diff.has_changes());
+
+    // But respect_inset_changed triggers a transition
+    bool respect_inset_changed = (desired_respect != committed_respect) && eff_pinned > 0;
+    CHECK(respect_inset_changed);
+
+    // Combined condition triggers transition
+    bool should_transition = (diff.has_changes() || respect_inset_changed) && diff.prev_pinned_count >= 0;
+    CHECK(should_transition);
+  }
+
+  TEST_CASE("respect change with no pins does not trigger transition") {
+    DisplayDiff diff;
+    std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::set<std::string> no_pins;
+
+    std::vector<std::string> keys = {"R1:A", "R2:B"};
+    std::vector<time_t> deps = {100, 200};
+    std::vector<bool> is_p = {false, false};
+    diff.commit(keys, deps, trips, is_p, 0, no_pins);
+
+    bool committed_respect = true;
+    bool desired_respect = false;
+    int eff_pinned = 0;
+
+    diff.compute(keys, deps, eff_pinned, no_pins);
+    CHECK(!diff.has_changes());
+
+    bool respect_inset_changed = (desired_respect != committed_respect) && eff_pinned > 0;
+    CHECK(!respect_inset_changed);  // no pins → no visual effect → no transition
+  }
+
+  TEST_CASE("simultaneous pin add and respect change triggers single transition") {
+    DisplayDiff diff;
+    std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::set<std::string> no_pins;
+
+    // Frame 0: no pins
+    std::vector<std::string> keys = {"R1:A", "R2:B"};
+    std::vector<time_t> deps = {100, 200};
+    std::vector<bool> is_p = {false, false};
+    diff.commit(keys, deps, trips, is_p, 0, no_pins);
+
+    bool committed_respect = true;
+    bool desired_respect = false;
+
+    // Frame 1: pin added AND respect changed
+    std::set<std::string> pin_r1 = {"R1:A"};
+    int new_eff_pinned = 1;
+    diff.compute(keys, deps, new_eff_pinned, pin_r1);
+    CHECK(diff.layout_changed);  // pin count 0→1
+
+    bool respect_inset_changed = (desired_respect != committed_respect) && new_eff_pinned > 0;
+    CHECK(respect_inset_changed);
+
+    // Both conditions true → single transition handles both
+    bool layout_swap = diff.layout_changed || diff.pinned_set_changed || respect_inset_changed;
+    CHECK(layout_swap);
+  }
+
+  TEST_CASE("full lifecycle: respect=true → false with active pins") {
+    DisplayDiff diff;
+    Transition transition;
+
+    std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::set<std::string> pin_r1 = {"R1:A"};
+
+    // Frame 0: pins active, respect=true, commit
+    std::vector<std::string> keys = {"R1:A", "R2:B"};
+    std::vector<time_t> deps = {100, 200};
+    std::vector<bool> is_p = {true, false};
+    int eff_pinned = 1;
+    bool committed_respect = true;
+    bool desired_respect = true;
+    diff.commit(keys, deps, trips, is_p, eff_pinned, pin_r1);
+
+    // Frame 1: user sets respect=false
+    desired_respect = false;
+    diff.compute(keys, deps, eff_pinned, pin_r1);
+    CHECK(!diff.has_changes());  // no data change
+
+    bool respect_inset_changed = (desired_respect != committed_respect) && eff_pinned > 0;
+    CHECK(respect_inset_changed);
+
+    // Start transition
+    transition.reset();
+    transition.old_trips = diff.prev_trips;
+    transition.old_is_pinned = diff.prev_is_pinned;
+    transition.old_eff_pinned = diff.prev_pinned_count;
+    transition.old_respect_pin_inset = committed_respect;  // true
+    transition.stagger_rows = (int)diff.prev_trips.size();
+    transition.phase = Transition::COLLAPSE;
+    transition.phase_start = 1000;
+
+    // During COLLAPSE: old respect is used
+    CHECK(transition.old_respect_pin_inset == true);
+    CHECK(compute_x_start(kPinIconWidth, false, transition.old_respect_pin_inset) == kPinIconWidth);
+
+    // Simulate transition completing
+    transition.reset();
+    committed_respect = desired_respect;  // now false
+
+    // After transition: new respect is active
+    CHECK(compute_x_start(kPinIconWidth, false, committed_respect) == 1);
+    CHECK(compute_x_start(kPinIconWidth, true, committed_respect) == kPinIconWidth);
   }
 }

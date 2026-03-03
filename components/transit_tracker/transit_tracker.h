@@ -58,6 +58,7 @@ class TransitTracker : public Component {
   void set_uniform_headsign_end(bool v) { uniform_headsign_end_ = v; }
   void set_scroll_routes(bool v);
   void set_show_pin_icon(bool v) { show_pin_icon_ = v; }
+  void set_respect_pin_inset(bool v) { respect_pin_inset_ = v; }
   void set_prefer_replace_over_scroll(bool v) { prefer_replace_over_scroll_ = v; }
   void set_scroll_speed(const std::string &speed);
   void set_page_interval(int seconds) { page_interval_ = seconds * 1000; }
@@ -161,6 +162,7 @@ class TransitTracker : public Component {
   std::map<std::string, Color> route_color_overrides_;
   bool scroll_headsigns_{false};
   bool show_pin_icon_{true};
+  bool respect_pin_inset_{true};
   bool uniform_headsign_start_{false};
   bool uniform_headsign_end_{false};
   bool scroll_routes_{false};
@@ -188,6 +190,8 @@ class TransitTracker : public Component {
 
   // ---- Per-frame rendering state (set once at top of draw_schedule) ----
   int frame_pin_inset_{0};
+  bool frame_respect_pin_inset_{true};
+  bool committed_respect_pin_inset_{true};
   int frame_uniform_clip_start_{-1};
   int frame_uniform_clip_end_{-1};
 
