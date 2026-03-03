@@ -268,7 +268,12 @@ void TransitTracker::set_route_styles_from_text(const std::string &text) {
 void TransitTracker::set_hidden_routes_from_text(const std::string &text) {
   this->hidden_routes_.clear();
   if (text.empty()) return;
-  for (const auto &id : split(text, ';')) {
+  // Composite keys (route_id:headsign:stop_id) may contain semicolons from
+  // transit agency headsign data.  We now persist with '\x1F' (ASCII Unit
+  // Separator) to avoid splitting keys incorrectly.  Fall back to ';' for
+  // backward compatibility with values persisted before this change.
+  char delim = (text.find('\x1F') != std::string::npos) ? '\x1F' : ';';
+  for (const auto &id : split(text, delim)) {
     if (!id.empty()) { this->hidden_routes_.insert(id); ESP_LOGD(TAG, "Hiding route: %s", id.c_str()); }
   }
 }
@@ -276,7 +281,10 @@ void TransitTracker::set_hidden_routes_from_text(const std::string &text) {
 void TransitTracker::set_pinned_routes_from_text(const std::string &text) {
   this->pinned_routes_.clear();
   if (text.empty()) return;
-  for (const auto &id : split(text, ';')) {
+  // Composite keys may contain semicolons — use '\x1F' if present, else
+  // fall back to ';' for backward compatibility with older persisted values.
+  char delim = (text.find('\x1F') != std::string::npos) ? '\x1F' : ';';
+  for (const auto &id : split(text, delim)) {
     if (!id.empty()) { this->pinned_routes_.insert(id); ESP_LOGD(TAG, "Pinning route: %s", id.c_str()); }
   }
 }
@@ -284,7 +292,10 @@ void TransitTracker::set_pinned_routes_from_text(const std::string &text) {
 void TransitTracker::set_next_only_routes_from_text(const std::string &text) {
   this->next_only_routes_.clear();
   if (text.empty()) return;
-  for (const auto &id : split(text, ';')) {
+  // Composite keys may contain semicolons — use '\x1F' if present, else
+  // fall back to ';' for backward compatibility with older persisted values.
+  char delim = (text.find('\x1F') != std::string::npos) ? '\x1F' : ';';
+  for (const auto &id : split(text, delim)) {
     if (!id.empty()) this->next_only_routes_.insert(id);
   }
 }
@@ -483,8 +494,18 @@ void TransitTracker::publish_mqtt_routes_() {
 }
 
 void TransitTracker::persist_hidden_routes_() {
+  // Use '\x1F' (ASCII Unit Separator) instead of ';' to delimit composite
+  // keys.  Composite keys contain the headsign, which may itself include
+  // semicolons from transit agency data.  Using ';' would split a single
+  // key into multiple fragments on the next restore, silently breaking
+  // pin/hide state.
+  //
+  // A leading '\x1F' prefix ensures the deserializer detects the new format
+  // even when only a single key is stored (where no inter-key delimiter
+  // would otherwise appear).  The deserializer skips empty tokens from
+  // the prefix.
   std::string s;
-  for (const auto &k : this->hidden_routes_) { if (!s.empty()) s += ";"; s += k; }
+  for (const auto &k : this->hidden_routes_) { s += '\x1F'; s += k; }
 #ifdef USE_TEXT
   if (this->hidden_routes_text_ && this->hidden_routes_text_->state != s) {
     auto call = this->hidden_routes_text_->make_call();
@@ -496,8 +517,9 @@ void TransitTracker::persist_hidden_routes_() {
 }
 
 void TransitTracker::persist_pinned_routes_() {
+  // Use '\x1F' with leading prefix — see persist_hidden_routes_() for rationale.
   std::string s;
-  for (const auto &k : this->pinned_routes_) { if (!s.empty()) s += ";"; s += k; }
+  for (const auto &k : this->pinned_routes_) { s += '\x1F'; s += k; }
 #ifdef USE_TEXT
   if (this->pinned_routes_text_ && this->pinned_routes_text_->state != s) {
     auto call = this->pinned_routes_text_->make_call();
@@ -509,8 +531,9 @@ void TransitTracker::persist_pinned_routes_() {
 }
 
 void TransitTracker::persist_next_only_routes_() {
+  // Use '\x1F' with leading prefix — see persist_hidden_routes_() for rationale.
   std::string s;
-  for (const auto &k : this->next_only_routes_) { if (!s.empty()) s += ";"; s += k; }
+  for (const auto &k : this->next_only_routes_) { s += '\x1F'; s += k; }
 #ifdef USE_TEXT
   if (this->next_only_routes_text_) {
     auto call = this->next_only_routes_text_->make_call();
