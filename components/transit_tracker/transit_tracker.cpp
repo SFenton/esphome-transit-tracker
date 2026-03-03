@@ -956,7 +956,9 @@ void TransitTracker::tick_transition_(unsigned long now, int fh,
         // Brief h-scroll hold after animation
         this->post_pause_end_ = now + 500;
         this->pinned_pager_.page_timer = now;
+        this->pinned_pager_.last_cycle_count = this->h_scroll_.cycle_count;
         this->unpinned_pager_.page_timer = now;
+        this->unpinned_pager_.last_cycle_count = this->h_scroll_.cycle_count;
       }
       break;
 
@@ -1176,17 +1178,38 @@ void HOT TransitTracker::draw_schedule() {
     } else if (this->scroll_routes_ && this->diff_.prev_pinned_count >= 0) {
       // Check page timers
       bool pinned_due = false, unpinned_due = false;
+      bool h_scroll_active = (this->h_scroll_.total_distance > 0 || this->h_scroll_.prev_total_distance > 0);
 
       if (this->pinned_pager_.needs_paging((int)pinned_pool.size(), eff_pinned)) {
-        if (this->pinned_pager_.page_timer == 0) this->pinned_pager_.page_timer = now;
-        bool interval_met = (now - this->pinned_pager_.page_timer >= (unsigned long)this->page_interval_);
-        pinned_due = interval_met && (this->h_scroll_.total_distance == 0 || this->h_scroll_.idle);
+        if (this->pinned_pager_.page_timer == 0) {
+          this->pinned_pager_.page_timer = now;
+          this->pinned_pager_.last_cycle_count = this->h_scroll_.cycle_count;
+        }
+        if (h_scroll_active) {
+          // Headsigns are scrolling — page when one full scroll cycle completes
+          pinned_due = this->h_scroll_.idle &&
+                       this->h_scroll_.cycle_count > this->pinned_pager_.last_cycle_count;
+        } else {
+          // No headsign scrolling — use fixed page_interval timer
+          bool interval_met = (now - this->pinned_pager_.page_timer >= (unsigned long)this->page_interval_);
+          pinned_due = interval_met;
+        }
       }
 
       if (this->unpinned_pager_.needs_paging((int)unpinned_pool.size(), eff_unpinned)) {
-        if (this->unpinned_pager_.page_timer == 0) this->unpinned_pager_.page_timer = now;
-        bool interval_met = (now - this->unpinned_pager_.page_timer >= (unsigned long)this->page_interval_);
-        unpinned_due = interval_met && (this->h_scroll_.total_distance == 0 || this->h_scroll_.idle);
+        if (this->unpinned_pager_.page_timer == 0) {
+          this->unpinned_pager_.page_timer = now;
+          this->unpinned_pager_.last_cycle_count = this->h_scroll_.cycle_count;
+        }
+        if (h_scroll_active) {
+          // Headsigns are scrolling — page when one full scroll cycle completes
+          unpinned_due = this->h_scroll_.idle &&
+                         this->h_scroll_.cycle_count > this->unpinned_pager_.last_cycle_count;
+        } else {
+          // No headsign scrolling — use fixed page_interval timer
+          bool interval_met = (now - this->unpinned_pager_.page_timer >= (unsigned long)this->page_interval_);
+          unpinned_due = interval_met;
+        }
       }
 
       if (pinned_due || unpinned_due) {

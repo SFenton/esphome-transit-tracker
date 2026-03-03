@@ -131,6 +131,7 @@ struct HScrollState {
 struct ScrollContainer {
   int page_offset{0};
   unsigned long page_timer{0};
+  int last_cycle_count{0};
 
   int page_count(int pool_size, int slot_count) const {
     if (pool_size <= slot_count || slot_count <= 0) return 1;
@@ -160,7 +161,7 @@ struct ScrollContainer {
     return std::min(start_index(pool_size, slot_count) + slot_count, pool_size);
   }
 
-  void reset() { page_offset = 0; page_timer = 0; }
+  void reset() { page_offset = 0; page_timer = 0; last_cycle_count = 0; }
 };
 
 // =====================================================================
