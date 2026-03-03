@@ -746,7 +746,7 @@ void TransitTracker::draw_trip(
   if (trip.is_realtime) {
     if (this->frame_uniform_clip_end_ < 0) clip_end -= 8;
     if (!no_draw)
-      this->draw_realtime_icon_(dw - time_width - 2, y_offset + fh - 6, uptime);
+      this->draw_realtime_icon_(dw - time_width - 2, y_offset + fh - 5, uptime);
   }
 
   // Headsign measurement
