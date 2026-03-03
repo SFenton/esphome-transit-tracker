@@ -692,17 +692,28 @@ void TransitTracker::draw_trip(
 
   // Pin icon (drawn in the inset margin if this row is pinned)
   if (is_pinned && x_start > 0 && this->show_pin_icon_ && !no_draw) {
-    int px = 1, py = y_offset + 1;
-    Color pc(0x808080);
-    // Simple pushpin glyph (5px wide)
-    this->display_->draw_pixel_at(px + 1, py, pc);
-    this->display_->draw_pixel_at(px + 2, py, pc);
-    this->display_->draw_pixel_at(px + 3, py, pc);
-    this->display_->draw_pixel_at(px + 1, py + 1, pc);
-    this->display_->draw_pixel_at(px + 2, py + 1, pc);
-    this->display_->draw_pixel_at(px + 3, py + 1, pc);
-    this->display_->draw_pixel_at(px + 2, py + 2, pc);
-    this->display_->draw_pixel_at(px + 2, py + 3, pc);
+    Color pin_color = Color(0xFF0000); // red
+    int px = 1; // 1px left margin; icon occupies columns px..px+4 (5 wide)
+    int py = y_offset + 1;
+    int cx = px + 2; // center column of the 5px-wide icon
+
+    // Row 0: 5px wide
+    for (int c = 0; c < 5; c++) this->display_->draw_pixel_at(px + c, py, pin_color);
+    py++;
+    // Row 1: 3px centered
+    for (int c = 1; c <= 3; c++) this->display_->draw_pixel_at(px + c, py, pin_color);
+    py++;
+    // Row 2: 3px centered
+    for (int c = 1; c <= 3; c++) this->display_->draw_pixel_at(px + c, py, pin_color);
+    py++;
+    // Row 3: 5px wide
+    for (int c = 0; c < 5; c++) this->display_->draw_pixel_at(px + c, py, pin_color);
+    py++;
+    // Remaining rows: 1px white vertical line centered
+    int bottom = y_offset + fh - 3;
+    for (int r = py; r < bottom; r++) {
+      this->display_->draw_pixel_at(cx, r, Color(0xFFFFFF));
+    }
   }
 
   // Route name
