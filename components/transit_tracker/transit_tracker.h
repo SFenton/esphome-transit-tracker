@@ -204,6 +204,7 @@ class TransitTracker : public Component {
   std::set<std::string> mqtt_published_routes_;
   std::set<std::string> mqtt_published_route_color_ids_;
   bool mqtt_routes_pending_{false};
+  bool mqtt_persist_pending_{false};
 #endif
 };
 

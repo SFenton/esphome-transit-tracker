@@ -54,6 +54,11 @@ void TransitTracker::loop() {
       this->publish_mqtt_routes_();
       this->publish_mqtt_route_colors_();
     }
+    if (this->mqtt_persist_pending_) {
+      this->mqtt_persist_pending_ = false;
+      this->persist_hidden_routes_();
+      this->persist_pinned_routes_();
+    }
   }
 #endif
 
@@ -401,18 +406,19 @@ void TransitTracker::publish_mqtt_routes_() {
       root["state_topic"] = state_topic;
       root["command_topic"] = command_topic;
       root["icon"] = "mdi:bus";
+      root["optimistic"] = true;
 
       auto options = root["options"].to<JsonArray>();
       options.add("Off");
       options.add("On");
       options.add("Pinned");
 
-      const auto &avail = mqtt::global_mqtt_client->get_availability();
-      if (!avail.topic.empty()) {
-        root["availability_topic"] = avail.topic;
-        root["payload_available"] = avail.payload_available;
-        root["payload_not_available"] = avail.payload_not_available;
-      }
+      // Note: we intentionally omit availability_topic here.
+      // These are configuration entities; the device's built-in
+      // ESPHome entities already report online/offline status.
+      // Including the device-level birth/will topic caused brief
+      // unavailable flickers whenever the blocking WebSocket
+      // reconnect starved the MQTT keepalive.
 
       auto device = root["device"].to<JsonObject>();
       auto ids = device["identifiers"].to<JsonArray>();
@@ -468,8 +474,7 @@ void TransitTracker::publish_mqtt_routes_() {
 
           mqtt::global_mqtt_client->publish(cap_st, payload, 0, true);
           ESP_LOGD(TAG, "Route %s set to %s via MQTT", cap_key.c_str(), payload.c_str());
-          this->persist_hidden_routes_();
-          this->persist_pinned_routes_();
+          this->mqtt_persist_pending_ = true;
         },
         0
       );
@@ -481,7 +486,7 @@ void TransitTracker::persist_hidden_routes_() {
   std::string s;
   for (const auto &k : this->hidden_routes_) { if (!s.empty()) s += ";"; s += k; }
 #ifdef USE_TEXT
-  if (this->hidden_routes_text_) {
+  if (this->hidden_routes_text_ && this->hidden_routes_text_->state != s) {
     auto call = this->hidden_routes_text_->make_call();
     call.set_value(s);
     call.perform();
@@ -494,7 +499,7 @@ void TransitTracker::persist_pinned_routes_() {
   std::string s;
   for (const auto &k : this->pinned_routes_) { if (!s.empty()) s += ";"; s += k; }
 #ifdef USE_TEXT
-  if (this->pinned_routes_text_) {
+  if (this->pinned_routes_text_ && this->pinned_routes_text_->state != s) {
     auto call = this->pinned_routes_text_->make_call();
     call.set_value(s);
     call.perform();
@@ -564,12 +569,7 @@ void TransitTracker::publish_mqtt_route_colors_() {
       auto modes = root["supported_color_modes"].to<JsonArray>();
       modes.add("rgb");
 
-      const auto &avail = mqtt::global_mqtt_client->get_availability();
-      if (!avail.topic.empty()) {
-        root["availability_topic"] = avail.topic;
-        root["payload_available"] = avail.payload_available;
-        root["payload_not_available"] = avail.payload_not_available;
-      }
+      // Omit availability_topic — same rationale as route select entities.
 
       auto device = root["device"].to<JsonObject>();
       auto ids = device["identifiers"].to<JsonArray>();
