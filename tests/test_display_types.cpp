@@ -732,6 +732,119 @@ TEST_SUITE("Transition — mid-animation") {
 }
 
 // =====================================================================
+// HScrollState — reset clears total_distance (phantom scroll fix)
+// =====================================================================
+
+TEST_SUITE("HScrollState — reset clears distance") {
+  TEST_CASE("reset clears both total_distance and prev_total_distance") {
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);
+    hs.update_distance(80, true);  // total = 100
+    CHECK(hs.total_distance == 100);
+
+    // Scroll for a while, then trigger wind-down so prev is populated
+    hs.update_distance(0, false);
+    CHECK(hs.prev_total_distance == 100);
+
+    // Reset (like a transition would do)
+    hs.reset(2000);
+    CHECK(hs.total_distance == 0);
+    CHECK(hs.prev_total_distance == 0);
+  }
+
+  TEST_CASE("no phantom scroll after reset when overflow disappears") {
+    // Scenario: scrolling active → transition resets → new data has no overflow.
+    // Before the fix, the stale total_distance survived reset() and
+    // update_distance(0, false) moved it into prev_total_distance, causing
+    // a phantom scroll cycle with skip_first_dwell=true (no dwell pause).
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);
+
+    // Start scrolling (overflow exists)
+    hs.update_distance(80, true);  // total = 100
+    hs.compute(501);               // mid-scroll: offset=50
+    CHECK(hs.offset == 50);
+    CHECK(!hs.idle);
+
+    // Transition fires: reset at current time
+    hs.reset(501);
+
+    // After transition, new trip data has no overflow
+    hs.update_distance(0, false);
+
+    // Should be fully idle — no phantom scroll cycle
+    CHECK(hs.total_distance == 0);
+    CHECK(hs.prev_total_distance == 0);
+
+    hs.compute(600);
+    CHECK(hs.idle);
+    CHECK(hs.offset == 0);
+
+    hs.compute(1000);
+    CHECK(hs.idle);
+    CHECK(hs.offset == 0);
+
+    hs.compute(5000);
+    CHECK(hs.idle);
+    CHECK(hs.offset == 0);
+  }
+
+  TEST_CASE("reset then new overflow starts scrolling normally") {
+    // After reset, if new data DOES overflow, scrolling should start fresh.
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);
+    hs.update_distance(80, true);  // total = 100
+
+    hs.compute(501);
+    CHECK(hs.offset == 50);
+
+    // Transition fires: reset
+    hs.reset(1000);
+    CHECK(hs.total_distance == 0);
+
+    // New data still overflows (different headsign, same width)
+    hs.update_distance(80, true);  // total = 100
+    CHECK(hs.total_distance == 100);
+    CHECK(!hs.deferred_start);  // skip_next_defer was set by reset
+
+    // Scrolling works from offset 0 (skip_first_dwell means no initial dwell)
+    hs.compute(1100);  // elapsed=100ms → 10px
+    CHECK(hs.offset == 10);
+    CHECK(!hs.idle);
+  }
+
+  TEST_CASE("repeated reset+no-overflow stays idle") {
+    // Multiple rapid transitions where overflow disappears each time.
+    // None should produce phantom scrolling.
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);
+    hs.update_distance(80, true);
+    hs.compute(501);  // scrolling
+
+    for (int i = 0; i < 5; i++) {
+      unsigned long t = 1000 + i * 500;
+      hs.reset(t);
+      hs.update_distance(0, false);
+      hs.compute(t + 100);
+      CHECK(hs.idle);
+      CHECK(hs.offset == 0);
+      CHECK(hs.total_distance == 0);
+      CHECK(hs.prev_total_distance == 0);
+
+      // Re-enable overflow for next iteration
+      if (i < 4) {
+        hs.update_distance(80, true);
+        hs.compute(t + 200);
+      }
+    }
+  }
+}
+
+// =====================================================================
 // HScrollState — pin inset / total_distance change scenarios
 // =====================================================================
 

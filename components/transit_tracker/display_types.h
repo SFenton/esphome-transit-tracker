@@ -101,6 +101,7 @@ struct HScrollState {
     offset = 0;
     cycle_count = 0;
     idle = true;
+    total_distance = 0;
     prev_total_distance = 0;
     deferred_start = false;
     deferred_since = 0;
