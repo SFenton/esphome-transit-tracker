@@ -47,7 +47,6 @@ CONF_NEXT_ONLY_ROUTES_TEXT = "next_only_routes_text"
 CONF_ROUTE_COLOR_OVERRIDES_TEXT = "route_color_overrides_text"
 CONF_SHOW_PIN_ICON = "show_pin_icon"
 CONF_RESPECT_PIN_INSET = "respect_pin_inset"
-CONF_PREFER_REPLACE_OVER_SCROLL = "prefer_replace_over_scroll"
 CONF_ALWAYS_SCROLL_OR_REPLACE = "always_scroll_or_replace"
 
 
@@ -88,7 +87,6 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_SCROLL_HEADSIGNS, default=False): cv.boolean,
             cv.Optional(CONF_SHOW_PIN_ICON, default=True): cv.boolean,
             cv.Optional(CONF_RESPECT_PIN_INSET, default=True): cv.boolean,
-            cv.Optional(CONF_PREFER_REPLACE_OVER_SCROLL, default=True): cv.boolean,
             cv.Optional(CONF_ALWAYS_SCROLL_OR_REPLACE, default=False): cv.boolean,
             cv.Optional(CONF_HIDDEN_ROUTES_TEXT): cv.use_id(TextEntity) if TextEntity else cv.string,
             cv.Optional(CONF_PINNED_ROUTES_TEXT): cv.use_id(TextEntity) if TextEntity else cv.string,
@@ -163,7 +161,6 @@ async def to_code(config):
     cg.add(var.set_scroll_headsigns(config[CONF_SCROLL_HEADSIGNS]))
     cg.add(var.set_show_pin_icon(config[CONF_SHOW_PIN_ICON]))
     cg.add(var.set_respect_pin_inset(config[CONF_RESPECT_PIN_INSET]))
-    cg.add(var.set_prefer_replace_over_scroll(config[CONF_PREFER_REPLACE_OVER_SCROLL]))
     cg.add(var.set_always_scroll_or_replace(config[CONF_ALWAYS_SCROLL_OR_REPLACE]))
 
     cg.add(var.set_limit(config[CONF_LIMIT]))

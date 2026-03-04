@@ -59,7 +59,6 @@ class TransitTracker : public Component {
   void set_scroll_routes(bool v);
   void set_show_pin_icon(bool v) { show_pin_icon_ = v; }
   void set_respect_pin_inset(bool v) { respect_pin_inset_ = v; }
-  void set_prefer_replace_over_scroll(bool v) { prefer_replace_over_scroll_ = v; }
   void set_always_scroll_or_replace(bool v) { always_scroll_or_replace_ = v; }
   void set_scroll_speed(const std::string &speed);
   void set_page_interval(int seconds) { page_interval_ = seconds * 1000; }
@@ -167,7 +166,6 @@ class TransitTracker : public Component {
   bool uniform_headsign_start_{false};
   bool uniform_headsign_end_{false};
   bool scroll_routes_{false};
-  bool prefer_replace_over_scroll_{true};
   bool always_scroll_or_replace_{false};
   int page_interval_{5000};
   int page_scroll_duration_{500};
