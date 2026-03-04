@@ -1075,10 +1075,16 @@ void TransitTracker::render_frame_(
   bool use_old = (phase == Transition::WAIT_SCROLL ||
                   phase == Transition::COLLAPSE ||
                   phase == Transition::MID_PAUSE);
+  bool use_new_snapshot = (phase == Transition::EXPAND ||
+                           phase == Transition::POST_PAUSE) &&
+                          !this->transition_.new_trips.empty();
 
-  const auto &draw_rows = use_old ? this->transition_.old_trips : rows;
-  const auto &draw_pinned = use_old ? this->transition_.old_is_pinned : row_pinned;
-  const auto &draw_leaving_soon = use_old ? this->transition_.old_is_leaving_soon : row_leaving_soon;
+  const auto &draw_rows = use_old ? this->transition_.old_trips
+                          : (use_new_snapshot ? this->transition_.new_trips : rows);
+  const auto &draw_pinned = use_old ? this->transition_.old_is_pinned
+                             : (use_new_snapshot ? this->transition_.new_is_pinned : row_pinned);
+  const auto &draw_leaving_soon = use_old ? this->transition_.old_is_leaving_soon
+                                   : (use_new_snapshot ? this->transition_.new_is_leaving_soon : row_leaving_soon);
 
   // Save/restore pin inset based on current phase
   int save_inset = this->frame_pin_inset_;
@@ -1087,6 +1093,9 @@ void TransitTracker::render_frame_(
     this->frame_pin_inset_ = (this->transition_.old_eff_pinned > 0 && this->show_pin_icon_)
                                  ? kPinIconWidth : 0;
     this->frame_respect_pin_inset_ = this->transition_.old_respect_pin_inset;
+  } else if (use_new_snapshot) {
+    this->frame_pin_inset_ = (this->transition_.new_eff_pinned > 0 && this->show_pin_icon_)
+                                 ? kPinIconWidth : 0;
   }
 
   // H-scroll: active only in IDLE and WAIT_SCROLL
@@ -1475,6 +1484,10 @@ void HOT TransitTracker::draw_schedule() {
       measure_rows = &this->transition_.old_trips;
       measure_eff_pinned = this->transition_.old_eff_pinned;
       rendering_old_layout = true;
+    } else if (!this->transition_.new_trips.empty()) {
+      // EXPAND/POST_PAUSE: use the snapshot for consistent measurements
+      measure_rows = &this->transition_.new_trips;
+      measure_eff_pinned = this->transition_.new_eff_pinned;
     }
   } else {
     // IDLE: peek at diff to detect an impending layout change so that the
@@ -1483,7 +1496,8 @@ void HOT TransitTracker::draw_schedule() {
     this->diff_.compute(keys, deps, eff_pinned, pinned_route_keys);
     bool respect_inset_changed = (this->respect_pin_inset_ != this->committed_respect_pin_inset_)
                                  && eff_pinned > 0;
-    if ((this->diff_.has_changes() || respect_inset_changed) && this->diff_.prev_pinned_count >= 0) {
+    bool visual_change = this->diff_.layout_changed || this->diff_.data_changed || respect_inset_changed;
+    if (visual_change && this->diff_.prev_pinned_count >= 0) {
       measure_rows = &this->diff_.prev_trips;
       measure_eff_pinned = this->diff_.prev_pinned_count;
       rendering_old_layout = true;
@@ -1523,8 +1537,9 @@ void HOT TransitTracker::draw_schedule() {
     bool respect_inset_changed = (this->respect_pin_inset_ != this->committed_respect_pin_inset_)
                                  && eff_pinned > 0;
     bool triggered_transition = false;
+    bool visual_change = this->diff_.layout_changed || this->diff_.data_changed || respect_inset_changed;
 
-    if ((this->diff_.has_changes() || respect_inset_changed) && this->diff_.prev_pinned_count >= 0) {
+    if (visual_change && this->diff_.prev_pinned_count >= 0) {
       // Data/layout changed — start transition
       bool layout_swap = this->diff_.layout_changed || this->diff_.pinned_set_changed || respect_inset_changed;
       this->begin_transition_(this->diff_.prev_trips, this->diff_.prev_is_pinned,
@@ -1666,12 +1681,42 @@ void HOT TransitTracker::draw_schedule() {
   // ---- 13. Tick transition ----
   this->tick_transition_(now, fh, pinned_pool, unpinned_pool, eff_pinned, eff_unpinned);
 
+  // Snapshot target rows when entering EXPAND for the first time.
+  // This keeps EXPAND and POST_PAUSE visually stable even if the
+  // underlying data changes mid-transition (WebSocket update,
+  // leaving-soon threshold crossing, etc.).
+  if (this->transition_.phase == Transition::EXPAND && this->transition_.new_trips.empty()) {
+    this->transition_.new_trips = rows;
+    this->transition_.new_is_pinned = row_pinned;
+    this->transition_.new_is_leaving_soon = row_leaving_soon;
+    this->transition_.new_eff_pinned = eff_pinned;
+  }
+
   // ---- 14. Render ----
   this->render_frame_(rows, row_pinned, row_leaving_soon, eff_pinned, now, rtc_now, fh, y_base);
 
   // ---- 15. Commit diff (only when idle) ----
   if (this->transition_.phase == Transition::IDLE) {
-    this->diff_.commit(keys, deps, rows, row_pinned, row_leaving_soon, eff_pinned, pinned_route_keys);
+    // If we just finished a transition that had a snapshot, commit the
+    // snapshot state so the diff can detect any changes that arrived
+    // during the transition (and animate them on the next frame).
+    if (!this->transition_.new_trips.empty()) {
+      std::vector<std::string> snap_keys;
+      std::vector<time_t> snap_deps;
+      for (const auto &t : this->transition_.new_trips) {
+        snap_keys.push_back(t.composite_key());
+        snap_deps.push_back(t.departure_time);
+      }
+      this->diff_.commit(snap_keys, snap_deps, this->transition_.new_trips,
+                         this->transition_.new_is_pinned, this->transition_.new_is_leaving_soon,
+                         this->transition_.new_eff_pinned, pinned_route_keys);
+      this->transition_.new_trips.clear();
+      this->transition_.new_is_pinned.clear();
+      this->transition_.new_is_leaving_soon.clear();
+      this->transition_.new_eff_pinned = 0;
+    } else {
+      this->diff_.commit(keys, deps, rows, row_pinned, row_leaving_soon, eff_pinned, pinned_route_keys);
+    }
     this->committed_respect_pin_inset_ = this->respect_pin_inset_;
   }
 }

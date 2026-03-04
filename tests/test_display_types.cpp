@@ -4189,3 +4189,172 @@ TEST_SUITE("SplitPinPaging") {
     CHECK(r.eff_unpinned == 1);
   }
 }
+
+// =====================================================================
+// DisplayDiff — pinned_set_changed + data_changed coexistence
+// =====================================================================
+
+TEST_SUITE("DisplayDiff — pinned_set_changed no early return") {
+  // helpers (mirror the ones in "DisplayDiff — pin transitions")
+  static void commit_frame(DisplayDiff &diff,
+                           const std::vector<Trip> &trips,
+                           int pinned_count,
+                           const std::set<std::string> &pinned_routes) {
+    std::vector<std::string> keys;
+    std::vector<time_t> deps;
+    std::vector<bool> is_p;
+    for (size_t i = 0; i < trips.size(); i++) {
+      keys.push_back(trips[i].composite_key());
+      deps.push_back(trips[i].departure_time);
+      is_p.push_back((int)i < pinned_count);
+    }
+    diff.commit(keys, deps, trips, is_p, is_p, pinned_count, pinned_routes);
+  }
+
+  static void compute_frame(DisplayDiff &diff,
+                             const std::vector<Trip> &trips,
+                             int pinned_count,
+                             const std::set<std::string> &pinned_routes) {
+    std::vector<std::string> keys;
+    std::vector<time_t> deps;
+    for (const auto &t : trips) {
+      keys.push_back(t.composite_key());
+      deps.push_back(t.departure_time);
+    }
+    diff.compute(keys, deps, pinned_count, pinned_routes);
+  }
+
+  TEST_CASE("pinned_set_changed alone — no data_changed when keys identical") {
+    DisplayDiff diff;
+    // R1 pinned, R2 unpinned — same order and keys
+    std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::set<std::string> pin_v1 = {"R1:A"};
+    commit_frame(diff, trips, 1, pin_v1);
+
+    // Now pin R2 instead of R1, but keep the same count and exact same rows
+    std::set<std::string> pin_v2 = {"R2:B"};
+    compute_frame(diff, trips, 1, pin_v2);
+
+    CHECK(diff.pinned_set_changed);
+    CHECK(!diff.layout_changed);
+    CHECK(!diff.data_changed);
+    CHECK(diff.has_changes());  // pinned_set_changed counts
+  }
+
+  TEST_CASE("pinned_set_changed WITH data_changed — both set") {
+    DisplayDiff diff;
+    std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::set<std::string> pin_v1 = {"R1:A"};
+    commit_frame(diff, trips, 1, pin_v1);
+
+    // Change pin set AND swap rows (different keys in display)
+    std::set<std::string> pin_v2 = {"R2:B"};
+    std::vector<Trip> reordered = {make_trip("R2", "B", 200), make_trip("R3", "C", 300)};
+    compute_frame(diff, reordered, 1, pin_v2);
+
+    CHECK(diff.pinned_set_changed);
+    CHECK(diff.data_changed);  // keys changed — was masked before the fix
+    CHECK(diff.has_changes());
+  }
+
+  TEST_CASE("pinned_set_changed WITH departure time jump — both set") {
+    DisplayDiff diff;
+    std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::set<std::string> pin_v1 = {"R1:A"};
+    commit_frame(diff, trips, 1, pin_v1);
+
+    // Change pin set AND large departure time change
+    std::set<std::string> pin_v2 = {"R2:B"};
+    std::vector<Trip> updated = {make_trip("R1", "A", 250), make_trip("R2", "B", 200)};
+    compute_frame(diff, updated, 1, pin_v2);
+
+    CHECK(diff.pinned_set_changed);
+    CHECK(diff.data_changed);  // 100→250 is >60s threshold
+  }
+
+  TEST_CASE("pinned_set_changed with row count change — both set") {
+    DisplayDiff diff;
+    std::vector<Trip> trips2 = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::set<std::string> pin_v1 = {"R1:A"};
+    commit_frame(diff, trips2, 1, pin_v1);
+
+    // Different pin set AND different row count
+    std::set<std::string> pin_v2 = {"R2:B"};
+    std::vector<Trip> trips3 = {
+        make_trip("R1", "A", 100), make_trip("R2", "B", 200), make_trip("R3", "C", 300)};
+    compute_frame(diff, trips3, 1, pin_v2);
+
+    CHECK(diff.pinned_set_changed);
+    CHECK(diff.data_changed);  // size changed
+  }
+}
+
+// =====================================================================
+// Transition — new_trips snapshot fields
+// =====================================================================
+
+TEST_SUITE("Transition — expand snapshot") {
+  TEST_CASE("reset clears new_trips snapshot") {
+    Transition tr;
+    tr.phase = Transition::EXPAND;
+    tr.stagger_rows = 2;
+    tr.old_trips = {make_trip("R1", "A"), make_trip("R2", "B")};
+    tr.new_trips = {make_trip("R3", "C"), make_trip("R4", "D")};
+    tr.new_is_pinned = {false, false};
+    tr.new_is_leaving_soon = {false, false};
+    tr.new_eff_pinned = 0;
+
+    tr.reset();
+
+    CHECK(tr.phase == Transition::IDLE);
+    CHECK(tr.old_trips.empty());
+    CHECK(tr.new_trips.empty());
+    CHECK(tr.new_is_pinned.empty());
+    CHECK(tr.new_is_leaving_soon.empty());
+    CHECK(tr.new_eff_pinned == 0);
+  }
+
+  TEST_CASE("new_trips snapshot is independent of source") {
+    Transition tr;
+    std::vector<Trip> rows = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+
+    tr.new_trips = rows;
+    tr.new_is_pinned = {true, false};
+    tr.new_is_leaving_soon = {false, false};
+    tr.new_eff_pinned = 1;
+
+    // Modify source — snapshot should be independent
+    rows[0] = make_trip("R5", "E", 500);
+    CHECK(tr.new_trips[0].route_id == "R1");
+    CHECK(tr.new_trips[0].departure_time == 100);
+  }
+
+  TEST_CASE("new_eff_pinned defaults to 0") {
+    Transition tr;
+    CHECK(tr.new_eff_pinned == 0);
+    CHECK(tr.new_trips.empty());
+  }
+
+  TEST_CASE("expand snapshot survives phase progression") {
+    // Simulate: snapshot taken during EXPAND, used through POST_PAUSE
+    Transition tr;
+    tr.phase = Transition::EXPAND;
+    tr.phase_start = 1000;
+    tr.stagger_rows = 2;
+    tr.new_trips = {make_trip("R1", "A"), make_trip("R2", "B")};
+    tr.new_is_pinned = {true, false};
+    tr.new_is_leaving_soon = {false, false};
+    tr.new_eff_pinned = 1;
+
+    // Transition to POST_PAUSE — snapshot should still be present
+    tr.phase = Transition::POST_PAUSE;
+    tr.phase_start = 2000;
+    CHECK(tr.new_trips.size() == 2);
+    CHECK(tr.new_eff_pinned == 1);
+    CHECK(tr.new_trips[0].route_id == "R1");
+
+    // Only reset() clears it
+    tr.reset();
+    CHECK(tr.new_trips.empty());
+  }
+}

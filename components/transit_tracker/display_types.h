@@ -300,7 +300,10 @@ struct DisplayDiff {
     if (prev_pinned_count < 0) return;  // first frame — no diff
 
     if (cur_pinned_count != prev_pinned_count) { layout_changed = true; return; }
-    if (cur_pinned_routes != prev_pinned_routes) { pinned_set_changed = true; return; }
+    if (cur_pinned_routes != prev_pinned_routes) pinned_set_changed = true;
+    // Don't return early — continue checking keys/deps so data_changed is
+    // also computed.  This lets callers distinguish "pin config changed but
+    // display is identical" from "pin config changed AND rows shifted".
 
     // Key or departure-time changes
     if (cur_keys.size() != prev_keys.size()) { data_changed = true; return; }
@@ -359,6 +362,12 @@ struct Transition {
   int old_eff_pinned{0};
   bool old_respect_pin_inset{true};
 
+  // Snapshot of target content when EXPAND begins (for stable EXPAND + POST_PAUSE)
+  std::vector<Trip> new_trips;
+  std::vector<bool> new_is_pinned;
+  std::vector<bool> new_is_leaving_soon;
+  int new_eff_pinned{0};
+
   // For vertical scroll page changes
   bool is_vscroll{false};
   int vscroll_section_y{0};      // y of first row in scrolling section
@@ -400,6 +409,10 @@ struct Transition {
     old_is_leaving_soon.clear();
     old_eff_pinned = 0;
     old_respect_pin_inset = true;
+    new_trips.clear();
+    new_is_pinned.clear();
+    new_is_leaving_soon.clear();
+    new_eff_pinned = 0;
     is_vscroll = false;
     stagger_rows = 0;
   }
