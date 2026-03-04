@@ -66,6 +66,8 @@ class TransitTracker : public Component {
   void set_page_pause_duration(int seconds) { page_pause_duration_ = seconds * 1000; }
   void set_pinned_rows_count(int c) { pinned_rows_count_ = std::max(1, std::min(c, limit_ - 1)); }
   int get_pinned_rows_count() const { return pinned_rows_count_; }
+  void set_general_pins_count(int c) { general_pins_count_ = std::max(1, c); }
+  int get_general_pins_count() const { return general_pins_count_; }
   void set_leaving_soon_threshold(int minutes) { leaving_soon_threshold_min_ = std::max(5, std::min(60, minutes)); }
   int get_leaving_soon_threshold() const { return leaving_soon_threshold_min_; }
   void set_unit_display(UnitDisplay u) { localization_.set_unit_display(u); }
@@ -122,6 +124,8 @@ class TransitTracker : public Component {
   void begin_page_transition_(const std::vector<Trip> &pinned_pool,
                                const std::vector<Trip> &unpinned_pool,
                                int eff_pinned, int eff_unpinned,
+                               int gen_pager_pool, int gen_pager_slots,
+                               int dep_pager_pool, int dep_pager_slots,
                                bool pinned_due, bool unpinned_due,
                                const std::vector<Trip> &old_trips,
                                const std::vector<bool> &old_is_pinned,
@@ -176,6 +180,7 @@ class TransitTracker : public Component {
   int page_scroll_duration_{500};
   int page_pause_duration_{1000};
   int pinned_rows_count_{1};
+  int general_pins_count_{1};
   int leaving_soon_threshold_min_{10};
   Color realtime_color_{Color(0x20FF00)};
   Color realtime_color_dark_{Color(0x00A700)};
@@ -191,6 +196,7 @@ class TransitTracker : public Component {
   DisplayDiff diff_;
   HScrollState h_scroll_;
   ScrollContainer pinned_pager_;
+  ScrollContainer departure_pager_;
   ScrollContainer unpinned_pager_;
   unsigned long post_pause_end_{0};
   unsigned long idle_since_{0};

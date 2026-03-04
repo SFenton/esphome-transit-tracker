@@ -367,6 +367,7 @@ void TransitTracker::set_scroll_routes(bool v) {
   if (this->scroll_routes_ != v) {
     this->scroll_routes_ = v;
     this->pinned_pager_.reset();
+    this->departure_pager_.reset();
     this->unpinned_pager_.reset();
     if (this->ws_client_.available()) this->reconnect();
   }
@@ -961,6 +962,8 @@ void TransitTracker::begin_transition_(
 void TransitTracker::begin_page_transition_(
     const std::vector<Trip> &pinned_pool, const std::vector<Trip> &unpinned_pool,
     int eff_pinned, int eff_unpinned,
+    int gen_pager_pool, int gen_pager_slots,
+    int dep_pager_pool, int dep_pager_slots,
     bool pinned_due, bool unpinned_due,
     const std::vector<Trip> &old_trips, const std::vector<bool> &old_is_pinned,
     const std::vector<bool> &old_is_leaving_soon,
@@ -978,8 +981,10 @@ void TransitTracker::begin_page_transition_(
   this->transition_.stagger_rows = std::max(1, (int)old_trips.size());
 
   // Advance page indices (EXPAND will use the new page content)
-  if (pinned_due)
-    this->pinned_pager_.advance_page((int)pinned_pool.size(), eff_pinned);
+  if (pinned_due) {
+    this->pinned_pager_.advance_page(gen_pager_pool, gen_pager_slots);
+    this->departure_pager_.advance_page(dep_pager_pool, dep_pager_slots);
+  }
   if (unpinned_due)
     this->unpinned_pager_.advance_page((int)unpinned_pool.size(), eff_unpinned);
 
@@ -1049,6 +1054,8 @@ void TransitTracker::tick_transition_(unsigned long now, int fh,
         this->post_pause_end_ = now + 500;
         this->pinned_pager_.page_timer = now;
         this->pinned_pager_.last_cycle_count = this->h_scroll_.cycle_count;
+        this->departure_pager_.page_timer = now;
+        this->departure_pager_.last_cycle_count = this->h_scroll_.cycle_count;
         this->unpinned_pager_.page_timer = now;
         this->unpinned_pager_.last_cycle_count = this->h_scroll_.cycle_count;
       }
@@ -1208,8 +1215,6 @@ void HOT TransitTracker::draw_schedule() {
   //   PIN_GENERAL or PIN_BOTH → always
   //   PIN_LEAVING_SOON → only when departure_time - rtc_now < threshold
   int actual_pinned = 0;
-  // Track per-trip leaving-soon state for the pinned pool
-  std::vector<bool> pinned_pool_leaving_soon;
   if (!this->pinned_routes_.empty()) {
     std::stable_partition(visible.begin(), visible.end(), [this, rtc_now, leaving_soon_threshold_sec](const Trip &t) {
       auto it = this->pinned_routes_.find(t.composite_key());
@@ -1241,22 +1246,99 @@ void HOT TransitTracker::draw_schedule() {
     dedup_pinned_section(visible, actual_pinned);
   }
 
-  int eff_pinned = (actual_pinned > 0) ? std::min(this->pinned_rows_count_, actual_pinned) : 0;
+  // ---- 4b. Split pinned trips into general (red) and departure (green) pools ----
+  // General: PIN_GENERAL, or PIN_BOTH when NOT leaving soon
+  // Departure: PIN_LEAVING_SOON, or PIN_BOTH when leaving soon
+  std::vector<Trip> general_pool;
+  std::vector<Trip> departure_pool;
+  for (int i = 0; i < actual_pinned; i++) {
+    const auto &t = visible[i];
+    auto it = this->pinned_routes_.find(t.composite_key());
+    if (it == this->pinned_routes_.end()) continue;
+    int secs_until = (int)(t.departure_time - rtc_now);
+    bool leaving_soon = (secs_until < leaving_soon_threshold_sec);
+    switch (it->second) {
+      case PIN_GENERAL:
+        general_pool.push_back(t);
+        break;
+      case PIN_LEAVING_SOON:
+        departure_pool.push_back(t);  // only in pinned section when leaving soon
+        break;
+      case PIN_BOTH:
+        if (leaving_soon) departure_pool.push_back(t);
+        else general_pool.push_back(t);
+        break;
+      default: break;
+    }
+  }
+
+  // Detect whether we have a split layout (both general and departure pins active)
+  bool has_pin_split = (general_pool.size() > 0 && departure_pool.size() > 0);
+
+  // ---- 4c. Compute effective pinned rows with split-aware logic ----
+  int eff_pinned;
+  int eff_general = 0;
+  int eff_departure = 0;
+  if (actual_pinned > 0) {
+    eff_pinned = std::min(this->pinned_rows_count_, actual_pinned);
+
+    if (has_pin_split) {
+      // Auto-bump to at least 2 pinned rows when both types are present
+      if (eff_pinned < 2) eff_pinned = std::min(2, this->limit_ - 1);
+
+      // Allocate rows: general first, then departure
+      int gen_want = std::min(this->general_pins_count_, eff_pinned - 1);  // leave ≥1 for departure
+      eff_general = std::min(gen_want, (int)general_pool.size());
+      int dep_slots = eff_pinned - eff_general;
+      eff_departure = std::min(dep_slots, (int)departure_pool.size());
+
+      // If departure didn't fill its slots, give surplus back to general
+      int surplus = dep_slots - eff_departure;
+      if (surplus > 0) {
+        int extra = std::min(surplus, (int)general_pool.size() - eff_general);
+        eff_general += extra;
+      }
+
+      // Shrink eff_pinned to what we actually have
+      eff_pinned = eff_general + eff_departure;
+    } else {
+      // Single pin type — at most 1 pinned row; multi-row is only for splits
+      eff_pinned = std::min(1, actual_pinned);
+    }
+  } else {
+    eff_pinned = 0;
+  }
   int eff_unpinned = this->limit_ - eff_pinned;
 
-  // Split into pools
-  std::vector<Trip> pinned_pool(visible.begin(), visible.begin() + actual_pinned);
+  // Build unpinned pool (same for all modes)
   std::vector<Trip> unpinned_pool(visible.begin() + actual_pinned, visible.end());
 
-  // ---- 5. Paginate ----
-  if (eff_pinned > 0) this->pinned_pager_.clamp((int)pinned_pool.size(), eff_pinned);
-  else this->pinned_pager_.reset();
+  // ---- 5. Paginate & build pinned_pool ----
+  // In split mode, pinned_pager_ pages the general sub-pool and
+  // departure_pager_ pages the departure sub-pool independently.
+  // In non-split mode, eff_pinned ≤ 1 so no paging is needed.
+  std::vector<Trip> pinned_pool;
+  if (has_pin_split) {
+    this->pinned_pager_.clamp((int)general_pool.size(), eff_general);
+    this->departure_pager_.clamp((int)departure_pool.size(), eff_departure);
+    int g_si = this->pinned_pager_.start_index((int)general_pool.size(), eff_general);
+    int g_ei = this->pinned_pager_.end_index((int)general_pool.size(), eff_general);
+    int d_si = this->departure_pager_.start_index((int)departure_pool.size(), eff_departure);
+    int d_ei = this->departure_pager_.end_index((int)departure_pool.size(), eff_departure);
+    for (int i = g_si; i < g_ei; i++) pinned_pool.push_back(general_pool[i]);
+    for (int i = d_si; i < d_ei; i++) pinned_pool.push_back(departure_pool[i]);
+  } else if (actual_pinned > 0) {
+    for (int i = 0; i < std::min(actual_pinned, eff_pinned); i++) pinned_pool.push_back(visible[i]);
+    this->pinned_pager_.reset();
+    this->departure_pager_.reset();
+  } else {
+    this->pinned_pager_.reset();
+    this->departure_pager_.reset();
+  }
 
   if (this->scroll_routes_) this->unpinned_pager_.clamp((int)unpinned_pool.size(), eff_unpinned);
   else this->unpinned_pager_.reset();
 
-  int p_si = eff_pinned > 0 ? this->pinned_pager_.start_index((int)pinned_pool.size(), eff_pinned) : 0;
-  int p_ei = eff_pinned > 0 ? this->pinned_pager_.end_index((int)pinned_pool.size(), eff_pinned) : 0;
   int u_si = this->unpinned_pager_.start_index((int)unpinned_pool.size(), eff_unpinned);
   int u_ei = this->unpinned_pager_.end_index((int)unpinned_pool.size(), eff_unpinned);
 
@@ -1267,7 +1349,7 @@ void HOT TransitTracker::draw_schedule() {
   std::vector<std::string> keys;
   std::vector<time_t> deps;
 
-  for (int i = p_si; i < p_ei; i++) {
+  for (int i = 0; i < (int)pinned_pool.size(); i++) {
     rows.push_back(pinned_pool[i]); row_pinned.push_back(true);
     // Determine leaving-soon state for this pinned trip
     auto it = this->pinned_routes_.find(pinned_pool[i].composite_key());
@@ -1384,17 +1466,30 @@ void HOT TransitTracker::draw_schedule() {
       bool pinned_due = false, unpinned_due = false;
       bool h_scroll_active = (this->h_scroll_.total_distance > 0 || this->h_scroll_.prev_total_distance > 0);
 
-      if (this->pinned_pager_.needs_paging((int)pinned_pool.size(), eff_pinned)) {
+      // In split mode, pinned_pager_ pages general_pool and departure_pager_
+      // pages departure_pool.  Either needing a page triggers pinned_due
+      // (both sub-pools advance together since they share the pinned section).
+      int gen_pager_pool = has_pin_split ? (int)general_pool.size() : (int)pinned_pool.size();
+      int gen_pager_slots = has_pin_split ? eff_general : eff_pinned;
+      int dep_pager_pool = has_pin_split ? (int)departure_pool.size() : 0;
+      int dep_pager_slots = has_pin_split ? eff_departure : 0;
+
+      bool gen_needs = this->pinned_pager_.needs_paging(gen_pager_pool, gen_pager_slots);
+      bool dep_needs = has_pin_split && this->departure_pager_.needs_paging(dep_pager_pool, dep_pager_slots);
+
+      if (gen_needs || dep_needs) {
         if (this->pinned_pager_.page_timer == 0) {
           this->pinned_pager_.page_timer = now;
           this->pinned_pager_.last_cycle_count = this->h_scroll_.cycle_count;
         }
+        if (has_pin_split && this->departure_pager_.page_timer == 0) {
+          this->departure_pager_.page_timer = now;
+          this->departure_pager_.last_cycle_count = this->h_scroll_.cycle_count;
+        }
         if (h_scroll_active) {
-          // Headsigns are scrolling — page when one full scroll cycle completes
           pinned_due = this->h_scroll_.idle &&
                        this->h_scroll_.cycle_count > this->pinned_pager_.last_cycle_count;
         } else {
-          // No headsign scrolling — use fixed page_interval timer
           bool interval_met = (now - this->pinned_pager_.page_timer >= (unsigned long)this->page_interval_);
           pinned_due = interval_met;
         }
@@ -1418,16 +1513,27 @@ void HOT TransitTracker::draw_schedule() {
 
       if (pinned_due || unpinned_due) {
         this->begin_page_transition_(pinned_pool, unpinned_pool, eff_pinned, eff_unpinned,
+                                     gen_pager_pool, gen_pager_slots,
+                                     dep_pager_pool, dep_pager_slots,
                                      pinned_due, unpinned_due, rows, row_pinned, row_leaving_soon, now);
         triggered_transition = true;
 
-        // Re-compute rows with new page indices
+        // Re-build pinned_pool with new page windows
+        if (has_pin_split) {
+          pinned_pool.clear();
+          int g_si = this->pinned_pager_.start_index((int)general_pool.size(), eff_general);
+          int g_ei = this->pinned_pager_.end_index((int)general_pool.size(), eff_general);
+          int d_si = this->departure_pager_.start_index((int)departure_pool.size(), eff_departure);
+          int d_ei = this->departure_pager_.end_index((int)departure_pool.size(), eff_departure);
+          for (int i = g_si; i < g_ei; i++) pinned_pool.push_back(general_pool[i]);
+          for (int i = d_si; i < d_ei; i++) pinned_pool.push_back(departure_pool[i]);
+        }
+
+        // Re-compute rows
         rows.clear(); row_pinned.clear(); row_leaving_soon.clear(); keys.clear(); deps.clear();
-        p_si = eff_pinned > 0 ? this->pinned_pager_.start_index((int)pinned_pool.size(), eff_pinned) : 0;
-        p_ei = eff_pinned > 0 ? this->pinned_pager_.end_index((int)pinned_pool.size(), eff_pinned) : 0;
         u_si = this->unpinned_pager_.start_index((int)unpinned_pool.size(), eff_unpinned);
         u_ei = this->unpinned_pager_.end_index((int)unpinned_pool.size(), eff_unpinned);
-        for (int i = p_si; i < p_ei; i++) {
+        for (int i = 0; i < (int)pinned_pool.size(); i++) {
           rows.push_back(pinned_pool[i]); row_pinned.push_back(true);
           auto it = this->pinned_routes_.find(pinned_pool[i].composite_key());
           bool ls = false;

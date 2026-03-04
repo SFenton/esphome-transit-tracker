@@ -143,15 +143,51 @@ TEST_SUITE("HScrollState") {
     hs.update_distance(80, true);  // total = 100
     CHECK(hs.total_distance == 100);
 
-    // After reset: first cycle has no dwell (scroll_phase=1000ms).
-    // Then start_time advances by 1000, standard cycles begin
-    // (scroll_phase=1000ms + dwell=3000ms = 4000ms each).
-    // To land in second cycle scroll phase at offset=50:
-    //   first cycle ends at t=1001, standard start_time=1001
-    //   t=1501: cycle_elapsed=500, offset=50, cycle_count=1+0=1
+    // Standard cycle: scroll_phase=1000ms, dwell=3000ms, total=4000ms.
+    // t=501: elapsed=500, offset=50, cycle_count=0 (in first scroll)
+    hs.compute(501);
+    CHECK(hs.offset == 50);
+    CHECK(hs.cycle_count == 0);
+
+    // t=1501: elapsed=1500, in first dwell, offset=0, cycle_count=1
     hs.compute(1501);
+    CHECK(hs.offset == 0);
+    CHECK(hs.cycle_count == 1);
+    CHECK(hs.idle);
+
+    // t=4501: elapsed=4500, in second scroll (4000+500), offset=50, cycle_count=1
+    hs.compute(4501);
     CHECK(hs.offset == 50);
     CHECK(hs.cycle_count == 1);
+  }
+
+  TEST_CASE("cycle_count increments at first dwell") {
+    // Verifies that cycle_count does not increment during the scroll phase
+    // and only increments when entering the dwell phase.
+    HScrollState hs;
+    hs.scroll_speed = 100;  // 100px/s
+    hs.reset(1);
+    hs.update_distance(80, true);  // total=100, scroll_phase=1000ms
+
+    // During first scroll phase: cycle_count = 0
+    hs.compute(501);  // 500ms into scroll
+    CHECK(hs.cycle_count == 0);
+    CHECK(hs.offset == 50);
+    CHECK(!hs.idle);
+
+    // In first dwell: cycle_count = 1
+    // Dwell starts at t=1001 (elapsed=1000 >= scroll_phase=1000)
+    hs.compute(1501);  // 500ms into first dwell
+    CHECK(hs.cycle_count == 1);
+    CHECK(hs.offset == 0);
+    CHECK(hs.idle);
+
+    // In second scroll: cycle_count still 1
+    // Second cycle starts at elapsed=4000 (4000ms cycle), i.e. t=4001
+    hs.compute(4501);  // 500ms into second scroll
+    CHECK(hs.cycle_count == 1);
+    CHECK(hs.offset == 50);
+    CHECK(!hs.idle);
   }
 
   TEST_CASE("wind-down: finishes cycle then stops") {
@@ -181,14 +217,18 @@ TEST_SUITE("HScrollState") {
     hs.scroll_speed = 100;
     hs.reset(1);
     hs.update_distance(80, true);  // total = 100
+
+    // Set pending speed AFTER the first compute (so offset > 0)
+    hs.compute(201);  // elapsed=200 => 20px, not near zero
+    CHECK(hs.offset == 20);
     hs.pending_speed = 200;
 
-    // Mid-scroll — pending not applied
-    hs.compute(201);  // elapsed=200 => 20px, not near zero
+    // Mid-scroll — pending not applied (offset > 0)
+    hs.compute(501);
     CHECK(hs.scroll_speed == 100);
 
-    // At cycle boundary — applied
-    hs.compute(1001);  // elapsed=1000 => 100px, 100 % 100 = 0 => near zero
+    // At dwell (cycle boundary) — applied
+    hs.compute(1501);  // in first dwell
     CHECK(hs.scroll_speed == 200);
     CHECK(hs.pending_speed == 0);
   }
@@ -860,20 +900,19 @@ TEST_SUITE("HScrollState — pin-change disruption") {
     hs.update_distance(80, true);
     CHECK(hs.total_distance == 100);
 
-    // Scroll to elapsed=750ms → 75px into first (no-dwell) cycle
+    // Scroll to elapsed=750ms, 75px into first scroll phase
     hs.compute(751);
     CHECK(hs.offset == 75);
 
-    // Now simulate pin change making headsign 7px narrower → width 73, total=93
+    // Now simulate pin change making headsign 7px narrower
     hs.update_distance(73, true);
     CHECK(hs.total_distance == 93);
 
     // At elapsed=1000ms with new dist 93:
-    // scroll_phase_ms = 930. First no-dwell cycle ends at elapsed=930.
-    // start_time advances to 931, standard timing begins.
-    // elapsed from 931 = 70ms, offset = 7px (in second cycle scroll phase).
+    // scroll_phase_ms = 930. Elapsed=1000 >= 930, in dwell.
     hs.compute(1001);
-    CHECK(hs.offset == 7);
+    CHECK(hs.offset == 0);
+    CHECK(hs.idle);
   }
 
   TEST_CASE("stable total_distance means smooth scrolling across cycles") {
@@ -882,12 +921,13 @@ TEST_SUITE("HScrollState — pin-change disruption") {
     hs.reset(0);
     hs.update_distance(80, true);  // total=100
 
-    // Sample many frames — offset should increase monotonically within a cycle
+    // Sample many frames — offset should increase monotonically within each
+    // scroll phase, and be 0 during dwell.
     int prev_offset = -1;
     int prev_cycle = 0;
-    for (unsigned long t = 0; t <= 2500; t += 50) {
+    for (unsigned long t = 0; t <= 10000; t += 50) {
       hs.compute(t);
-      if (hs.cycle_count == prev_cycle) {
+      if (hs.cycle_count == prev_cycle && !hs.idle) {
         CHECK(hs.offset >= prev_offset);
       }
       prev_offset = hs.offset;
@@ -965,10 +1005,233 @@ TEST_SUITE("HScrollState — pin-change disruption") {
 }
 
 // =====================================================================
+// HScrollState — page-rotation regression
+//
+// Regression tests for the bug where page pagers triggered immediately
+// after every transition, causing an infinite rapid-fire collapse/expand
+// loop. The root cause was skip_first_dwell incrementing cycle_count at
+// its boundary. The fix removed skip_first_dwell entirely so that all
+// cycles are standard (scroll + dwell) from the start.
+// =====================================================================
+
+TEST_SUITE("HScrollState — page-rotation regression") {
+
+  TEST_CASE("cycle_count stays 0 through first scroll phase") {
+    HScrollState hs;
+    hs.scroll_speed = 30;  // realistic speed: 30px/s
+    hs.reset(1);
+    hs.update_distance(134, true);  // total = 154, scroll_phase = 5133ms
+
+    // Sample throughout the first scroll phase — cycle_count must be 0
+    for (unsigned long t = 1; t < 5133; t += 200) {
+      hs.compute(t);
+      CHECK(hs.cycle_count == 0);
+    }
+    CHECK(!hs.idle);
+  }
+
+  TEST_CASE("cycle_count increments to 1 at first dwell") {
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);
+    hs.update_distance(80, true);  // total=100, scroll_phase=1000ms
+
+    // Just before dwell
+    hs.compute(990);
+    CHECK(hs.cycle_count == 0);
+    CHECK(!hs.idle);
+
+    // Just into dwell (elapsed=1000 >= scroll_phase=1000)
+    hs.compute(1050);
+    CHECK(hs.cycle_count == 1);
+    CHECK(hs.idle);
+    CHECK(hs.offset == 0);
+  }
+
+  TEST_CASE("simulated page pager fires at first dwell, not before") {
+    // Simulates the exact condition that caused the infinite loop:
+    // pager.last_cycle_count = 0 (set at POST_PAUSE→IDLE),
+    // then h-scroll starts.  Page must NOT trigger until the first dwell.
+    HScrollState hs;
+    hs.scroll_speed = 30;  // 30px/s (realistic)
+    hs.reset(1);
+    hs.update_distance(134, true);  // total=154, scroll_phase=5133ms
+
+    int pager_last_cycle_count = 0;
+    bool page_triggered_during_scroll = false;
+    bool page_triggered_at_dwell = false;
+
+    // scroll: 1..5134, dwell: 5134..8134
+    for (unsigned long t = 1; t <= 9000; t += 50) {
+      hs.compute(t);
+      bool page_due = hs.idle && hs.cycle_count > pager_last_cycle_count;
+
+      if (page_due) {
+        if (t <= 5134) {
+          page_triggered_during_scroll = true;
+        } else {
+          page_triggered_at_dwell = true;
+          break;
+        }
+      }
+    }
+
+    CHECK(!page_triggered_during_scroll);
+    CHECK(page_triggered_at_dwell);
+  }
+
+  TEST_CASE("cycle_count accumulates correctly across multiple cycles") {
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);
+    hs.update_distance(80, true);  // total=100
+
+    // Standard cycles (scroll+dwell): each 1000+3000 = 4000ms
+    //   cycle 0: scroll 1..1001, dwell 1001..4001 → cycle_count=1
+    //   cycle 1: scroll 4001..5001, dwell 5001..8001 → cycle_count=2
+    //   cycle 2: scroll 8001..9001, dwell 9001..12001 → cycle_count=3
+
+    hs.compute(1500);  // first dwell
+    CHECK(hs.cycle_count == 1);
+
+    hs.compute(4500);  // second scroll
+    CHECK(hs.cycle_count == 1);
+
+    hs.compute(5500);  // second dwell
+    CHECK(hs.cycle_count == 2);
+
+    hs.compute(9500);  // third dwell
+    CHECK(hs.cycle_count == 3);
+  }
+
+  TEST_CASE("no double-scroll after transition") {
+    // Verifies that after reset, the first scroll phase transitions
+    // to a dwell (not another scroll), preventing the old double-scroll
+    // artifact that skip_first_dwell caused.
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);
+    hs.update_distance(80, true);  // total=100, scroll_phase=1000ms
+
+    // End of first scroll (offset near max)
+    hs.compute(950);
+    CHECK(hs.offset >= 90);
+    CHECK(hs.cycle_count == 0);
+
+    // Immediately after scroll_phase, we're in dwell (not another scroll)
+    hs.compute(1100);
+    CHECK(hs.offset == 0);   // at home position
+    CHECK(hs.idle);           // in dwell
+    CHECK(hs.cycle_count == 1);
+  }
+
+  TEST_CASE("wind-down clears at first dwell") {
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);
+    hs.update_distance(80, true);  // total=100
+
+    // Scroll halfway
+    hs.compute(501);
+    CHECK(hs.offset == 50);
+
+    // Remove overflow (triggers wind-down)
+    hs.update_distance(0, false);
+    CHECK(hs.total_distance == 0);
+    CHECK(hs.prev_total_distance == 100);
+
+    // At dwell: wind-down clears prev_total_distance
+    hs.compute(1501);  // in first dwell
+    CHECK(hs.idle);
+    CHECK(hs.prev_total_distance == 0);
+  }
+
+  TEST_CASE("pending speed applied at home position before first scroll") {
+    // On reboot, configured speed arrives as pending_speed after reset.
+    // It should be applied before the first scroll begins.
+    HScrollState hs;
+    hs.scroll_speed = 10;  // default
+    hs.reset(1);
+    hs.update_distance(80, true);  // total=100
+    hs.pending_speed = 30;
+
+    // First compute: offset==0, so pending_speed applied immediately
+    hs.compute(1);
+    CHECK(hs.scroll_speed == 30);
+    CHECK(hs.pending_speed == 0);
+
+    // Subsequent scrolling uses the correct speed
+    hs.compute(501);  // elapsed=500ms at 30px/s = 15px
+    CHECK(hs.offset == 15);
+  }
+
+  TEST_CASE("pending speed not applied mid-scroll") {
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    hs.reset(1);
+    hs.update_distance(80, true);
+
+    // Start scrolling
+    hs.compute(201);  // offset=20
+    CHECK(hs.offset == 20);
+
+    // Set pending speed mid-scroll
+    hs.pending_speed = 50;
+
+    // Next compute: offset > 0, so pending_speed NOT applied
+    hs.compute(301);
+    CHECK(hs.scroll_speed == 100);  // unchanged
+    CHECK(hs.pending_speed == 50);  // still pending
+
+    // Applied at dwell
+    hs.compute(1501);
+    CHECK(hs.scroll_speed == 50);
+  }
+}
+
+// =====================================================================
 // HScrollState — deferred start
 // =====================================================================
 
 TEST_SUITE("HScrollState — deferred start") {
+  TEST_CASE("first overflow on boot defers with 3s dwell") {
+    // On boot, the very first schedule arrival causes overflow.
+    // This triggers a 3s deferred start (kScrollCycleDwellMs) so the
+    // user can read the initial display before scrolling begins.
+    HScrollState hs;
+    hs.scroll_speed = 100;
+    // No reset() called — simulating fresh struct as component would see it
+    // before any transition has occurred.
+    hs.compute(1);  // init start_time
+
+    // First overflow appears (first schedule arrives)
+    hs.update_distance(80, true);  // total=100
+    CHECK(hs.total_distance == 100);
+    CHECK(hs.deferred_start);  // deferred — 3s dwell before scrolling
+
+    // First compute after deferred_start sets deferred_since.
+    // compute(100): deferred_since=100, dwell ends at 100+3000=3100
+    hs.compute(100);
+    CHECK(hs.offset == 0);
+    CHECK(hs.idle);
+
+    // Still dwelling at t=3099
+    hs.compute(3099);
+    CHECK(hs.offset == 0);
+    CHECK(hs.idle);
+    CHECK(hs.deferred_start);
+
+    // Dwell ends at t=3100
+    hs.compute(3100);
+    CHECK(!hs.deferred_start);
+    CHECK(hs.offset == 0);  // start_time was just set
+
+    // Scrolling begins
+    hs.compute(3200);
+    CHECK(hs.offset == 10);  // 100ms at 100px/s
+    CHECK(!hs.idle);
+  }
+
   TEST_CASE("overflow appearing while fully idle defers scrolling") {
     // Simulates: headsign fit, then Wi-Fi icon shrinks available space
     HScrollState hs;
@@ -989,8 +1252,8 @@ TEST_SUITE("HScrollState — deferred start") {
     CHECK(hs.deferred_start);
 
     // First compute after deferred_start sets deferred_since = 5100
-    // Dwell duration = dist * 1000 / speed = 100 * 1000 / 100 = 1000ms
-    // So dwell ends at 5100 + 1000 = 6100
+    // Dwell duration = kScrollCycleDwellMs = 3000ms
+    // So dwell ends at 5100 + 3000 = 8100
     hs.compute(5100);
     CHECK(hs.offset == 0);
     CHECK(hs.idle);
@@ -999,19 +1262,19 @@ TEST_SUITE("HScrollState — deferred start") {
     CHECK(hs.offset == 0);
     CHECK(hs.idle);
 
-    // Still dwelling at t=6099 (just before dwell ends)
-    hs.compute(6099);
+    // Still dwelling at t=8099 (just before dwell ends)
+    hs.compute(8099);
     CHECK(hs.offset == 0);
     CHECK(hs.idle);
     CHECK(hs.deferred_start);
 
-    // At t=6100, dwell ends → scrolling begins from offset 0
-    hs.compute(6100);
+    // At t=8100, dwell ends → scrolling begins from offset 0
+    hs.compute(8100);
     CHECK(!hs.deferred_start);
-    CHECK(hs.offset == 0);  // start_time was just set to 6100
+    CHECK(hs.offset == 0);  // start_time was just set to 8100
 
-    // At t=6200, scrolling is underway: 100ms * 100px/s = 10px
-    hs.compute(6200);
+    // At t=8200, scrolling is underway: 100ms * 100px/s = 10px
+    hs.compute(8200);
     CHECK(hs.offset == 10);
     CHECK(!hs.idle);
   }
@@ -1104,9 +1367,9 @@ TEST_SUITE("HScrollState — deferred start") {
     CHECK(hs.offset > 0);
   }
 
-  TEST_CASE("dwell duration scales with distance and speed") {
+  TEST_CASE("dwell duration is always 3s (kScrollCycleDwellMs)") {
     HScrollState hs;
-    hs.scroll_speed = 50;  // slower
+    hs.scroll_speed = 50;  // slower — but dwell is fixed 3s regardless
     hs.compute(1);  // init start_time
     hs.update_distance(0, false);
     hs.compute(1000);
@@ -1115,20 +1378,20 @@ TEST_SUITE("HScrollState — deferred start") {
     CHECK(hs.deferred_start);
 
     // First compute sets deferred_since=1100
-    // Dwell = 100 * 1000 / 50 = 2000ms → ends at 1100+2000=3100
+    // Dwell = kScrollCycleDwellMs = 3000ms → ends at 1100+3000=4100
     hs.compute(1100);
     CHECK(hs.deferred_start);
     CHECK(hs.offset == 0);
 
-    hs.compute(3099);
+    hs.compute(4099);
     CHECK(hs.deferred_start);
 
-    hs.compute(3100);
+    hs.compute(4100);
     CHECK(!hs.deferred_start);
-    CHECK(hs.offset == 0);  // start_time just set to 3100
+    CHECK(hs.offset == 0);  // start_time just set to 4100
 
-    // Now scrolling at 50px/s: at t=3300, elapsed=200ms → 10px
-    hs.compute(3300);
+    // Now scrolling at 50px/s: at t=4300, elapsed=200ms → 10px
+    hs.compute(4300);
     CHECK(hs.offset == 10);
   }
 
@@ -1143,21 +1406,21 @@ TEST_SUITE("HScrollState — deferred start") {
     hs.update_distance(80, true);
     CHECK(hs.deferred_start);
 
-    // First compute sets deferred_since=1100, dwell=1000ms, ends at 2100
+    // First compute sets deferred_since=1100, dwell=3000ms, ends at 4100
     hs.compute(1100);
     CHECK(hs.deferred_start);
-    hs.compute(2100);
+    hs.compute(4100);
     CHECK(!hs.deferred_start);
 
-    // Scroll phase completes at 2100+1000=3100 (enters dwell)
-    // start_time was set to 2100, scroll_phase_ms=1000, cycle_total_ms=4000
-    hs.compute(3100);
+    // Scroll phase completes at 4100+1000=5100 (enters dwell)
+    // start_time was set to 4100, scroll_phase_ms=1000, cycle_total_ms=4000
+    hs.compute(5100);
     CHECK(hs.idle);
 
     // Remove overflow — wind-down
     hs.update_distance(0, false);
     // In dwell phase — wind-down clears prev_total_distance immediately
-    hs.compute(3101);
+    hs.compute(5101);
     CHECK(hs.prev_total_distance == 0);
 
     // Second overflow → should defer again (fully idle)
@@ -1515,12 +1778,12 @@ TEST_SUITE("Multi-frame integration") {
     hs.compute(501);
     CHECK(hs.offset == offset_before);
 
-    // If width changes (wrong inset used), after reset the first cycle
-    // has no dwell, so the scroll wraps into the next cycle.
+    // If width changes (wrong inset used), it shifts scroll_phase_ms.
+    // With standard cycles, the change takes effect immediately.
     hs.update_distance(73, true);  // total=93 (bug scenario)
-    hs.compute(1001);  // elapsed=1000, scroll_phase=930 → first cycle ends,
-                       // enters second cycle at offset=7
-    CHECK(hs.offset == 7);
+    hs.compute(1001);  // elapsed=1000, scroll_phase=930 → in dwell (idle)
+    CHECK(hs.offset == 0);
+    CHECK(hs.idle);
   }
 }
 
@@ -2346,5 +2609,1095 @@ TEST_SUITE("PinnedLeavingSoon") {
     tr.old_is_leaving_soon = {true, false};
     tr.reset();
     CHECK(tr.old_is_leaving_soon.empty());
+  }
+}
+
+// =====================================================================
+// Split-Pin Layout — general vs departure pin allocation
+// =====================================================================
+
+// Helper that mirrors draw_schedule steps 4, 4b, 4c: partition visible trips
+// into pinned-first order, split into general/departure pools, and compute
+// effective row counts for each sub-section.
+struct SplitPinResult {
+  std::vector<Trip> general_pool;    // PIN_GENERAL, or PIN_BOTH when NOT leaving soon
+  std::vector<Trip> departure_pool;  // PIN_LEAVING_SOON, or PIN_BOTH when leaving soon
+  std::vector<Trip> pinned_pool;     // combined: general first, then departure
+  std::vector<Trip> unpinned_pool;
+  int actual_pinned;
+  int eff_pinned;
+  int eff_general;
+  int eff_departure;
+  int eff_unpinned;
+  bool has_pin_split;
+};
+
+static SplitPinResult split_pin_partition(
+    std::vector<Trip> visible,
+    const std::map<std::string, PinMode> &pinned_routes,
+    unsigned int rtc_now,
+    int threshold_min,
+    int pinned_rows_count,
+    int general_pins_count,
+    int limit) {
+
+  int threshold_sec = threshold_min * 60;
+  int actual_pinned = 0;
+
+  if (!pinned_routes.empty()) {
+    std::stable_partition(visible.begin(), visible.end(),
+      [&](const Trip &t) {
+        auto it = pinned_routes.find(t.composite_key());
+        if (it == pinned_routes.end()) return false;
+        switch (it->second) {
+          case PIN_GENERAL: case PIN_BOTH: return true;
+          case PIN_LEAVING_SOON:
+            return (int)(t.departure_time - rtc_now) < threshold_sec;
+          default: return false;
+        }
+      });
+    for (const auto &t : visible) {
+      auto it = pinned_routes.find(t.composite_key());
+      if (it == pinned_routes.end()) break;
+      bool eff = false;
+      switch (it->second) {
+        case PIN_GENERAL: case PIN_BOTH: eff = true; break;
+        case PIN_LEAVING_SOON:
+          eff = (int)(t.departure_time - rtc_now) < threshold_sec; break;
+        default: break;
+      }
+      if (!eff) break;
+      actual_pinned++;
+    }
+    dedup_pinned_section(visible, actual_pinned);
+  }
+
+  // Split into general and departure pools
+  std::vector<Trip> general_pool;
+  std::vector<Trip> departure_pool;
+  for (int i = 0; i < actual_pinned; i++) {
+    const auto &t = visible[i];
+    auto it = pinned_routes.find(t.composite_key());
+    if (it == pinned_routes.end()) continue;
+    int secs_until = (int)(t.departure_time - rtc_now);
+    bool leaving_soon = (secs_until < threshold_sec);
+    switch (it->second) {
+      case PIN_GENERAL: general_pool.push_back(t); break;
+      case PIN_LEAVING_SOON: departure_pool.push_back(t); break;
+      case PIN_BOTH:
+        if (leaving_soon) departure_pool.push_back(t);
+        else general_pool.push_back(t);
+        break;
+      default: break;
+    }
+  }
+
+  bool has_pin_split = (general_pool.size() > 0 && departure_pool.size() > 0);
+
+  int eff_pinned;
+  int eff_general = 0;
+  int eff_departure = 0;
+  if (actual_pinned > 0) {
+    eff_pinned = std::min(pinned_rows_count, actual_pinned);
+    if (has_pin_split) {
+      if (eff_pinned < 2) eff_pinned = std::min(2, limit - 1);
+      int gen_want = std::min(general_pins_count, eff_pinned - 1);
+      eff_general = std::min(gen_want, (int)general_pool.size());
+      int dep_slots = eff_pinned - eff_general;
+      eff_departure = std::min(dep_slots, (int)departure_pool.size());
+      int surplus = dep_slots - eff_departure;
+      if (surplus > 0) {
+        int extra = std::min(surplus, (int)general_pool.size() - eff_general);
+        eff_general += extra;
+      }
+      eff_pinned = eff_general + eff_departure;
+    } else {
+      // Single pin type — at most 1 pinned row; multi-row is only for splits
+      eff_pinned = std::min(1, actual_pinned);
+    }
+  } else {
+    eff_pinned = 0;
+  }
+  int eff_unpinned = limit - eff_pinned;
+
+  // Build combined pool
+  std::vector<Trip> pinned_pool;
+  for (int i = 0; i < eff_general; i++) pinned_pool.push_back(general_pool[i]);
+  for (int i = 0; i < eff_departure; i++) pinned_pool.push_back(departure_pool[i]);
+  if (!has_pin_split && actual_pinned > 0) {
+    pinned_pool.clear();
+    for (int i = 0; i < std::min(actual_pinned, eff_pinned); i++)
+      pinned_pool.push_back(visible[i]);
+  }
+  std::vector<Trip> unpinned_pool(visible.begin() + actual_pinned, visible.end());
+
+  return {general_pool, departure_pool, pinned_pool, unpinned_pool,
+          actual_pinned, eff_pinned, eff_general, eff_departure,
+          eff_unpinned, has_pin_split};
+}
+
+TEST_SUITE("SplitPinLayout") {
+
+  // ---- has_pin_split detection ----
+
+  TEST_CASE("no pinned routes — no split, all unpinned") {
+    std::map<std::string, PinMode> pins;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", 1300), make_trip("R2", "B", 1400)},
+        pins, 1000, 10, /*pinned_rows=*/1, /*general_pins=*/1, /*limit=*/3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 0);
+    CHECK(r.eff_unpinned == 3);
+    CHECK(r.pinned_pool.empty());
+    CHECK(r.unpinned_pool.size() == 2);
+  }
+
+  TEST_CASE("only PIN_GENERAL — no split") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_GENERAL}};
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", 2800), make_trip("R2", "B", 2900)},
+        pins, 1000, 10, 1, 1, 3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 1);
+    CHECK(r.eff_unpinned == 2);
+    CHECK(r.general_pool.size() == 1);
+    CHECK(r.departure_pool.empty());
+  }
+
+  TEST_CASE("only PIN_LEAVING_SOON (inside threshold) — no split") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_LEAVING_SOON}};
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", 1300), make_trip("R2", "B", 2900)},
+        pins, 1000, 10, 1, 1, 3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 1);
+    CHECK(r.departure_pool.size() == 1);
+    CHECK(r.general_pool.empty());
+  }
+
+  TEST_CASE("PIN_BOTH outside threshold — general only, no split") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_BOTH}};
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", 2800)},
+        pins, 1000, 10, 1, 1, 3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.general_pool.size() == 1);
+    CHECK(r.departure_pool.empty());
+  }
+
+  TEST_CASE("PIN_BOTH inside threshold — departure only, no split") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_BOTH}};
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", 1300)},
+        pins, 1000, 10, 1, 1, 3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.departure_pool.size() == 1);
+    CHECK(r.general_pool.empty());
+  }
+
+  // ---- Split detection: both types present ----
+
+  TEST_CASE("PIN_GENERAL + PIN_LEAVING_SOON (inside) — split active") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800), make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, 1, 1, 3);
+    CHECK(r.has_pin_split);
+    CHECK(r.general_pool.size() == 1);
+    CHECK(r.departure_pool.size() == 1);
+  }
+
+  TEST_CASE("PIN_GENERAL + PIN_LEAVING_SOON (outside) — no split, only general") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800), make_trip("R2", "B", now + 900)},
+        pins, now, 10, 1, 1, 3);
+    CHECK(!r.has_pin_split);  // R2 outside threshold → unpinned
+    CHECK(r.general_pool.size() == 1);
+    CHECK(r.departure_pool.empty());
+  }
+
+  TEST_CASE("PIN_BOTH — one inside, one outside threshold — split active") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_BOTH},
+        {"R2:B", PIN_BOTH},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 300),   // 5 min, inside → departure
+         make_trip("R2", "B", now + 1800)}, // 30 min, outside → general
+        pins, now, 10, 1, 1, 3);
+    CHECK(r.has_pin_split);
+    CHECK(r.general_pool.size() == 1);
+    CHECK(r.general_pool[0].route_id == "R2");
+    CHECK(r.departure_pool.size() == 1);
+    CHECK(r.departure_pool[0].route_id == "R1");
+  }
+
+  // ---- Auto-bump to 2 pinned rows ----
+
+  TEST_CASE("split with pinned_rows=1 auto-bumps to 2") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800), make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, /*pinned_rows=*/1, /*general_pins=*/1, /*limit=*/3);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 2);  // auto-bumped from 1 to 2
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 1);
+  }
+
+  TEST_CASE("split with pinned_rows=2 stays at 2") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800), make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/1, /*limit=*/3);
+    CHECK(r.eff_pinned == 2);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+  }
+
+  TEST_CASE("auto-bump capped at limit-1 when limit=2") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800), make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, /*pinned_rows=*/1, /*general_pins=*/1, /*limit=*/2);
+    // limit=2, so auto-bump: min(2, limit-1=1) = 1
+    // gen_want=min(1,0)=0, eff_general=0, dep_slots=1, eff_departure=1
+    CHECK(r.eff_pinned == 1);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_general == 0);
+    CHECK(r.eff_unpinned == 1);
+  }
+
+  // ---- general_pins_count allocation ----
+
+  TEST_CASE("general_pins_count=1, 3 pinned rows — 1 general, 2 departure slots") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+        {"R3:C", PIN_LEAVING_SOON},
+        {"R4:D", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 300),
+         make_trip("R4", "D", now + 400),
+         make_trip("R5", "E", now + 500)},
+        pins, now, 10, /*pinned_rows=*/3, /*general_pins=*/1, /*limit=*/5);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 3);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 2);
+    CHECK(r.eff_unpinned == 2);
+  }
+
+  TEST_CASE("general_pins_count=2, 3 pinned rows — 2 general, 1 departure") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+        {"R3:C", PIN_LEAVING_SOON},
+        {"R4:D", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 300),
+         make_trip("R4", "D", now + 400),
+         make_trip("R5", "E", now + 500)},
+        pins, now, 10, /*pinned_rows=*/3, /*general_pins=*/2, /*limit=*/5);
+    CHECK(r.eff_pinned == 3);
+    CHECK(r.eff_general == 2);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 2);
+  }
+
+  TEST_CASE("general_pins_count capped at eff_pinned-1 to leave room for departure") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+        {"R3:C", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 300),
+         make_trip("R4", "D", now + 400)},
+        pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/5, /*limit=*/4);
+    // gen_want = min(5, 2-1) = 1; eff_general = min(1, 2) = 1
+    CHECK(r.eff_pinned == 2);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+  }
+
+  // ---- Fill-up / shrink to actual ----
+
+  TEST_CASE("3 pinned rows but only 1 general + 1 departure — shows 2 pinned") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, /*pinned_rows=*/3, /*general_pins=*/1, /*limit=*/4);
+    // Only 2 actual pins → shrink
+    CHECK(r.eff_pinned == 2);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 2);
+  }
+
+  TEST_CASE("surplus departure slots given back to general") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+        {"R3:C", PIN_GENERAL},
+        {"R4:D", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 2000),
+         make_trip("R4", "D", now + 300),
+         make_trip("R5", "E", now + 400)},
+        pins, now, 10, /*pinned_rows=*/3, /*general_pins=*/1, /*limit=*/5);
+    // gen_want=1, eff_general=1, dep_slots=2, eff_departure=1
+    // surplus=1, extra=min(1, 3-1)=1 → eff_general=2
+    CHECK(r.eff_pinned == 3);
+    CHECK(r.eff_general == 2);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 2);
+  }
+
+  // ---- Priority ordering: general first, then departure ----
+
+  TEST_CASE("pinned pool order: general first, then departure") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_LEAVING_SOON},
+        {"R2:B", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 300),   // departure pin
+         make_trip("R2", "B", now + 1800),  // general pin
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, 2, 1, 3);
+    CHECK(r.has_pin_split);
+    CHECK(r.pinned_pool.size() == 2);
+    CHECK(r.pinned_pool[0].route_id == "R2");  // general first
+    CHECK(r.pinned_pool[1].route_id == "R1");  // departure second
+  }
+
+  TEST_CASE("pinned pool order: multiple general then multiple departure") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+        {"R3:C", PIN_LEAVING_SOON},
+        {"R4:D", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 300),
+         make_trip("R4", "D", now + 400),
+         make_trip("R5", "E", now + 500)},
+        pins, now, 10, 4, 2, 5);
+    CHECK(r.pinned_pool.size() == 4);
+    CHECK(r.pinned_pool[0].route_id == "R1");  // general
+    CHECK(r.pinned_pool[1].route_id == "R2");  // general
+    CHECK(r.pinned_pool[2].route_id == "R3");  // departure
+    CHECK(r.pinned_pool[3].route_id == "R4");  // departure
+  }
+
+  // ---- No split fallback: original behavior ----
+
+  TEST_CASE("no split — pinned_pool uses original visible order, capped at 1") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, 2, 1, 3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 1);  // capped at 1 when no split
+    CHECK(r.pinned_pool.size() == 1);
+    CHECK(r.pinned_pool[0].route_id == "R1");
+  }
+
+  // ---- PIN_BOTH dynamic movement ----
+
+  TEST_CASE("PIN_BOTH transitions from general to departure as time passes") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_BOTH},
+        {"R2:B", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    int threshold = 10;
+
+    // Time 1: R1 at 20 min → general (red)
+    auto r1 = split_pin_partition(
+        {make_trip("R1", "A", now + 1200), make_trip("R2", "B", now + 1800),
+         make_trip("R3", "C", now + 400)},
+        pins, now, threshold, 2, 1, 3);
+    CHECK(!r1.has_pin_split);  // both in general
+    CHECK(r1.general_pool.size() == 2);
+    CHECK(r1.departure_pool.empty());
+
+    // Time 2: R1 now at 5 min → departure (green), R2 still general → split!
+    auto r2 = split_pin_partition(
+        {make_trip("R1", "A", now + 300), make_trip("R2", "B", now + 1800),
+         make_trip("R3", "C", now + 400)},
+        pins, now, threshold, 2, 1, 3);
+    CHECK(r2.has_pin_split);
+    CHECK(r2.general_pool.size() == 1);
+    CHECK(r2.general_pool[0].route_id == "R2");
+    CHECK(r2.departure_pool.size() == 1);
+    CHECK(r2.departure_pool[0].route_id == "R1");
+  }
+
+  // ---- Edge cases ----
+
+  TEST_CASE("all pinned leaving soon — no general at all, no split") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_LEAVING_SOON},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 300), make_trip("R2", "B", now + 400)},
+        pins, now, 10, 2, 1, 3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.general_pool.empty());
+    CHECK(r.departure_pool.size() == 2);
+    CHECK(r.eff_pinned == 1);  // capped at 1 when no split
+  }
+
+  TEST_CASE("all pinned general — no departure, no split") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800), make_trip("R2", "B", now + 1900)},
+        pins, now, 10, 2, 1, 3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.general_pool.size() == 2);
+    CHECK(r.departure_pool.empty());
+  }
+
+  TEST_CASE("single trip with PIN_BOTH straddles threshold — no split possible") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_BOTH}};
+    unsigned int now = 1000;
+    // Inside threshold — goes to departure only
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 300)},
+        pins, now, 10, 1, 1, 3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.departure_pool.size() == 1);
+    CHECK(r.general_pool.empty());
+    CHECK(r.eff_pinned == 1);
+  }
+
+  TEST_CASE("limit=2 with split — can only auto-bump to 1") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800), make_trip("R2", "B", now + 300)},
+        pins, now, 10, 1, 1, 2);
+    // auto-bump: min(2, limit-1=1) = 1
+    // gen_want=min(1,0)=0, dep_slots=1, eff_departure=1
+    CHECK(r.eff_pinned == 1);
+    CHECK(r.eff_general == 0);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 1);
+  }
+
+  TEST_CASE("many general, few departure — surplus fills general") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+        {"R3:C", PIN_GENERAL},
+        {"R4:D", PIN_GENERAL},
+        {"R5:E", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 2000),
+         make_trip("R4", "D", now + 2100),
+         make_trip("R5", "E", now + 300),
+         make_trip("R6", "F", now + 400)},
+        pins, now, 10, /*pinned_rows=*/4, /*general_pins=*/1, /*limit=*/6);
+    // gen_want=1, eff_general=1, dep_slots=3, eff_departure=min(3,1)=1
+    // surplus=2, extra=min(2, 4-1)=2 → eff_general=3
+    CHECK(r.eff_pinned == 4);
+    CHECK(r.eff_general == 3);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 2);
+  }
+
+  TEST_CASE("many departure, few general — departure fills remaining slots") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+        {"R3:C", PIN_LEAVING_SOON},
+        {"R4:D", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400),
+         make_trip("R4", "D", now + 500),
+         make_trip("R5", "E", now + 600)},
+        pins, now, 10, /*pinned_rows=*/4, /*general_pins=*/1, /*limit=*/5);
+    CHECK(r.eff_pinned == 4);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 3);
+    CHECK(r.eff_unpinned == 1);
+  }
+
+  TEST_CASE("pinned_rows larger than actual pins — shrinks to actual") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400),
+         make_trip("R4", "D", now + 500)},
+        pins, now, 10, /*pinned_rows=*/5, /*general_pins=*/1, /*limit=*/6);
+    CHECK(r.eff_pinned == 2);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 4);
+  }
+
+  // ---- Setter bounds ----
+
+  TEST_CASE("general_pins_count minimum is 1") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800), make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, 2, /*general_pins=*/1, 3);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+  }
+
+  // ---- Real-world scenario: the user's example ----
+
+  TEST_CASE("real scenario: 3 rows, 1 general + 1 departure, gen_pins=1") {
+    std::map<std::string, PinMode> pins = {
+        {"A:Downtown", PIN_GENERAL},
+        {"B:Airport", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("A", "Downtown", now + 1800),
+         make_trip("B", "Airport", now + 300),
+         make_trip("C", "Mall", now + 400),
+         make_trip("D", "Park", now + 500)},
+        pins, now, 10, /*pinned_rows=*/1, /*general_pins=*/1, /*limit=*/3);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 2);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 1);
+    CHECK(r.pinned_pool[0].route_id == "A");   // general first
+    CHECK(r.pinned_pool[1].route_id == "B");   // departure second
+    CHECK(r.unpinned_pool[0].route_id == "C");
+  }
+
+  TEST_CASE("real scenario: B not yet leaving soon — no split, 1 pinned row") {
+    std::map<std::string, PinMode> pins = {
+        {"A:Downtown", PIN_GENERAL},
+        {"B:Airport", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("A", "Downtown", now + 1800),
+         make_trip("B", "Airport", now + 900),  // 15 min, outside 10
+         make_trip("C", "Mall", now + 400)},
+        pins, now, 10, 1, 1, 3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 1);
+    CHECK(r.eff_unpinned == 2);
+    CHECK(r.pinned_pool[0].route_id == "A");
+  }
+
+  // ---- Dedup interaction ----
+
+  TEST_CASE("dedup within split: duplicate general keys are deduped before splitting") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R1", "A", now + 2000),  // duplicate
+         make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, 2, 1, 4);
+    // After dedup: only 1 R1:A and 1 R2:B in pinned
+    CHECK(r.actual_pinned == 2);
+    CHECK(r.general_pool.size() == 1);
+    CHECK(r.departure_pool.size() == 1);
+  }
+
+  // ---- Cap-at-1 for non-split (bug fix) ----
+
+  TEST_CASE("bug: two green pins with pinned_rows=2 — capped at 1 row") {
+    // The original bug: PIN_BOTH routes all leaving soon, pinned_rows=2,
+    // showed 2 rows. Should only show 1 when no split.
+    std::map<std::string, PinMode> pins = {
+        {"R1:A:S1", PIN_BOTH},
+        {"R1:A:S2", PIN_BOTH},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 300, false, "S1"),   // green
+         make_trip("R1", "A", now + 400, false, "S2"),   // green
+         make_trip("R2", "B", now + 500)},
+        pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/1, /*limit=*/3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.departure_pool.size() == 2);
+    CHECK(r.general_pool.empty());
+    CHECK(r.eff_pinned == 1);  // capped at 1, not 2
+    CHECK(r.eff_unpinned == 2);
+  }
+
+  TEST_CASE("two red pins with pinned_rows=2 — capped at 1 row") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/1, /*limit=*/3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 1);  // capped at 1
+    CHECK(r.eff_unpinned == 2);
+  }
+
+  TEST_CASE("split active with pinned_rows=2 — uses full allocation") {
+    // Contrast: when split IS active, pinned_rows=2 gives 2 rows
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/1, /*limit=*/3);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 2);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+  }
+
+  TEST_CASE("PIN_BOTH all leaving soon with pinned_rows=1 — still 1 row") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_BOTH},
+        {"R2:B", PIN_BOTH},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 300),
+         make_trip("R2", "B", now + 400),
+         make_trip("R3", "C", now + 500)},
+        pins, now, 10, /*pinned_rows=*/1, /*general_pins=*/1, /*limit=*/3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 1);
+    CHECK(r.pinned_pool.size() == 1);
+  }
+}
+
+// =====================================================================
+// Split-pin paging — verify ScrollContainer pages correctly
+// over both general and departure sub-pools in split mode
+// =====================================================================
+
+TEST_SUITE("SplitPinPaging") {
+
+  // Helper: simulates the split-mode paging logic from draw_schedule.
+  // Uses pinned_pager_ for general and departure_pager_ for departure.
+  struct SplitPagingFrame {
+    std::vector<Trip> pinned_pool;
+    std::vector<Trip> unpinned_pool;
+  };
+
+  static SplitPagingFrame build_split_frame(
+      const SplitPinResult &r,
+      ScrollContainer &gen_pager, ScrollContainer &dep_pager) {
+    SplitPagingFrame f;
+    if (r.has_pin_split) {
+      gen_pager.clamp((int)r.general_pool.size(), r.eff_general);
+      dep_pager.clamp((int)r.departure_pool.size(), r.eff_departure);
+      int g_si = gen_pager.start_index((int)r.general_pool.size(), r.eff_general);
+      int g_ei = gen_pager.end_index((int)r.general_pool.size(), r.eff_general);
+      int d_si = dep_pager.start_index((int)r.departure_pool.size(), r.eff_departure);
+      int d_ei = dep_pager.end_index((int)r.departure_pool.size(), r.eff_departure);
+      for (int i = g_si; i < g_ei; i++)
+        f.pinned_pool.push_back(r.general_pool[i]);
+      for (int i = d_si; i < d_ei; i++)
+        f.pinned_pool.push_back(r.departure_pool[i]);
+    } else if (r.eff_pinned > 0) {
+      f.pinned_pool = r.pinned_pool;
+    }
+    f.unpinned_pool = r.unpinned_pool;
+    return f;
+  }
+
+  // Helper to advance both pagers together (mirrors draw_schedule behavior)
+  static void advance_both(const SplitPinResult &r,
+                            ScrollContainer &gen_pager, ScrollContainer &dep_pager) {
+    gen_pager.advance_page((int)r.general_pool.size(), r.eff_general);
+    dep_pager.advance_page((int)r.departure_pool.size(), r.eff_departure);
+  }
+
+  TEST_CASE("1 red + 2 green: departure pages, general stays fixed") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+        {"R3:C", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400),
+         make_trip("R4", "D", now + 500)},
+        pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/1, /*limit=*/3);
+
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.departure_pool.size() == 2);
+
+    ScrollContainer gen_p, dep_p;
+    gen_p.reset(); dep_p.reset();
+
+    // Page 0: general R1 + first departure R2
+    auto f0 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f0.pinned_pool.size() == 2);
+    CHECK(f0.pinned_pool[0].route_id == "R1");
+    CHECK(f0.pinned_pool[1].route_id == "R2");
+
+    // Departure needs paging; general does not
+    CHECK(!gen_p.needs_paging((int)r.general_pool.size(), r.eff_general));
+    CHECK(dep_p.needs_paging((int)r.departure_pool.size(), r.eff_departure));
+
+    advance_both(r, gen_p, dep_p);
+
+    // Page 1: general R1 stays, departure rotates to R3
+    auto f1 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f1.pinned_pool[0].route_id == "R1");
+    CHECK(f1.pinned_pool[1].route_id == "R3");
+
+    // Wrap around
+    advance_both(r, gen_p, dep_p);
+    auto f2 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f2.pinned_pool[1].route_id == "R2");
+  }
+
+  TEST_CASE("2 red + 1 green: general pages, departure stays fixed") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+        {"R3:C", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 300),
+         make_trip("R4", "D", now + 500)},
+        pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/1, /*limit=*/3);
+
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.general_pool.size() == 2);
+    CHECK(r.departure_pool.size() == 1);
+
+    ScrollContainer gen_p, dep_p;
+    gen_p.reset(); dep_p.reset();
+
+    // Page 0: first general R1 + departure R3
+    auto f0 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f0.pinned_pool.size() == 2);
+    CHECK(f0.pinned_pool[0].route_id == "R1");
+    CHECK(f0.pinned_pool[1].route_id == "R3");
+
+    // General needs paging; departure does not
+    CHECK(gen_p.needs_paging((int)r.general_pool.size(), r.eff_general));
+    CHECK(!dep_p.needs_paging((int)r.departure_pool.size(), r.eff_departure));
+
+    advance_both(r, gen_p, dep_p);
+
+    // Page 1: general rotates to R2, departure R3 stays
+    auto f1 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f1.pinned_pool[0].route_id == "R2");
+    CHECK(f1.pinned_pool[1].route_id == "R3");
+
+    // Wrap around
+    advance_both(r, gen_p, dep_p);
+    auto f2 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f2.pinned_pool[0].route_id == "R1");
+    CHECK(f2.pinned_pool[1].route_id == "R3");
+  }
+
+  TEST_CASE("2 red + 2 green: both sub-pools page together") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"G2:B", PIN_GENERAL},
+        {"D1:C", PIN_LEAVING_SOON},
+        {"D2:D", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("G2", "B", now + 1900),
+         make_trip("D1", "C", now + 300),
+         make_trip("D2", "D", now + 400),
+         make_trip("U1", "E", now + 500)},
+        pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/1, /*limit=*/3);
+
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+
+    ScrollContainer gen_p, dep_p;
+    gen_p.reset(); dep_p.reset();
+
+    auto f0 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f0.pinned_pool[0].route_id == "G1");
+    CHECK(f0.pinned_pool[1].route_id == "D1");
+
+    advance_both(r, gen_p, dep_p);
+
+    auto f1 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f1.pinned_pool[0].route_id == "G2");
+    CHECK(f1.pinned_pool[1].route_id == "D2");
+
+    advance_both(r, gen_p, dep_p);
+
+    auto f2 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f2.pinned_pool[0].route_id == "G1");
+    CHECK(f2.pinned_pool[1].route_id == "D1");
+  }
+
+  TEST_CASE("1 red + 3 green, 2 departure slots: pages 2 at a time") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+        {"R3:C", PIN_LEAVING_SOON},
+        {"R4:D", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 200),
+         make_trip("R3", "C", now + 300),
+         make_trip("R4", "D", now + 400),
+         make_trip("R5", "E", now + 500)},
+        pins, now, 10, /*pinned_rows=*/3, /*general_pins=*/1, /*limit=*/4);
+
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 2);
+    CHECK(r.departure_pool.size() == 3);
+
+    ScrollContainer gen_p, dep_p;
+    gen_p.reset(); dep_p.reset();
+
+    auto f0 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f0.pinned_pool.size() == 3);
+    CHECK(f0.pinned_pool[0].route_id == "R1");
+    CHECK(f0.pinned_pool[1].route_id == "R2");
+    CHECK(f0.pinned_pool[2].route_id == "R3");
+
+    advance_both(r, gen_p, dep_p);
+
+    auto f1 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f1.pinned_pool[0].route_id == "R1");
+    CHECK(f1.pinned_pool[1].route_id == "R3");
+    CHECK(f1.pinned_pool[2].route_id == "R4");
+  }
+
+  TEST_CASE("3 red + 1 green, 2 general slots: general pages 2 at a time") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"G2:B", PIN_GENERAL},
+        {"G3:C", PIN_GENERAL},
+        {"D1:D", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("G2", "B", now + 1900),
+         make_trip("G3", "C", now + 2000),
+         make_trip("D1", "D", now + 300),
+         make_trip("U1", "E", now + 500)},
+        pins, now, 10, /*pinned_rows=*/3, /*general_pins=*/2, /*limit=*/4);
+
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_general == 2);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.general_pool.size() == 3);
+
+    ScrollContainer gen_p, dep_p;
+    gen_p.reset(); dep_p.reset();
+
+    auto f0 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f0.pinned_pool.size() == 3);
+    CHECK(f0.pinned_pool[0].route_id == "G1");
+    CHECK(f0.pinned_pool[1].route_id == "G2");
+    CHECK(f0.pinned_pool[2].route_id == "D1");
+
+    advance_both(r, gen_p, dep_p);
+
+    auto f1 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f1.pinned_pool[0].route_id == "G2");
+    CHECK(f1.pinned_pool[1].route_id == "G3");
+    CHECK(f1.pinned_pool[2].route_id == "D1");  // departure stays
+
+    advance_both(r, gen_p, dep_p);
+
+    auto f2 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f2.pinned_pool[0].route_id == "G1");  // wraps
+    CHECK(f2.pinned_pool[2].route_id == "D1");
+  }
+
+  TEST_CASE("no paging needed when both pools fit slots exactly") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, 2, 1, 3);
+
+    CHECK(r.has_pin_split);
+
+    ScrollContainer gen_p, dep_p;
+    gen_p.reset(); dep_p.reset();
+    gen_p.clamp((int)r.general_pool.size(), r.eff_general);
+    dep_p.clamp((int)r.departure_pool.size(), r.eff_departure);
+
+    CHECK(!gen_p.needs_paging((int)r.general_pool.size(), r.eff_general));
+    CHECK(!dep_p.needs_paging((int)r.departure_pool.size(), r.eff_departure));
+  }
+
+  TEST_CASE("non-split mode: no paging since eff_pinned capped at 1") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, 2, 1, 3);
+
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 1);
+
+    ScrollContainer pager;
+    pager.reset();
+    pager.clamp((int)r.pinned_pool.size(), r.eff_pinned);
+    CHECK(!pager.needs_paging((int)r.pinned_pool.size(), r.eff_pinned));
+  }
+
+  TEST_CASE("PIN_BOTH mixed: departure sub-pool pages correctly") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_BOTH},
+        {"R2:B", PIN_BOTH},
+        {"R3:C", PIN_BOTH},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400),
+         make_trip("R4", "D", now + 500)},
+        pins, now, 10, 2, 1, 3);
+
+    CHECK(r.has_pin_split);
+    CHECK(r.general_pool.size() == 1);
+    CHECK(r.departure_pool.size() == 2);
+
+    ScrollContainer gen_p, dep_p;
+    gen_p.reset(); dep_p.reset();
+
+    auto f0 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f0.pinned_pool[0].route_id == "R1");
+    CHECK(f0.pinned_pool[1].route_id == "R2");
+
+    advance_both(r, gen_p, dep_p);
+
+    auto f1 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f1.pinned_pool[0].route_id == "R1");
+    CHECK(f1.pinned_pool[1].route_id == "R3");
   }
 }

@@ -93,8 +93,10 @@ struct HScrollState {
   // finishes the current cycle before stopping).
   bool deferred_start{false};
   unsigned long deferred_since{0};
-  // Set by reset() so that the first update_distance() after a transition
-  // does not re-trigger deferral (the transition already provided a visual break).
+  // Skips the next deferred-start trigger.  Set by reset() so that the
+  // first update_distance() after a transition does not re-trigger deferral
+  // (the transition already provided a visual break).  Defaults to false
+  // so that the very first overflow on boot gets a 3s dwell before scrolling.
   bool skip_next_defer{false};
 
   // After a transition reset, the first scroll cycle skips the inter-cycle
@@ -117,7 +119,7 @@ struct HScrollState {
     deferred_start = false;
     deferred_since = 0;
     skip_next_defer = true;
-    skip_first_dwell = true;
+    skip_first_dwell = false;
     base_cycle_count = 0;
   }
 
@@ -149,13 +151,18 @@ struct HScrollState {
     int dist = total_distance > 0 ? total_distance : prev_total_distance;
     if (dist <= 0) { idle = true; offset = 0; cycle_count = 0; return; }
 
-    // Deferred start: dwell at home position for one full cycle duration
-    // before scrolling begins.  Symmetric with the wind-down logic that
-    // finishes the current cycle before stopping when overflow disappears.
+    // Deferred start: dwell at home position for kScrollCycleDwellMs
+    // before scrolling begins.  Uses the same fixed 3s dwell as the
+    // inter-cycle pause, regardless of scroll speed or distance.
     if (deferred_start) {
+      // Apply pending speed during deferred dwell so the dwell duration
+      // uses the correct speed (not the default 10px/s).
+      if (pending_speed != 0) {
+        scroll_speed = pending_speed;
+        pending_speed = 0;
+      }
       if (deferred_since == 0) deferred_since = now;
-      unsigned long dwell_ms = (unsigned long)dist * 1000 / scroll_speed;
-      if (now - deferred_since >= dwell_ms) {
+      if (now - deferred_since >= kScrollCycleDwellMs) {
         // Dwell complete — begin actual scrolling
         deferred_start = false;
         deferred_since = 0;
@@ -167,44 +174,18 @@ struct HScrollState {
       return;
     }
 
-    // Each cycle = scroll phase + dwell phase (paused at home position).
-    // After a transition reset, the first cycle skips the dwell.
-    unsigned long scroll_phase_ms = (unsigned long)dist * 1000 / scroll_speed;
-
-    // --- First cycle after reset: no dwell ---
-    if (skip_first_dwell) {
-      unsigned long elapsed = now - start_time;
-      if (elapsed < scroll_phase_ms) {
-        offset = (int)(elapsed * scroll_speed / 1000);
-        idle = (offset < kScrollNearZeroPx);
-        cycle_count = base_cycle_count;
-        return;
-      }
-      // First scroll phase complete — switch to standard timing with dwell
-      skip_first_dwell = false;
-      start_time += scroll_phase_ms;
-      base_cycle_count++;
-
-      // Wind-down at first cycle boundary
-      if (total_distance <= 0 && prev_total_distance > 0) {
-        prev_total_distance = 0;
-        offset = 0;
-        idle = true;
-        cycle_count = base_cycle_count;
-        return;
-      }
-      // Pending speed at first cycle boundary
-      if (pending_speed != 0) {
-        scroll_speed = pending_speed;
-        pending_speed = 0;
-        start_time = now;
-        offset = 0;
-        idle = true;
-        cycle_count = base_cycle_count;
-        return;
-      }
-      // Fall through to standard cycle computation
+    // Apply pending speed immediately when at home position (offset == 0).
+    // This ensures the correct speed is used from the very first scroll
+    // cycle after a reset — e.g. on reboot, the configured speed arrives
+    // via MQTT after the component starts, so pending_speed must be applied
+    // before the first scroll begins rather than waiting for a dwell.
+    if (pending_speed != 0 && offset == 0) {
+      scroll_speed = pending_speed;
+      pending_speed = 0;
     }
+
+    // Each cycle = scroll phase + dwell phase (paused at home position).
+    unsigned long scroll_phase_ms = (unsigned long)dist * 1000 / scroll_speed;
 
     // --- Standard cycles with dwell ---
     unsigned long cycle_total_ms = scroll_phase_ms + kScrollCycleDwellMs;
