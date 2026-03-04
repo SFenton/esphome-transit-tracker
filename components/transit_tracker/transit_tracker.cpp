@@ -357,10 +357,10 @@ void TransitTracker::set_scroll_routes(bool v) {
 }
 
 void TransitTracker::set_scroll_speed(const std::string &speed) {
-  int new_speed = 10;
-  if (speed == "slow") new_speed = 5;
-  else if (speed == "medium") new_speed = 10;
-  else if (speed == "fast") new_speed = 20;
+  int new_speed = 20;
+  if (speed == "slow") new_speed = 10;
+  else if (speed == "medium") new_speed = 20;
+  else if (speed == "fast") new_speed = 30;
   else if (speed == "fastest") new_speed = 40;
   else {
     char *end = nullptr;
