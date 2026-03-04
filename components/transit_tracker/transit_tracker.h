@@ -66,6 +66,8 @@ class TransitTracker : public Component {
   void set_page_pause_duration(int seconds) { page_pause_duration_ = seconds * 1000; }
   void set_pinned_rows_count(int c) { pinned_rows_count_ = std::max(1, std::min(c, limit_ - 1)); }
   int get_pinned_rows_count() const { return pinned_rows_count_; }
+  void set_leaving_soon_threshold(int minutes) { leaving_soon_threshold_min_ = std::max(5, std::min(60, minutes)); }
+  int get_leaving_soon_threshold() const { return leaving_soon_threshold_min_; }
   void set_unit_display(UnitDisplay u) { localization_.set_unit_display(u); }
   void add_abbreviation(const std::string &from, const std::string &to) { abbreviations_[from] = to; }
   void set_default_route_color(const Color &c) { default_route_color_ = c; }
@@ -105,7 +107,7 @@ class TransitTracker : public Component {
                  int *headsign_overflow_out = nullptr,
                  int *headsign_width_out = nullptr,
                  int h_scroll_offset = -1, int total_scroll_distance = 0,
-                 bool is_pinned = false);
+                 bool is_pinned = false, bool is_leaving_soon = false);
 
   // ---- draw_schedule helpers ----
   void rebuild_route_stop_map_();
@@ -114,6 +116,7 @@ class TransitTracker : public Component {
                           unsigned long now, uint rtc_now);
   void begin_transition_(const std::vector<Trip> &old_trips,
                           const std::vector<bool> &old_is_pinned,
+                          const std::vector<bool> &old_is_leaving_soon,
                           int old_eff_pinned, bool layout_or_swap,
                           unsigned long now);
   void begin_page_transition_(const std::vector<Trip> &pinned_pool,
@@ -122,6 +125,7 @@ class TransitTracker : public Component {
                                bool pinned_due, bool unpinned_due,
                                const std::vector<Trip> &old_trips,
                                const std::vector<bool> &old_is_pinned,
+                               const std::vector<bool> &old_is_leaving_soon,
                                unsigned long now);
   void tick_transition_(unsigned long now, int fh,
                          const std::vector<Trip> &pinned_pool,
@@ -129,6 +133,7 @@ class TransitTracker : public Component {
                          int eff_pinned, int eff_unpinned);
   void render_frame_(const std::vector<Trip> &rows,
                       const std::vector<bool> &row_pinned,
+                      const std::vector<bool> &row_leaving_soon,
                       int eff_pinned, unsigned long now, uint rtc_now,
                       int fh, int y_base);
 
@@ -171,12 +176,13 @@ class TransitTracker : public Component {
   int page_scroll_duration_{500};
   int page_pause_duration_{1000};
   int pinned_rows_count_{1};
+  int leaving_soon_threshold_min_{10};
   Color realtime_color_{Color(0x20FF00)};
   Color realtime_color_dark_{Color(0x00A700)};
 
   // ---- Route management ----
   std::set<std::string> hidden_routes_;
-  std::set<std::string> pinned_routes_;
+  std::map<std::string, PinMode> pinned_routes_;
   std::set<std::string> next_only_routes_;
   std::map<std::string, std::string> route_stop_map_;
 

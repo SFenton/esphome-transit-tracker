@@ -286,8 +286,24 @@ void TransitTracker::set_pinned_routes_from_text(const std::string &text) {
   // Composite keys may contain semicolons — use '\x1F' if present, else
   // fall back to ';' for backward compatibility with older persisted values.
   char delim = (text.find('\x1F') != std::string::npos) ? '\x1F' : ';';
-  for (const auto &id : split(text, delim)) {
-    if (!id.empty()) { this->pinned_routes_.insert(id); ESP_LOGD(TAG, "Pinning route: %s", id.c_str()); }
+  for (const auto &entry : split(text, delim)) {
+    if (entry.empty()) continue;
+    // Parse optional mode suffix: key=G, key=L, key=B
+    // Default to PIN_GENERAL for backward compatibility (no suffix).
+    std::string key = entry;
+    PinMode mode = PIN_GENERAL;
+    if (entry.size() >= 3) {
+      auto eq = entry.rfind('=');
+      if (eq != std::string::npos && eq == entry.size() - 2) {
+        char m = entry.back();
+        key = entry.substr(0, eq);
+        if (m == 'L') mode = PIN_LEAVING_SOON;
+        else if (m == 'B') mode = PIN_BOTH;
+        // else default to PIN_GENERAL
+      }
+    }
+    this->pinned_routes_[key] = mode;
+    ESP_LOGD(TAG, "Pinning route: %s (mode=%d)", key.c_str(), (int)mode);
   }
 }
 
@@ -425,6 +441,8 @@ void TransitTracker::publish_mqtt_routes_() {
       options.add("Off");
       options.add("On");
       options.add("Pinned");
+      options.add("Pinned (Leaving Soon)");
+      options.add("Pinned (Both)");
 
       // Note: we intentionally omit availability_topic here.
       // These are configuration entities; the device's built-in
@@ -445,8 +463,19 @@ void TransitTracker::publish_mqtt_routes_() {
 
     // Publish current state
     bool hidden = this->hidden_routes_.count(key) > 0;
-    bool pinned = this->pinned_routes_.count(key) > 0;
-    std::string state = hidden ? "Off" : (pinned ? "Pinned" : "On");
+    auto pin_it = this->pinned_routes_.find(key);
+    std::string state;
+    if (hidden) {
+      state = "Off";
+    } else if (pin_it != this->pinned_routes_.end()) {
+      switch (pin_it->second) {
+        case PIN_LEAVING_SOON: state = "Pinned (Leaving Soon)"; break;
+        case PIN_BOTH: state = "Pinned (Both)"; break;
+        default: state = "Pinned"; break;
+      }
+    } else {
+      state = "On";
+    }
     mqtt::global_mqtt_client->publish(state_topic, state, 0, true);
 
     // Subscribe to commands
@@ -468,8 +497,18 @@ void TransitTracker::publish_mqtt_routes_() {
             }
             if (visible_count <= 1) {
               ESP_LOGW(TAG, "Cannot hide last visible route %s", cap_key.c_str());
-              bool is_pinned = this->pinned_routes_.count(cap_key) > 0;
-              mqtt::global_mqtt_client->publish(cap_st, std::string(is_pinned ? "Pinned" : "On"), 0, true);
+              auto pin_it = this->pinned_routes_.find(cap_key);
+              std::string cur_state;
+              if (pin_it != this->pinned_routes_.end()) {
+                switch (pin_it->second) {
+                  case PIN_LEAVING_SOON: cur_state = "Pinned (Leaving Soon)"; break;
+                  case PIN_BOTH: cur_state = "Pinned (Both)"; break;
+                  default: cur_state = "Pinned"; break;
+                }
+              } else {
+                cur_state = "On";
+              }
+              mqtt::global_mqtt_client->publish(cap_st, cur_state, 0, true);
               return;
             }
             this->hidden_routes_.insert(cap_key);
@@ -479,7 +518,13 @@ void TransitTracker::publish_mqtt_routes_() {
             this->pinned_routes_.erase(cap_key);
           } else if (payload == "Pinned") {
             this->hidden_routes_.erase(cap_key);
-            this->pinned_routes_.insert(cap_key);
+            this->pinned_routes_[cap_key] = PIN_GENERAL;
+          } else if (payload == "Pinned (Leaving Soon)") {
+            this->hidden_routes_.erase(cap_key);
+            this->pinned_routes_[cap_key] = PIN_LEAVING_SOON;
+          } else if (payload == "Pinned (Both)") {
+            this->hidden_routes_.erase(cap_key);
+            this->pinned_routes_[cap_key] = PIN_BOTH;
           } else {
             ESP_LOGW(TAG, "Unknown route command: %s", payload.c_str());
             return;
@@ -520,8 +565,18 @@ void TransitTracker::persist_hidden_routes_() {
 
 void TransitTracker::persist_pinned_routes_() {
   // Use '\x1F' with leading prefix — see persist_hidden_routes_() for rationale.
+  // Each entry is key=M where M is G (General), L (Leaving Soon), or B (Both).
   std::string s;
-  for (const auto &k : this->pinned_routes_) { s += '\x1F'; s += k; }
+  for (const auto &kv : this->pinned_routes_) {
+    s += '\x1F';
+    s += kv.first;
+    s += '=';
+    switch (kv.second) {
+      case PIN_LEAVING_SOON: s += 'L'; break;
+      case PIN_BOTH: s += 'B'; break;
+      default: s += 'G'; break;
+    }
+  }
 #ifdef USE_TEXT
   if (this->pinned_routes_text_ && this->pinned_routes_text_->state != s) {
     auto call = this->pinned_routes_text_->make_call();
@@ -709,7 +764,7 @@ void HOT TransitTracker::draw_realtime_icon_(int bottom_right_x, int bottom_righ
 void TransitTracker::draw_trip(
     const Trip &trip, int y_offset, int fh, unsigned long uptime, uint rtc_now,
     bool no_draw, int *headsign_overflow_out, int *headsign_width_out,
-    int h_scroll_offset, int total_scroll_distance, bool is_pinned) {
+    int h_scroll_offset, int total_scroll_distance, bool is_pinned, bool is_leaving_soon) {
 
   int x_start = this->frame_pin_inset_;
   if (!is_pinned && !this->frame_respect_pin_inset_ && x_start > 0) {
@@ -720,7 +775,7 @@ void TransitTracker::draw_trip(
 
   // Pin icon (drawn in the inset margin if this row is pinned)
   if (is_pinned && x_start > 0 && this->show_pin_icon_ && !no_draw) {
-    Color pin_color = Color(0xFF0000); // red
+    Color pin_color = is_leaving_soon ? Color(0x00FF00) : Color(0xFF0000); // green if leaving soon, else red
     int px = 1; // 1px left margin; icon occupies columns px..px+4 (5 wide)
     int py = y_offset + 1;
     int cx = px + 2; // center column of the 5px-wide icon
@@ -876,11 +931,13 @@ void TransitTracker::compute_h_scroll_(const std::vector<Trip> &trips, int fh,
 
 void TransitTracker::begin_transition_(
     const std::vector<Trip> &old_trips, const std::vector<bool> &old_is_pinned,
+    const std::vector<bool> &old_is_leaving_soon,
     int old_eff_pinned, bool layout_or_swap, unsigned long now) {
 
   this->transition_.reset();
   this->transition_.old_trips = old_trips;
   this->transition_.old_is_pinned = old_is_pinned;
+  this->transition_.old_is_leaving_soon = old_is_leaving_soon;
   this->transition_.old_eff_pinned = old_eff_pinned;
   this->transition_.old_respect_pin_inset = this->committed_respect_pin_inset_;
 
@@ -906,12 +963,14 @@ void TransitTracker::begin_page_transition_(
     int eff_pinned, int eff_unpinned,
     bool pinned_due, bool unpinned_due,
     const std::vector<Trip> &old_trips, const std::vector<bool> &old_is_pinned,
+    const std::vector<bool> &old_is_leaving_soon,
     unsigned long now) {
 
   // Snapshot current display before advancing pages
   this->transition_.reset();
   this->transition_.old_trips = old_trips;
   this->transition_.old_is_pinned = old_is_pinned;
+  this->transition_.old_is_leaving_soon = old_is_leaving_soon;
   this->transition_.old_eff_pinned = eff_pinned;
   this->transition_.old_respect_pin_inset = this->committed_respect_pin_inset_;
   this->transition_.animate_pinned = pinned_due;
@@ -1002,6 +1061,7 @@ void TransitTracker::tick_transition_(unsigned long now, int fh,
 
 void TransitTracker::render_frame_(
     const std::vector<Trip> &rows, const std::vector<bool> &row_pinned,
+    const std::vector<bool> &row_leaving_soon,
     int eff_pinned, unsigned long now, uint rtc_now, int fh, int y_base) {
 
   auto phase = this->transition_.phase;
@@ -1011,6 +1071,7 @@ void TransitTracker::render_frame_(
 
   const auto &draw_rows = use_old ? this->transition_.old_trips : rows;
   const auto &draw_pinned = use_old ? this->transition_.old_is_pinned : row_pinned;
+  const auto &draw_leaving_soon = use_old ? this->transition_.old_is_leaving_soon : row_leaving_soon;
 
   // Save/restore pin inset based on current phase
   int save_inset = this->frame_pin_inset_;
@@ -1037,6 +1098,7 @@ void TransitTracker::render_frame_(
 
   for (size_t i = 0; i < draw_rows.size() && (int)i < this->limit_; i++) {
     int y = y_base + (int)i * fh;
+    bool ls = (i < draw_leaving_soon.size()) ? draw_leaving_soon[i] : false;
 
     if (phase == Transition::COLLAPSE) {
       // Rows shrink from bottom up (top stays visible longest)
@@ -1044,7 +1106,7 @@ void TransitTracker::render_frame_(
       if (scale <= kMinRowScale) continue;
       int clip_h = std::max(1, (int)(fh * scale));
       this->display_->start_clipping(0, y, dw, y + clip_h);
-      this->draw_trip(draw_rows[i], y, fh, now, rtc_now, false, nullptr, nullptr, -1, 0, draw_pinned[i]);
+      this->draw_trip(draw_rows[i], y, fh, now, rtc_now, false, nullptr, nullptr, -1, 0, draw_pinned[i], ls);
       this->display_->end_clipping();
 
     } else if (phase == Transition::MID_PAUSE) {
@@ -1058,12 +1120,12 @@ void TransitTracker::render_frame_(
       int clip_h = std::max(1, (int)(fh * scale));
       int clip_top = y + fh - clip_h;
       this->display_->start_clipping(0, std::max(0, clip_top), dw, y + fh);
-      this->draw_trip(draw_rows[i], y, fh, now, rtc_now, false, nullptr, nullptr, -1, 0, draw_pinned[i]);
+      this->draw_trip(draw_rows[i], y, fh, now, rtc_now, false, nullptr, nullptr, -1, 0, draw_pinned[i], ls);
       this->display_->end_clipping();
 
     } else {
       // IDLE, WAIT_SCROLL, POST_PAUSE — full rows with optional h-scroll
-      this->draw_trip(draw_rows[i], y, fh, now, rtc_now, false, nullptr, nullptr, h_off, h_dist, draw_pinned[i]);
+      this->draw_trip(draw_rows[i], y, fh, now, rtc_now, false, nullptr, nullptr, h_off, h_dist, draw_pinned[i], ls);
     }
   }
 
@@ -1138,14 +1200,43 @@ void HOT TransitTracker::draw_schedule() {
   }
 
   // ---- 4. Partition: pinned first, then unpinned ----
+  // We need rtc_now early for the leaving-soon threshold check.
+  uint rtc_now = this->rtc_->now().timestamp;
+  int leaving_soon_threshold_sec = this->leaving_soon_threshold_min_ * 60;
+
+  // A trip is "effectively pinned" if:
+  //   PIN_GENERAL or PIN_BOTH → always
+  //   PIN_LEAVING_SOON → only when departure_time - rtc_now < threshold
   int actual_pinned = 0;
+  // Track per-trip leaving-soon state for the pinned pool
+  std::vector<bool> pinned_pool_leaving_soon;
   if (!this->pinned_routes_.empty()) {
-    std::stable_partition(visible.begin(), visible.end(), [this](const Trip &t) {
-      return this->pinned_routes_.count(t.composite_key()) > 0;
+    std::stable_partition(visible.begin(), visible.end(), [this, rtc_now, leaving_soon_threshold_sec](const Trip &t) {
+      auto it = this->pinned_routes_.find(t.composite_key());
+      if (it == this->pinned_routes_.end()) return false;
+      switch (it->second) {
+        case PIN_GENERAL:
+        case PIN_BOTH:
+          return true;
+        case PIN_LEAVING_SOON:
+          return (int)(t.departure_time - rtc_now) < leaving_soon_threshold_sec;
+        default:
+          return false;
+      }
     });
     for (const auto &t : visible) {
-      if (this->pinned_routes_.count(t.composite_key())) actual_pinned++;
-      else break;
+      auto it = this->pinned_routes_.find(t.composite_key());
+      if (it == this->pinned_routes_.end()) break;
+      bool eff_pinned_trip = false;
+      switch (it->second) {
+        case PIN_GENERAL: case PIN_BOTH: eff_pinned_trip = true; break;
+        case PIN_LEAVING_SOON:
+          eff_pinned_trip = (int)(t.departure_time - rtc_now) < leaving_soon_threshold_sec;
+          break;
+        default: break;
+      }
+      if (!eff_pinned_trip) break;
+      actual_pinned++;
     }
     dedup_pinned_section(visible, actual_pinned);
   }
@@ -1172,21 +1263,35 @@ void HOT TransitTracker::draw_schedule() {
   // ---- 6. Build display rows ----
   std::vector<Trip> rows;
   std::vector<bool> row_pinned;
+  std::vector<bool> row_leaving_soon;
   std::vector<std::string> keys;
   std::vector<time_t> deps;
 
   for (int i = p_si; i < p_ei; i++) {
     rows.push_back(pinned_pool[i]); row_pinned.push_back(true);
+    // Determine leaving-soon state for this pinned trip
+    auto it = this->pinned_routes_.find(pinned_pool[i].composite_key());
+    bool ls = false;
+    if (it != this->pinned_routes_.end()) {
+      int secs_until = (int)(pinned_pool[i].departure_time - rtc_now);
+      switch (it->second) {
+        case PIN_LEAVING_SOON: ls = true; break; // always green when in pinned section
+        case PIN_BOTH: ls = (secs_until < leaving_soon_threshold_sec); break;
+        default: break;
+      }
+    }
+    row_leaving_soon.push_back(ls);
     keys.push_back(pinned_pool[i].composite_key()); deps.push_back(pinned_pool[i].departure_time);
   }
   for (int i = u_si; i < u_ei; i++) {
     rows.push_back(unpinned_pool[i]); row_pinned.push_back(false);
+    row_leaving_soon.push_back(false);
     keys.push_back(unpinned_pool[i].composite_key()); deps.push_back(unpinned_pool[i].departure_time);
   }
 
   // ---- 7. Timing ----
   unsigned long now = millis();
-  uint rtc_now = this->rtc_->now().timestamp;
+  // rtc_now already computed in step 4
   int fh = this->font_->get_ascender() + this->font_->get_descender();
   int max_h = (this->limit_ * this->font_->get_ascender()) + ((this->limit_ - 1) * this->font_->get_descender());
   int y_base = (this->display_->get_height() % max_h) / 2;
@@ -1194,6 +1299,10 @@ void HOT TransitTracker::draw_schedule() {
   // ---- 8. Per-frame state ----
   this->frame_pin_inset_ = (eff_pinned > 0 && this->show_pin_icon_) ? kPinIconWidth : 0;
   this->frame_respect_pin_inset_ = this->respect_pin_inset_;
+
+  // Build a set of pinned route keys for diff tracking
+  std::set<std::string> pinned_route_keys;
+  for (const auto &kv : this->pinned_routes_) pinned_route_keys.insert(kv.first);
 
   // ---- 9. Determine rendering context (old vs new layout) ----
   // H-scroll and uniform clipping must measure against the layout actually
@@ -1219,7 +1328,7 @@ void HOT TransitTracker::draw_schedule() {
     // IDLE: peek at diff to detect an impending layout change so that the
     // measurements below (and begin_transition_'s WAIT vs COLLAPSE decision)
     // use h-scroll / clipping state consistent with the old layout.
-    this->diff_.compute(keys, deps, eff_pinned, this->pinned_routes_);
+    this->diff_.compute(keys, deps, eff_pinned, pinned_route_keys);
     bool respect_inset_changed = (this->respect_pin_inset_ != this->committed_respect_pin_inset_)
                                  && eff_pinned > 0;
     if ((this->diff_.has_changes() || respect_inset_changed) && this->diff_.prev_pinned_count >= 0) {
@@ -1267,6 +1376,7 @@ void HOT TransitTracker::draw_schedule() {
       // Data/layout changed — start transition
       bool layout_swap = this->diff_.layout_changed || this->diff_.pinned_set_changed || respect_inset_changed;
       this->begin_transition_(this->diff_.prev_trips, this->diff_.prev_is_pinned,
+                              this->diff_.prev_is_leaving_soon,
                               this->diff_.prev_pinned_count, layout_swap, now);
       triggered_transition = true;
     } else if (this->scroll_routes_ && this->diff_.prev_pinned_count >= 0) {
@@ -1308,21 +1418,33 @@ void HOT TransitTracker::draw_schedule() {
 
       if (pinned_due || unpinned_due) {
         this->begin_page_transition_(pinned_pool, unpinned_pool, eff_pinned, eff_unpinned,
-                                     pinned_due, unpinned_due, rows, row_pinned, now);
+                                     pinned_due, unpinned_due, rows, row_pinned, row_leaving_soon, now);
         triggered_transition = true;
 
         // Re-compute rows with new page indices
-        rows.clear(); row_pinned.clear(); keys.clear(); deps.clear();
+        rows.clear(); row_pinned.clear(); row_leaving_soon.clear(); keys.clear(); deps.clear();
         p_si = eff_pinned > 0 ? this->pinned_pager_.start_index((int)pinned_pool.size(), eff_pinned) : 0;
         p_ei = eff_pinned > 0 ? this->pinned_pager_.end_index((int)pinned_pool.size(), eff_pinned) : 0;
         u_si = this->unpinned_pager_.start_index((int)unpinned_pool.size(), eff_unpinned);
         u_ei = this->unpinned_pager_.end_index((int)unpinned_pool.size(), eff_unpinned);
         for (int i = p_si; i < p_ei; i++) {
           rows.push_back(pinned_pool[i]); row_pinned.push_back(true);
+          auto it = this->pinned_routes_.find(pinned_pool[i].composite_key());
+          bool ls = false;
+          if (it != this->pinned_routes_.end()) {
+            int secs_until = (int)(pinned_pool[i].departure_time - rtc_now);
+            switch (it->second) {
+              case PIN_LEAVING_SOON: ls = true; break;
+              case PIN_BOTH: ls = (secs_until < leaving_soon_threshold_sec); break;
+              default: break;
+            }
+          }
+          row_leaving_soon.push_back(ls);
           keys.push_back(pinned_pool[i].composite_key()); deps.push_back(pinned_pool[i].departure_time);
         }
         for (int i = u_si; i < u_ei; i++) {
           rows.push_back(unpinned_pool[i]); row_pinned.push_back(false);
+          row_leaving_soon.push_back(false);
           keys.push_back(unpinned_pool[i].composite_key()); deps.push_back(unpinned_pool[i].departure_time);
         }
       }
@@ -1338,7 +1460,7 @@ void HOT TransitTracker::draw_schedule() {
         if (this->idle_since_ == 0) {
           this->idle_since_ = now;
         } else if (now - this->idle_since_ >= (unsigned long)this->page_interval_) {
-          this->begin_transition_(rows, row_pinned, eff_pinned, false, now);
+          this->begin_transition_(rows, row_pinned, row_leaving_soon, eff_pinned, false, now);
           this->idle_since_ = 0;
         }
       } else {
@@ -1353,11 +1475,11 @@ void HOT TransitTracker::draw_schedule() {
   this->tick_transition_(now, fh, pinned_pool, unpinned_pool, eff_pinned, eff_unpinned);
 
   // ---- 14. Render ----
-  this->render_frame_(rows, row_pinned, eff_pinned, now, rtc_now, fh, y_base);
+  this->render_frame_(rows, row_pinned, row_leaving_soon, eff_pinned, now, rtc_now, fh, y_base);
 
   // ---- 15. Commit diff (only when idle) ----
   if (this->transition_.phase == Transition::IDLE) {
-    this->diff_.commit(keys, deps, rows, row_pinned, eff_pinned, this->pinned_routes_);
+    this->diff_.commit(keys, deps, rows, row_pinned, row_leaving_soon, eff_pinned, pinned_route_keys);
     this->committed_respect_pin_inset_ = this->respect_pin_inset_;
   }
 }

@@ -261,7 +261,7 @@ TEST_SUITE("DisplayDiff") {
     std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
     std::vector<bool> is_p = {false, false};
 
-    diff.commit(keys, deps, trips, is_p, 0, pinned);
+    diff.commit(keys, deps, trips, is_p, is_p, 0, pinned);
     diff.compute(keys, deps, 0, pinned);
     CHECK(!diff.has_changes());
   }
@@ -274,7 +274,7 @@ TEST_SUITE("DisplayDiff") {
     std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
     std::vector<bool> is_p = {false, false};
 
-    diff.commit(keys, deps, trips, is_p, 0, pinned);
+    diff.commit(keys, deps, trips, is_p, is_p, 0, pinned);
 
     // Now pinned count changes to 1
     diff.compute(keys, deps, 1, pinned);
@@ -290,7 +290,7 @@ TEST_SUITE("DisplayDiff") {
     std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
     std::vector<bool> is_p = {true, false};
 
-    diff.commit(keys, deps, trips, is_p, 1, pinned_v1);
+    diff.commit(keys, deps, trips, is_p, is_p, 1, pinned_v1);
 
     std::set<std::string> pinned_v2 = {"R2:B"};
     diff.compute(keys, deps, 1, pinned_v2);
@@ -306,7 +306,7 @@ TEST_SUITE("DisplayDiff") {
     std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
     std::vector<bool> is_p = {false, false};
 
-    diff.commit(keys1, deps1, trips, is_p, 0, pinned);
+    diff.commit(keys1, deps1, trips, is_p, is_p, 0, pinned);
 
     std::vector<std::string> keys2 = {"R1:A", "R3:C"};
     std::vector<time_t> deps2 = {100, 300};
@@ -322,7 +322,7 @@ TEST_SUITE("DisplayDiff") {
     std::vector<Trip> trips = {make_trip("R1", "A", 1000)};
     std::vector<bool> is_p = {false};
 
-    diff.commit(keys, deps1, trips, is_p, 0, pinned);
+    diff.commit(keys, deps1, trips, is_p, is_p, 0, pinned);
 
     std::vector<time_t> deps2 = {1100};  // +100s > 60s threshold
     diff.compute(keys, deps2, 0, pinned);
@@ -337,7 +337,7 @@ TEST_SUITE("DisplayDiff") {
     std::vector<Trip> trips = {make_trip("R1", "A", 1000)};
     std::vector<bool> is_p = {false};
 
-    diff.commit(keys, deps1, trips, is_p, 0, pinned);
+    diff.commit(keys, deps1, trips, is_p, is_p, 0, pinned);
 
     std::vector<time_t> deps2 = {1030};  // +30s < 60s threshold
     diff.compute(keys, deps2, 0, pinned);
@@ -465,7 +465,7 @@ TEST_SUITE("DisplayDiff — pin transitions") {
       deps.push_back(trips[i].departure_time);
       is_p.push_back((int)i < pinned_count);
     }
-    diff.commit(keys, deps, trips, is_p, pinned_count, pinned_routes);
+    diff.commit(keys, deps, trips, is_p, is_p, pinned_count, pinned_routes);
   }
 
   static void compute_frame(DisplayDiff &diff,
@@ -1304,7 +1304,7 @@ TEST_SUITE("Multi-frame integration") {
 
       ctx.diff.compute(keys, deps, 0, no_pins);
       CHECK(!ctx.diff.has_changes());  // first frame
-      ctx.diff.commit(keys, deps, trips, is_p, 0, no_pins);
+      ctx.diff.commit(keys, deps, trips, is_p, is_p, 0, no_pins);
     }
 
     // Frame 1: pin R1 — should detect layout change
@@ -1364,7 +1364,7 @@ TEST_SUITE("Multi-frame integration") {
       std::vector<std::string> keys = {"R1:A", "R2:B"};
       std::vector<time_t> deps = {100, 200};
       std::vector<bool> is_p = {true, false};
-      ctx.diff.commit(keys, deps, trips, is_p, 1, pin_r1);
+      ctx.diff.commit(keys, deps, trips, is_p, is_p, 1, pin_r1);
       CHECK(ctx.diff.prev_pinned_count == 1);
     }
   }
@@ -1379,7 +1379,7 @@ TEST_SUITE("Multi-frame integration") {
       std::vector<std::string> keys = {"R1:A", "R2:B"};
       std::vector<time_t> deps = {100, 200};
       std::vector<bool> is_p = {true, false};
-      ctx.diff.commit(keys, deps, trips_v1, is_p, 1, pin_r1);
+      ctx.diff.commit(keys, deps, trips_v1, is_p, is_p, 1, pin_r1);
     }
 
     // Remove pin → triggers transition
@@ -1440,7 +1440,7 @@ TEST_SUITE("Multi-frame integration") {
       std::vector<std::string> keys = {"R1:A", "R2:B", "R3:C"};
       std::vector<time_t> deps = {100, 200, 300};
       std::vector<bool> is_p = {false, false, false};
-      ctx.diff.commit(keys, deps, trips, is_p, 0, no_pins);
+      ctx.diff.commit(keys, deps, trips, is_p, is_p, 0, no_pins);
     }
 
     // Add pin — start transition
@@ -1592,7 +1592,7 @@ TEST_SUITE("Respect Pin Inset") {
     std::vector<time_t> deps = {100, 200};
     std::vector<bool> is_p = {true, false};
     int eff_pinned = 1;
-    diff.commit(keys, deps, trips, is_p, eff_pinned, pin_r1);
+    diff.commit(keys, deps, trips, is_p, is_p, eff_pinned, pin_r1);
 
     bool committed_respect = true;
     bool desired_respect = false;  // user changed it
@@ -1618,7 +1618,7 @@ TEST_SUITE("Respect Pin Inset") {
     std::vector<std::string> keys = {"R1:A", "R2:B"};
     std::vector<time_t> deps = {100, 200};
     std::vector<bool> is_p = {false, false};
-    diff.commit(keys, deps, trips, is_p, 0, no_pins);
+    diff.commit(keys, deps, trips, is_p, is_p, 0, no_pins);
 
     bool committed_respect = true;
     bool desired_respect = false;
@@ -1640,7 +1640,7 @@ TEST_SUITE("Respect Pin Inset") {
     std::vector<std::string> keys = {"R1:A", "R2:B"};
     std::vector<time_t> deps = {100, 200};
     std::vector<bool> is_p = {false, false};
-    diff.commit(keys, deps, trips, is_p, 0, no_pins);
+    diff.commit(keys, deps, trips, is_p, is_p, 0, no_pins);
 
     bool committed_respect = true;
     bool desired_respect = false;
@@ -1673,7 +1673,7 @@ TEST_SUITE("Respect Pin Inset") {
     int eff_pinned = 1;
     bool committed_respect = true;
     bool desired_respect = true;
-    diff.commit(keys, deps, trips, is_p, eff_pinned, pin_r1);
+    diff.commit(keys, deps, trips, is_p, is_p, eff_pinned, pin_r1);
 
     // Frame 1: user sets respect=false
     desired_respect = false;
@@ -1943,5 +1943,408 @@ TEST_SUITE("Always Scroll or Replace") {
       bool result = state.check(t, false, scrolling, false, 0);
       CHECK(!result);  // never accumulates 5 continuous seconds
     }
+  }
+}
+
+// =====================================================================
+// PinMode enum
+// =====================================================================
+
+TEST_SUITE("PinMode") {
+  TEST_CASE("enum values are distinct") {
+    CHECK(PIN_NONE == 0);
+    CHECK(PIN_GENERAL == 1);
+    CHECK(PIN_LEAVING_SOON == 2);
+    CHECK(PIN_BOTH == 3);
+    CHECK(PIN_NONE != PIN_GENERAL);
+    CHECK(PIN_GENERAL != PIN_LEAVING_SOON);
+    CHECK(PIN_LEAVING_SOON != PIN_BOTH);
+  }
+}
+
+// =====================================================================
+// Pinned Leaving Soon — partition & leaving-soon flag logic
+// =====================================================================
+
+// Helper that mimics draw_schedule step 4: partition visible trips into
+// pinned-first order, and step 6: compute per-row leaving_soon flags.
+// Returns {pinned_pool, unpinned_pool, pinned_leaving_soon_flags}.
+struct PartitionResult {
+  std::vector<Trip> pinned_pool;
+  std::vector<Trip> unpinned_pool;
+  std::vector<bool> pinned_leaving_soon;  // one per pinned_pool entry
+};
+
+static PartitionResult partition_trips(
+    std::vector<Trip> visible,
+    const std::map<std::string, PinMode> &pinned_routes,
+    unsigned int rtc_now,
+    int threshold_min) {
+
+  int threshold_sec = threshold_min * 60;
+  int actual_pinned = 0;
+
+  if (!pinned_routes.empty()) {
+    std::stable_partition(visible.begin(), visible.end(),
+      [&](const Trip &t) {
+        auto it = pinned_routes.find(t.composite_key());
+        if (it == pinned_routes.end()) return false;
+        switch (it->second) {
+          case PIN_GENERAL: case PIN_BOTH: return true;
+          case PIN_LEAVING_SOON:
+            return (int)(t.departure_time - rtc_now) < threshold_sec;
+          default: return false;
+        }
+      });
+    for (const auto &t : visible) {
+      auto it = pinned_routes.find(t.composite_key());
+      if (it == pinned_routes.end()) break;
+      bool eff = false;
+      switch (it->second) {
+        case PIN_GENERAL: case PIN_BOTH: eff = true; break;
+        case PIN_LEAVING_SOON:
+          eff = (int)(t.departure_time - rtc_now) < threshold_sec; break;
+        default: break;
+      }
+      if (!eff) break;
+      actual_pinned++;
+    }
+    dedup_pinned_section(visible, actual_pinned);
+  }
+
+  PartitionResult r;
+  r.pinned_pool.assign(visible.begin(), visible.begin() + actual_pinned);
+  r.unpinned_pool.assign(visible.begin() + actual_pinned, visible.end());
+
+  for (const auto &t : r.pinned_pool) {
+    auto it = pinned_routes.find(t.composite_key());
+    bool ls = false;
+    if (it != pinned_routes.end()) {
+      int secs_until = (int)(t.departure_time - rtc_now);
+      switch (it->second) {
+        case PIN_LEAVING_SOON: ls = true; break;
+        case PIN_BOTH: ls = (secs_until < threshold_sec); break;
+        default: break;
+      }
+    }
+    r.pinned_leaving_soon.push_back(ls);
+  }
+  return r;
+}
+
+TEST_SUITE("PinnedLeavingSoon") {
+
+  // -- PIN_GENERAL: always pinned, never leaving-soon (red pin) --
+
+  TEST_CASE("PIN_GENERAL — always in pinned pool regardless of time") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_GENERAL}};
+    // Trip departing in 30 minutes (1800s from now)
+    auto r = partition_trips(
+        {make_trip("R1", "A", 2800), make_trip("R2", "B", 2900)},
+        pins, /*rtc_now=*/1000, /*threshold_min=*/10);
+    CHECK(r.pinned_pool.size() == 1);
+    CHECK(r.pinned_pool[0].route_id == "R1");
+    CHECK(r.unpinned_pool.size() == 1);
+    CHECK(r.unpinned_pool[0].route_id == "R2");
+  }
+
+  TEST_CASE("PIN_GENERAL — leaving_soon flag is always false") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_GENERAL}};
+    // Even when departure is 2 minutes away
+    auto r = partition_trips(
+        {make_trip("R1", "A", 1120)},
+        pins, 1000, 10);
+    CHECK(r.pinned_pool.size() == 1);
+    CHECK(r.pinned_leaving_soon.size() == 1);
+    CHECK(r.pinned_leaving_soon[0] == false);
+  }
+
+  // -- PIN_LEAVING_SOON: unpinned until within threshold --
+
+  TEST_CASE("PIN_LEAVING_SOON — outside threshold stays unpinned") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_LEAVING_SOON}};
+    // Trip departing in 15 min, threshold is 10 min
+    auto r = partition_trips(
+        {make_trip("R1", "A", 1900), make_trip("R2", "B", 2000)},
+        pins, 1000, 10);
+    CHECK(r.pinned_pool.size() == 0);
+    CHECK(r.unpinned_pool.size() == 2);
+    // R1 is first in unpinned (stable order)
+    CHECK(r.unpinned_pool[0].route_id == "R1");
+  }
+
+  TEST_CASE("PIN_LEAVING_SOON — inside threshold moves to pinned with green flag") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_LEAVING_SOON}};
+    // Trip departing in 5 min (300s), threshold is 10 min (600s)
+    auto r = partition_trips(
+        {make_trip("R1", "A", 1300), make_trip("R2", "B", 2000)},
+        pins, 1000, 10);
+    CHECK(r.pinned_pool.size() == 1);
+    CHECK(r.pinned_pool[0].route_id == "R1");
+    CHECK(r.pinned_leaving_soon[0] == true);  // green pin
+    CHECK(r.unpinned_pool.size() == 1);
+    CHECK(r.unpinned_pool[0].route_id == "R2");
+  }
+
+  TEST_CASE("PIN_LEAVING_SOON — exactly at threshold boundary") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_LEAVING_SOON}};
+    // Trip departing in exactly 10 min (600s), threshold is 10 min
+    // (int)(1600 - 1000) = 600, and 600 < 600 is false → unpinned
+    auto r = partition_trips(
+        {make_trip("R1", "A", 1600)},
+        pins, 1000, 10);
+    CHECK(r.pinned_pool.size() == 0);
+    CHECK(r.unpinned_pool.size() == 1);
+  }
+
+  TEST_CASE("PIN_LEAVING_SOON — one second under threshold moves to pinned") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_LEAVING_SOON}};
+    // Trip departing in 9min59s (599s), threshold is 10 min (600s)
+    auto r = partition_trips(
+        {make_trip("R1", "A", 1599)},
+        pins, 1000, 10);
+    CHECK(r.pinned_pool.size() == 1);
+    CHECK(r.pinned_leaving_soon[0] == true);
+  }
+
+  // -- PIN_BOTH: always pinned; green when within threshold, red otherwise --
+
+  TEST_CASE("PIN_BOTH — always in pinned pool, red pin when outside threshold") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_BOTH}};
+    // Trip departing in 20 min, threshold 10 min
+    auto r = partition_trips(
+        {make_trip("R1", "A", 2200)},
+        pins, 1000, 10);
+    CHECK(r.pinned_pool.size() == 1);
+    CHECK(r.pinned_leaving_soon[0] == false);  // red pin
+  }
+
+  TEST_CASE("PIN_BOTH — always in pinned pool, green pin when inside threshold") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_BOTH}};
+    // Trip departing in 5 min, threshold 10 min
+    auto r = partition_trips(
+        {make_trip("R1", "A", 1300)},
+        pins, 1000, 10);
+    CHECK(r.pinned_pool.size() == 1);
+    CHECK(r.pinned_leaving_soon[0] == true);  // green pin
+  }
+
+  // -- PIN_BOTH with multiple instances of same route (the "2 Line" scenario) --
+
+  TEST_CASE("PIN_BOTH — mixed: some instances green, some red") {
+    // Scenario from the spec: "2 Line" pinned both, threshold = 10 min
+    // Departures at 2min, 8min, 13min from now
+    std::map<std::string, PinMode> pins = {{"2:Downtown", PIN_BOTH}};
+    unsigned int now = 1000;
+    std::vector<Trip> trips = {
+        make_trip("2", "Downtown", now + 120),   // 2 min
+        make_trip("2", "Downtown", now + 480),   // 8 min
+        make_trip("2", "Downtown", now + 780),   // 13 min
+    };
+    auto r = partition_trips(trips, pins, now, 10);
+
+    // All three share the same composite_key. After dedup, only the first
+    // (soonest) survives in the pinned pool. The duplicates are discarded
+    // (dedup_pinned_section erases them from the vector entirely).
+    CHECK(r.pinned_pool.size() == 1);
+    CHECK(r.pinned_pool[0].departure_time == now + 120);
+    CHECK(r.pinned_leaving_soon[0] == true);  // 2 min is within 10 min
+    CHECK(r.unpinned_pool.size() == 0);
+  }
+
+  TEST_CASE("PIN_BOTH — distinct stop_ids show mixed green/red pins") {
+    // Same route at different stops — composite_keys differ, so all survive dedup.
+    // This matches the user scenario: 2 Line at 2min(green), 8min(green), 13min(red).
+    std::map<std::string, PinMode> pins = {
+        {"2:Downtown:S1", PIN_BOTH},
+        {"2:Downtown:S2", PIN_BOTH},
+        {"2:Downtown:S3", PIN_BOTH},
+    };
+    unsigned int now = 1000;
+    std::vector<Trip> trips = {
+        make_trip("2", "Downtown", now + 120, false, "S1"),   // 2 min
+        make_trip("2", "Downtown", now + 480, false, "S2"),   // 8 min
+        make_trip("2", "Downtown", now + 780, false, "S3"),   // 13 min
+    };
+    auto r = partition_trips(trips, pins, now, 10);
+
+    CHECK(r.pinned_pool.size() == 3);
+    // 2 min and 8 min are within 10 min threshold → green
+    CHECK(r.pinned_leaving_soon[0] == true);
+    CHECK(r.pinned_leaving_soon[1] == true);
+    // 13 min is outside threshold → red
+    CHECK(r.pinned_leaving_soon[2] == false);
+  }
+
+  TEST_CASE("PIN_BOTH — multiple distinct routes, mixed pin states") {
+    // "2 Line" and "E Line" both PIN_BOTH, threshold 10 min
+    std::map<std::string, PinMode> pins = {
+        {"2:Downtown", PIN_BOTH},
+        {"E:Airport", PIN_BOTH},
+    };
+    unsigned int now = 1000;
+    std::vector<Trip> trips = {
+        make_trip("2", "Downtown", now + 120),   // 2 min — green
+        make_trip("E", "Airport", now + 900),    // 15 min — red
+        make_trip("2", "Downtown", now + 780),   // 13 min — (deduped)
+    };
+    auto r = partition_trips(trips, pins, now, 10);
+
+    // After dedup: one "2:Downtown" (first) and one "E:Airport"
+    CHECK(r.pinned_pool.size() == 2);
+    CHECK(r.pinned_pool[0].route_id == "2");
+    CHECK(r.pinned_pool[1].route_id == "E");
+    CHECK(r.pinned_leaving_soon[0] == true);   // 2 min < 10 min
+    CHECK(r.pinned_leaving_soon[1] == false);  // 15 min > 10 min
+  }
+
+  // -- Mixed pin modes --
+
+  TEST_CASE("mixed: PIN_GENERAL + PIN_LEAVING_SOON + unpinned") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    std::vector<Trip> trips = {
+        make_trip("R1", "A", now + 1200),  // PIN_GENERAL, 20 min
+        make_trip("R2", "B", now + 300),   // PIN_LEAVING_SOON, 5 min (within 10)
+        make_trip("R3", "C", now + 400),   // unpinned
+    };
+    auto r = partition_trips(trips, pins, now, 10);
+
+    // R1 (general) and R2 (leaving soon, within threshold) are pinned
+    CHECK(r.pinned_pool.size() == 2);
+    CHECK(r.unpinned_pool.size() == 1);
+    CHECK(r.unpinned_pool[0].route_id == "R3");
+
+    // Find R1 and R2 in pinned pool (order preserved by stable_partition)
+    // R1 and R2 are both "effectively pinned", so they stay in their
+    // relative order from the visible list
+    bool found_r1 = false, found_r2 = false;
+    for (size_t i = 0; i < r.pinned_pool.size(); i++) {
+      if (r.pinned_pool[i].route_id == "R1") {
+        found_r1 = true;
+        CHECK(r.pinned_leaving_soon[i] == false);  // PIN_GENERAL → red
+      }
+      if (r.pinned_pool[i].route_id == "R2") {
+        found_r2 = true;
+        CHECK(r.pinned_leaving_soon[i] == true);   // PIN_LEAVING_SOON → green
+      }
+    }
+    CHECK(found_r1);
+    CHECK(found_r2);
+  }
+
+  TEST_CASE("mixed: PIN_LEAVING_SOON outside threshold stays unpinned with PIN_GENERAL") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    std::vector<Trip> trips = {
+        make_trip("R1", "A", now + 1200),  // PIN_GENERAL
+        make_trip("R2", "B", now + 900),   // PIN_LEAVING_SOON, 15 min (outside 10)
+        make_trip("R3", "C", now + 400),   // unpinned
+    };
+    auto r = partition_trips(trips, pins, now, 10);
+
+    // Only R1 is pinned; R2 is unpinned (outside threshold)
+    CHECK(r.pinned_pool.size() == 1);
+    CHECK(r.pinned_pool[0].route_id == "R1");
+    CHECK(r.pinned_leaving_soon[0] == false);
+
+    CHECK(r.unpinned_pool.size() == 2);
+  }
+
+  // -- Threshold variation --
+
+  TEST_CASE("threshold 5 min — trip at 4 min is pinned") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_LEAVING_SOON}};
+    auto r = partition_trips(
+        {make_trip("R1", "A", 1240)},  // 4 min from now
+        pins, 1000, 5);
+    CHECK(r.pinned_pool.size() == 1);
+    CHECK(r.pinned_leaving_soon[0] == true);
+  }
+
+  TEST_CASE("threshold 5 min — trip at 6 min stays unpinned") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_LEAVING_SOON}};
+    auto r = partition_trips(
+        {make_trip("R1", "A", 1360)},  // 6 min from now
+        pins, 1000, 5);
+    CHECK(r.pinned_pool.size() == 0);
+    CHECK(r.unpinned_pool.size() == 1);
+  }
+
+  TEST_CASE("threshold 60 min — trip at 59 min is pinned") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_LEAVING_SOON}};
+    auto r = partition_trips(
+        {make_trip("R1", "A", 4540)},  // 59 min from now
+        pins, 1000, 60);
+    CHECK(r.pinned_pool.size() == 1);
+    CHECK(r.pinned_leaving_soon[0] == true);
+  }
+
+  // -- No pinned routes at all --
+
+  TEST_CASE("no pinned routes — all unpinned") {
+    std::map<std::string, PinMode> pins;
+    auto r = partition_trips(
+        {make_trip("R1", "A", 1300), make_trip("R2", "B", 1400)},
+        pins, 1000, 10);
+    CHECK(r.pinned_pool.size() == 0);
+    CHECK(r.unpinned_pool.size() == 2);
+  }
+
+  // -- PIN_NONE should not pin --
+
+  TEST_CASE("PIN_NONE — treated as unpinned") {
+    std::map<std::string, PinMode> pins = {{"R1:A", PIN_NONE}};
+    auto r = partition_trips(
+        {make_trip("R1", "A", 1120)},
+        pins, 1000, 10);
+    CHECK(r.pinned_pool.size() == 0);
+    CHECK(r.unpinned_pool.size() == 1);
+  }
+
+  // -- DisplayDiff stores leaving_soon correctly --
+
+  TEST_CASE("DisplayDiff commit stores is_leaving_soon") {
+    DisplayDiff diff;
+    std::vector<std::string> keys = {"R1:A"};
+    std::vector<time_t> deps = {1300};
+    std::vector<Trip> trips = {make_trip("R1", "A", 1300)};
+    std::vector<bool> is_p = {true};
+    std::vector<bool> is_ls = {true};
+    std::set<std::string> pinned = {"R1:A"};
+
+    diff.commit(keys, deps, trips, is_p, is_ls, 1, pinned);
+    CHECK(diff.prev_is_leaving_soon.size() == 1);
+    CHECK(diff.prev_is_leaving_soon[0] == true);
+  }
+
+  TEST_CASE("DisplayDiff commit stores mixed leaving_soon flags") {
+    DisplayDiff diff;
+    std::vector<std::string> keys = {"R1:A", "R2:B"};
+    std::vector<time_t> deps = {1300, 1900};
+    std::vector<Trip> trips = {make_trip("R1", "A", 1300), make_trip("R2", "B", 1900)};
+    std::vector<bool> is_p = {true, true};
+    std::vector<bool> is_ls = {true, false};  // R1 leaving soon, R2 not
+    std::set<std::string> pinned = {"R1:A", "R2:B"};
+
+    diff.commit(keys, deps, trips, is_p, is_ls, 2, pinned);
+    REQUIRE(diff.prev_is_leaving_soon.size() == 2);
+    CHECK(diff.prev_is_leaving_soon[0] == true);
+    CHECK(diff.prev_is_leaving_soon[1] == false);
+  }
+
+  // -- Transition stores leaving_soon --
+
+  TEST_CASE("Transition reset clears old_is_leaving_soon") {
+    Transition tr;
+    tr.old_is_leaving_soon = {true, false};
+    tr.reset();
+    CHECK(tr.old_is_leaving_soon.empty());
   }
 }

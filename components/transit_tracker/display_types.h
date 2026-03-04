@@ -12,6 +12,17 @@ namespace esphome {
 namespace transit_tracker {
 
 // =====================================================================
+// Pin modes
+// =====================================================================
+
+enum PinMode : uint8_t {
+  PIN_NONE = 0,       // Not pinned (Off or On)
+  PIN_GENERAL = 1,    // Always in pinned section, red pin
+  PIN_LEAVING_SOON = 2, // Unpinned until departure < threshold, then green pin
+  PIN_BOTH = 3,       // Always pinned; green pin when departure < threshold, else red
+};
+
+// =====================================================================
 // Easing
 // =====================================================================
 
@@ -284,6 +295,7 @@ struct DisplayDiff {
   std::vector<time_t> prev_departures;
   std::vector<Trip> prev_trips;
   std::vector<bool> prev_is_pinned;
+  std::vector<bool> prev_is_leaving_soon;
   int prev_pinned_count{-1};
   std::set<std::string> prev_pinned_routes;
 
@@ -325,12 +337,14 @@ struct DisplayDiff {
               const std::vector<time_t> &deps,
               const std::vector<Trip> &trips,
               const std::vector<bool> &is_pinned,
+              const std::vector<bool> &is_leaving_soon,
               int pinned_count,
               const std::set<std::string> &pinned_routes) {
     prev_keys = keys;
     prev_departures = deps;
     prev_trips = trips;
     prev_is_pinned = is_pinned;
+    prev_is_leaving_soon = is_leaving_soon;
     prev_pinned_count = pinned_count;
     prev_pinned_routes = pinned_routes;
   }
@@ -360,6 +374,7 @@ struct Transition {
   // Snapshot of display content at transition start (for WAIT_SCROLL + COLLAPSE)
   std::vector<Trip> old_trips;
   std::vector<bool> old_is_pinned;
+  std::vector<bool> old_is_leaving_soon;
   int old_eff_pinned{0};
   bool old_respect_pin_inset{true};
 
@@ -401,6 +416,7 @@ struct Transition {
     animate_pinned = animate_unpinned = false;
     old_trips.clear();
     old_is_pinned.clear();
+    old_is_leaving_soon.clear();
     old_eff_pinned = 0;
     old_respect_pin_inset = true;
     is_vscroll = false;
