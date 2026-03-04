@@ -2624,6 +2624,7 @@ struct SplitPinResult {
   std::vector<Trip> departure_pool;  // PIN_LEAVING_SOON, or PIN_BOTH when leaving soon
   std::vector<Trip> pinned_pool;     // combined: general first, then departure
   std::vector<Trip> unpinned_pool;
+  std::vector<Trip> demoted_to_unpinned;
   int actual_pinned;
   int eff_pinned;
   int eff_general;
@@ -2669,28 +2670,52 @@ static SplitPinResult split_pin_partition(
       if (!eff) break;
       actual_pinned++;
     }
-    dedup_pinned_section(visible, actual_pinned);
   }
+  int original_actual_pinned = actual_pinned;
 
-  // Split into general and departure pools
+  // Split into general and departure pools (with inline dedup)
   std::vector<Trip> general_pool;
   std::vector<Trip> departure_pool;
-  for (int i = 0; i < actual_pinned; i++) {
-    const auto &t = visible[i];
-    auto it = pinned_routes.find(t.composite_key());
-    if (it == pinned_routes.end()) continue;
-    int secs_until = (int)(t.departure_time - rtc_now);
-    bool leaving_soon = (secs_until < threshold_sec);
-    switch (it->second) {
-      case PIN_GENERAL: general_pool.push_back(t); break;
-      case PIN_LEAVING_SOON: departure_pool.push_back(t); break;
-      case PIN_BOTH:
-        if (leaving_soon) departure_pool.push_back(t);
-        else general_pool.push_back(t);
-        break;
-      default: break;
+  std::vector<Trip> demoted_to_unpinned;
+  {
+    std::set<std::string> seen_pinned_keys;
+    for (int i = 0; i < actual_pinned; i++) {
+      const auto &t = visible[i];
+      auto key = t.composite_key();
+      auto it = pinned_routes.find(key);
+      if (it == pinned_routes.end()) continue;
+      bool is_dup = seen_pinned_keys.count(key) > 0;
+      seen_pinned_keys.insert(key);
+      int secs_until = (int)(t.departure_time - rtc_now);
+      bool leaving_soon = (secs_until < threshold_sec);
+      if (is_dup) {
+        switch (it->second) {
+          case PIN_GENERAL:
+          case PIN_BOTH:
+            general_pool.push_back(t);
+            break;
+          case PIN_LEAVING_SOON:
+            if (leaving_soon) departure_pool.push_back(t);  // still within threshold
+            else demoted_to_unpinned.push_back(t);
+            break;
+          default:
+            demoted_to_unpinned.push_back(t);
+            break;
+        }
+      } else {
+        switch (it->second) {
+          case PIN_GENERAL: general_pool.push_back(t); break;
+          case PIN_LEAVING_SOON: departure_pool.push_back(t); break;
+          case PIN_BOTH:
+            if (leaving_soon) departure_pool.push_back(t);
+            else general_pool.push_back(t);
+            break;
+          default: break;
+        }
+      }
     }
   }
+  actual_pinned = (int)(general_pool.size() + departure_pool.size());
 
   bool has_pin_split = (general_pool.size() > 0 && departure_pool.size() > 0);
 
@@ -2712,8 +2737,8 @@ static SplitPinResult split_pin_partition(
       }
       eff_pinned = eff_general + eff_departure;
     } else {
-      // Single pin type — at most 1 pinned row; multi-row is only for splits
-      eff_pinned = std::min(1, actual_pinned);
+      // Single pin type — respect pinned_rows_count setting and allow paging
+      eff_pinned = std::min(pinned_rows_count, actual_pinned);
     }
   } else {
     eff_pinned = 0;
@@ -2726,12 +2751,19 @@ static SplitPinResult split_pin_partition(
   for (int i = 0; i < eff_departure; i++) pinned_pool.push_back(departure_pool[i]);
   if (!has_pin_split && actual_pinned > 0) {
     pinned_pool.clear();
-    for (int i = 0; i < std::min(actual_pinned, eff_pinned); i++)
-      pinned_pool.push_back(visible[i]);
+    auto &single_pool = general_pool.empty() ? departure_pool : general_pool;
+    int take = std::min((int)single_pool.size(), eff_pinned);
+    for (int i = 0; i < take; i++)
+      pinned_pool.push_back(single_pool[i]);
   }
-  std::vector<Trip> unpinned_pool(visible.begin() + actual_pinned, visible.end());
+  std::vector<Trip> unpinned_pool(demoted_to_unpinned.begin(), demoted_to_unpinned.end());
+  unpinned_pool.insert(unpinned_pool.end(), visible.begin() + original_actual_pinned, visible.end());
+  if (!demoted_to_unpinned.empty()) {
+    std::stable_sort(unpinned_pool.begin(), unpinned_pool.end(),
+        [](const Trip &a, const Trip &b) { return a.departure_time < b.departure_time; });
+  }
 
-  return {general_pool, departure_pool, pinned_pool, unpinned_pool,
+  return {general_pool, departure_pool, pinned_pool, unpinned_pool, demoted_to_unpinned,
           actual_pinned, eff_pinned, eff_general, eff_departure,
           eff_unpinned, has_pin_split};
 }
@@ -3045,7 +3077,7 @@ TEST_SUITE("SplitPinLayout") {
 
   // ---- No split fallback: original behavior ----
 
-  TEST_CASE("no split — pinned_pool uses original visible order, capped at 1") {
+  TEST_CASE("no split — pinned_pool respects pinned_rows_count in non-split") {
     std::map<std::string, PinMode> pins = {
         {"R1:A", PIN_GENERAL},
         {"R2:B", PIN_GENERAL},
@@ -3057,9 +3089,10 @@ TEST_SUITE("SplitPinLayout") {
          make_trip("R3", "C", now + 400)},
         pins, now, 10, 2, 1, 3);
     CHECK(!r.has_pin_split);
-    CHECK(r.eff_pinned == 1);  // capped at 1 when no split
-    CHECK(r.pinned_pool.size() == 1);
+    CHECK(r.eff_pinned == 2);  // respects pinned_rows_count=2
+    CHECK(r.pinned_pool.size() == 2);
     CHECK(r.pinned_pool[0].route_id == "R1");
+    CHECK(r.pinned_pool[1].route_id == "R2");
   }
 
   // ---- PIN_BOTH dynamic movement ----
@@ -3107,7 +3140,7 @@ TEST_SUITE("SplitPinLayout") {
     CHECK(!r.has_pin_split);
     CHECK(r.general_pool.empty());
     CHECK(r.departure_pool.size() == 2);
-    CHECK(r.eff_pinned == 1);  // capped at 1 when no split
+    CHECK(r.eff_pinned == 2);  // respects pinned_rows_count=2
   }
 
   TEST_CASE("all pinned general — no departure, no split") {
@@ -3277,7 +3310,7 @@ TEST_SUITE("SplitPinLayout") {
 
   // ---- Dedup interaction ----
 
-  TEST_CASE("dedup within split: duplicate general keys are deduped before splitting") {
+  TEST_CASE("dedup within split: duplicate PIN_GENERAL stays in general pool") {
     std::map<std::string, PinMode> pins = {
         {"R1:A", PIN_GENERAL},
         {"R2:B", PIN_LEAVING_SOON},
@@ -3285,21 +3318,93 @@ TEST_SUITE("SplitPinLayout") {
     unsigned int now = 1000;
     auto r = split_pin_partition(
         {make_trip("R1", "A", now + 1800),
-         make_trip("R1", "A", now + 2000),  // duplicate
+         make_trip("R1", "A", now + 2000),  // dup PIN_GENERAL → general (red)
          make_trip("R2", "B", now + 300),
          make_trip("R3", "C", now + 400)},
         pins, now, 10, 2, 1, 4);
-    // After dedup: only 1 R1:A and 1 R2:B in pinned
-    CHECK(r.actual_pinned == 2);
-    CHECK(r.general_pool.size() == 1);
+    // Duplicate PIN_GENERAL goes to general_pool (red pin)
+    CHECK(r.actual_pinned == 3);
+    CHECK(r.general_pool.size() == 2);  // first + duplicate
     CHECK(r.departure_pool.size() == 1);
+    CHECK(r.unpinned_pool.size() == 1);  // R3:C
   }
 
-  // ---- Cap-at-1 for non-split (bug fix) ----
+  TEST_CASE("PIN_BOTH dups: leaving-soon first → departure, dup → general (red)") {
+    // Simulates the real scenario: all routes PIN_BOTH, most leaving soon,
+    // duplicates should go to general pool instead of being erased.
+    std::map<std::string, PinMode> pins = {
+        {"545:DT Seattle", PIN_BOTH},
+        {"2Line:S Bellevue", PIN_BOTH},
+        {"BLine:BTC", PIN_BOTH},
+        {"BLine:DTR", PIN_BOTH},
+    };
+    unsigned int now = 1000;
+    // 545 at +60 (LS), 2Line at +120 (LS), BLine BTC at +300 (LS),
+    // 2Line dup at +720 (not LS), BLine DTR at +840 (not LS),
+    // BLine BTC dup at +900 (not LS), 545 dup at +960 (not LS)
+    auto r = split_pin_partition(
+        {make_trip("545", "DT Seattle", now + 60),
+         make_trip("2Line", "S Bellevue", now + 120),
+         make_trip("BLine", "BTC", now + 300),
+         make_trip("2Line", "S Bellevue", now + 720),   // dup PIN_BOTH
+         make_trip("BLine", "DTR", now + 840),
+         make_trip("BLine", "BTC", now + 900),           // dup PIN_BOTH
+         make_trip("545", "DT Seattle", now + 960)},     // dup PIN_BOTH
+        pins, now, 10, 2, 1, 3);
 
-  TEST_CASE("bug: two green pins with pinned_rows=2 — capped at 1 row") {
-    // The original bug: PIN_BOTH routes all leaving soon, pinned_rows=2,
-    // showed 2 rows. Should only show 1 when no split.
+    // First-occurrences leaving soon → departure_pool (green)
+    CHECK(r.departure_pool.size() == 3);  // 545, 2Line, BLine BTC
+    // First-occurrence NOT leaving soon + duplicates → general_pool (red)
+    CHECK(r.general_pool.size() == 4);    // BLine DTR (first) + 2Line dup + BLine BTC dup + 545 dup
+    CHECK(r.has_pin_split);
+    CHECK(r.actual_pinned == 7);  // all in pools, none erased
+    CHECK(r.unpinned_pool.empty());  // no unpinned routes
+    CHECK(r.demoted_to_unpinned.empty());  // no PIN_LEAVING_SOON dups
+  }
+
+  TEST_CASE("PIN_LEAVING_SOON dups within threshold: all stay in departure") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_LEAVING_SOON},
+        {"R2:B", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 300),   // first → departure (green)
+         make_trip("R1", "A", now + 400),   // dup, still within threshold → departure (green)
+         make_trip("R2", "B", now + 1800),
+         make_trip("R3", "C", now + 500)},
+        pins, now, 10, 2, 1, 4);
+    CHECK(r.departure_pool.size() == 2);  // both R1 trips within threshold
+    CHECK(r.general_pool.size() == 1);
+    CHECK(r.demoted_to_unpinned.empty());
+    CHECK(r.unpinned_pool.size() == 1);  // R3:C only
+  }
+
+  TEST_CASE("PIN_LEAVING_SOON dup outside threshold: stays in unpinned naturally") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_LEAVING_SOON},
+        {"R2:B", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 300),   // first → departure (green)
+         make_trip("R1", "A", now + 700),   // outside threshold → not eff. pinned → unpinned
+         make_trip("R2", "B", now + 1800),
+         make_trip("R3", "C", now + 500)},
+        pins, now, 10, 2, 1, 4);
+    CHECK(r.departure_pool.size() == 1);
+    CHECK(r.general_pool.size() == 1);
+    CHECK(r.demoted_to_unpinned.empty());  // never reached dedup — was unpinned from partition
+    // unpinned: R1 dup (700) then R3 (500), original order from partition
+    CHECK(r.unpinned_pool.size() == 2);
+    CHECK(r.unpinned_pool[0].departure_time == (time_t)(now + 700));
+    CHECK(r.unpinned_pool[1].departure_time == (time_t)(now + 500));
+  }
+
+  // ---- Non-split respects pinned_rows_count ----
+
+  TEST_CASE("two green pins with pinned_rows=2 — both shown in non-split") {
+    // With the fix, non-split mode respects pinned_rows_count
     std::map<std::string, PinMode> pins = {
         {"R1:A:S1", PIN_BOTH},
         {"R1:A:S2", PIN_BOTH},
@@ -3313,11 +3418,11 @@ TEST_SUITE("SplitPinLayout") {
     CHECK(!r.has_pin_split);
     CHECK(r.departure_pool.size() == 2);
     CHECK(r.general_pool.empty());
-    CHECK(r.eff_pinned == 1);  // capped at 1, not 2
-    CHECK(r.eff_unpinned == 2);
+    CHECK(r.eff_pinned == 2);  // respects pinned_rows_count
+    CHECK(r.eff_unpinned == 1);
   }
 
-  TEST_CASE("two red pins with pinned_rows=2 — capped at 1 row") {
+  TEST_CASE("two red pins with pinned_rows=2 — both shown in non-split") {
     std::map<std::string, PinMode> pins = {
         {"R1:A", PIN_GENERAL},
         {"R2:B", PIN_GENERAL},
@@ -3329,8 +3434,8 @@ TEST_SUITE("SplitPinLayout") {
          make_trip("R3", "C", now + 400)},
         pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/1, /*limit=*/3);
     CHECK(!r.has_pin_split);
-    CHECK(r.eff_pinned == 1);  // capped at 1
-    CHECK(r.eff_unpinned == 2);
+    CHECK(r.eff_pinned == 2);  // respects pinned_rows_count
+    CHECK(r.eff_unpinned == 1);
   }
 
   TEST_CASE("split active with pinned_rows=2 — uses full allocation") {
@@ -3648,7 +3753,7 @@ TEST_SUITE("SplitPinPaging") {
     CHECK(!dep_p.needs_paging((int)r.departure_pool.size(), r.eff_departure));
   }
 
-  TEST_CASE("non-split mode: no paging since eff_pinned capped at 1") {
+  TEST_CASE("non-split mode: paging works with pinned_rows_count=1 and pool>1") {
     std::map<std::string, PinMode> pins = {
         {"R1:A", PIN_GENERAL},
         {"R2:B", PIN_GENERAL},
@@ -3658,15 +3763,26 @@ TEST_SUITE("SplitPinPaging") {
         {make_trip("R1", "A", now + 1800),
          make_trip("R2", "B", now + 1900),
          make_trip("R3", "C", now + 400)},
-        pins, now, 10, 2, 1, 3);
+        pins, now, 10, 1, 1, 3);
 
     CHECK(!r.has_pin_split);
     CHECK(r.eff_pinned == 1);
+    CHECK(r.general_pool.size() == 2);
 
+    // The single-pool pager should page through the general pool
     ScrollContainer pager;
     pager.reset();
-    pager.clamp((int)r.pinned_pool.size(), r.eff_pinned);
-    CHECK(!pager.needs_paging((int)r.pinned_pool.size(), r.eff_pinned));
+    pager.clamp((int)r.general_pool.size(), r.eff_pinned);
+    CHECK(pager.needs_paging((int)r.general_pool.size(), r.eff_pinned));
+
+    // Page 0: R1
+    int si = pager.start_index((int)r.general_pool.size(), r.eff_pinned);
+    CHECK(r.general_pool[si].route_id == "R1");
+
+    // Page 1: R2
+    pager.advance_page((int)r.general_pool.size(), r.eff_pinned);
+    si = pager.start_index((int)r.general_pool.size(), r.eff_pinned);
+    CHECK(r.general_pool[si].route_id == "R2");
   }
 
   TEST_CASE("PIN_BOTH mixed: departure sub-pool pages correctly") {

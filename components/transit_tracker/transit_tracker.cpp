@@ -1243,34 +1243,64 @@ void HOT TransitTracker::draw_schedule() {
       if (!eff_pinned_trip) break;
       actual_pinned++;
     }
-    dedup_pinned_section(visible, actual_pinned);
   }
+  int original_actual_pinned = actual_pinned;
 
   // ---- 4b. Split pinned trips into general (red) and departure (green) pools ----
-  // General: PIN_GENERAL, or PIN_BOTH when NOT leaving soon
-  // Departure: PIN_LEAVING_SOON, or PIN_BOTH when leaving soon
+  // First occurrence of each composite_key is routed by pin mode:
+  //   PIN_GENERAL → general (red)
+  //   PIN_LEAVING_SOON → departure (green) if within threshold
+  //   PIN_BOTH → departure if leaving soon, else general
+  // Duplicate occurrences:
+  //   PIN_GENERAL / PIN_BOTH → general (red) — always-pinned routes stay visible
+  //   PIN_LEAVING_SOON → departure (green) if within threshold, else unpinned
   std::vector<Trip> general_pool;
   std::vector<Trip> departure_pool;
-  for (int i = 0; i < actual_pinned; i++) {
-    const auto &t = visible[i];
-    auto it = this->pinned_routes_.find(t.composite_key());
-    if (it == this->pinned_routes_.end()) continue;
-    int secs_until = (int)(t.departure_time - rtc_now);
-    bool leaving_soon = (secs_until < leaving_soon_threshold_sec);
-    switch (it->second) {
-      case PIN_GENERAL:
-        general_pool.push_back(t);
-        break;
-      case PIN_LEAVING_SOON:
-        departure_pool.push_back(t);  // only in pinned section when leaving soon
-        break;
-      case PIN_BOTH:
-        if (leaving_soon) departure_pool.push_back(t);
-        else general_pool.push_back(t);
-        break;
-      default: break;
+  std::vector<Trip> demoted_to_unpinned;
+  {
+    std::set<std::string> seen_pinned_keys;
+    for (int i = 0; i < actual_pinned; i++) {
+      const auto &t = visible[i];
+      auto key = t.composite_key();
+      auto it = this->pinned_routes_.find(key);
+      if (it == this->pinned_routes_.end()) continue;
+      bool is_dup = seen_pinned_keys.count(key) > 0;
+      seen_pinned_keys.insert(key);
+      int secs_until = (int)(t.departure_time - rtc_now);
+      bool leaving_soon = (secs_until < leaving_soon_threshold_sec);
+      if (is_dup) {
+        switch (it->second) {
+          case PIN_GENERAL:
+          case PIN_BOTH:
+            general_pool.push_back(t);  // always-pinned duplicates → red pin
+            break;
+          case PIN_LEAVING_SOON:
+            if (leaving_soon) departure_pool.push_back(t);  // still within threshold → green
+            else demoted_to_unpinned.push_back(t);
+            break;
+          default:
+            demoted_to_unpinned.push_back(t);
+            break;
+        }
+      } else {
+        switch (it->second) {
+          case PIN_GENERAL:
+            general_pool.push_back(t);
+            break;
+          case PIN_LEAVING_SOON:
+            departure_pool.push_back(t);
+            break;
+          case PIN_BOTH:
+            if (leaving_soon) departure_pool.push_back(t);
+            else general_pool.push_back(t);
+            break;
+          default: break;
+        }
+      }
     }
   }
+  // Update actual_pinned to reflect the pools (excluding demoted dups)
+  actual_pinned = (int)(general_pool.size() + departure_pool.size());
 
   // Detect whether we have a split layout (both general and departure pins active)
   bool has_pin_split = (general_pool.size() > 0 && departure_pool.size() > 0);
@@ -1302,21 +1332,26 @@ void HOT TransitTracker::draw_schedule() {
       // Shrink eff_pinned to what we actually have
       eff_pinned = eff_general + eff_departure;
     } else {
-      // Single pin type — at most 1 pinned row; multi-row is only for splits
-      eff_pinned = std::min(1, actual_pinned);
+      // Single pin type — respect pinned_rows_count setting and allow paging
+      eff_pinned = std::min(this->pinned_rows_count_, actual_pinned);
     }
   } else {
     eff_pinned = 0;
   }
   int eff_unpinned = this->limit_ - eff_pinned;
 
-  // Build unpinned pool (same for all modes)
-  std::vector<Trip> unpinned_pool(visible.begin() + actual_pinned, visible.end());
+  // Build unpinned pool: demoted duplicate trips + originally-unpinned, sorted by departure
+  std::vector<Trip> unpinned_pool(demoted_to_unpinned.begin(), demoted_to_unpinned.end());
+  unpinned_pool.insert(unpinned_pool.end(), visible.begin() + original_actual_pinned, visible.end());
+  if (!demoted_to_unpinned.empty()) {
+    std::stable_sort(unpinned_pool.begin(), unpinned_pool.end(),
+        [](const Trip &a, const Trip &b) { return a.departure_time < b.departure_time; });
+  }
 
   // ---- 5. Paginate & build pinned_pool ----
   // In split mode, pinned_pager_ pages the general sub-pool and
   // departure_pager_ pages the departure sub-pool independently.
-  // In non-split mode, eff_pinned ≤ 1 so no paging is needed.
+  // In non-split mode, pinned_pager_ pages the single active pool.
   std::vector<Trip> pinned_pool;
   if (has_pin_split) {
     this->pinned_pager_.clamp((int)general_pool.size(), eff_general);
@@ -1328,8 +1363,12 @@ void HOT TransitTracker::draw_schedule() {
     for (int i = g_si; i < g_ei; i++) pinned_pool.push_back(general_pool[i]);
     for (int i = d_si; i < d_ei; i++) pinned_pool.push_back(departure_pool[i]);
   } else if (actual_pinned > 0) {
-    for (int i = 0; i < std::min(actual_pinned, eff_pinned); i++) pinned_pool.push_back(visible[i]);
-    this->pinned_pager_.reset();
+    // Non-split: all pinned trips are the same type; page with pinned_pager_
+    auto &single_pool = general_pool.empty() ? departure_pool : general_pool;
+    this->pinned_pager_.clamp((int)single_pool.size(), eff_pinned);
+    int si = this->pinned_pager_.start_index((int)single_pool.size(), eff_pinned);
+    int ei = this->pinned_pager_.end_index((int)single_pool.size(), eff_pinned);
+    for (int i = si; i < ei; i++) pinned_pool.push_back(single_pool[i]);
     this->departure_pager_.reset();
   } else {
     this->pinned_pager_.reset();
@@ -1469,10 +1508,20 @@ void HOT TransitTracker::draw_schedule() {
       // In split mode, pinned_pager_ pages general_pool and departure_pager_
       // pages departure_pool.  Either needing a page triggers pinned_due
       // (both sub-pools advance together since they share the pinned section).
-      int gen_pager_pool = has_pin_split ? (int)general_pool.size() : (int)pinned_pool.size();
-      int gen_pager_slots = has_pin_split ? eff_general : eff_pinned;
-      int dep_pager_pool = has_pin_split ? (int)departure_pool.size() : 0;
-      int dep_pager_slots = has_pin_split ? eff_departure : 0;
+      // In non-split mode, pinned_pager_ pages the single active pool.
+      int gen_pager_pool, gen_pager_slots, dep_pager_pool, dep_pager_slots;
+      if (has_pin_split) {
+        gen_pager_pool = (int)general_pool.size();
+        gen_pager_slots = eff_general;
+        dep_pager_pool = (int)departure_pool.size();
+        dep_pager_slots = eff_departure;
+      } else {
+        int single_pool_size = (int)general_pool.size() + (int)departure_pool.size();
+        gen_pager_pool = single_pool_size;
+        gen_pager_slots = eff_pinned;
+        dep_pager_pool = 0;
+        dep_pager_slots = 0;
+      }
 
       bool gen_needs = this->pinned_pager_.needs_paging(gen_pager_pool, gen_pager_slots);
       bool dep_needs = has_pin_split && this->departure_pager_.needs_paging(dep_pager_pool, dep_pager_slots);
@@ -1527,6 +1576,12 @@ void HOT TransitTracker::draw_schedule() {
           int d_ei = this->departure_pager_.end_index((int)departure_pool.size(), eff_departure);
           for (int i = g_si; i < g_ei; i++) pinned_pool.push_back(general_pool[i]);
           for (int i = d_si; i < d_ei; i++) pinned_pool.push_back(departure_pool[i]);
+        } else if (actual_pinned > 0) {
+          pinned_pool.clear();
+          auto &single_pool = general_pool.empty() ? departure_pool : general_pool;
+          int si = this->pinned_pager_.start_index((int)single_pool.size(), eff_pinned);
+          int ei = this->pinned_pager_.end_index((int)single_pool.size(), eff_pinned);
+          for (int i = si; i < ei; i++) pinned_pool.push_back(single_pool[i]);
         }
 
         // Re-compute rows
