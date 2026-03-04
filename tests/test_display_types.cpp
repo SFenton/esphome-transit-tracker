@@ -1706,3 +1706,242 @@ TEST_SUITE("Respect Pin Inset") {
     CHECK(compute_x_start(kPinIconWidth, true, committed_respect) == kPinIconWidth);
   }
 }
+
+// =====================================================================
+// Always Scroll or Replace — idle self-replace detection
+// =====================================================================
+
+TEST_SUITE("Always Scroll or Replace") {
+
+  // Mirrors the idle detection logic from draw_schedule step 12.
+  // Returns true when a self-replace transition should fire.
+  struct IdleReplaceState {
+    bool always_scroll_or_replace{false};
+    int page_interval{5000};  // ms
+    unsigned long idle_since{0};
+
+    // Returns true when a self-replace should fire.
+    // Call after normal change-detection / paging logic runs.
+    bool check(unsigned long now, bool triggered_transition,
+               bool h_scroll_active, bool post_pause_active,
+               int prev_pinned_count) {
+      if (triggered_transition) {
+        idle_since = 0;
+        return false;
+      }
+      if (!always_scroll_or_replace || prev_pinned_count < 0)
+        return false;
+
+      if (!h_scroll_active && !post_pause_active) {
+        if (idle_since == 0) {
+          idle_since = now;
+          return false;
+        }
+        if (now - idle_since >= (unsigned long)page_interval) {
+          idle_since = 0;
+          return true;
+        }
+        return false;
+      }
+      idle_since = 0;
+      return false;
+    }
+  };
+
+  TEST_CASE("disabled by default — never fires") {
+    IdleReplaceState state;
+    state.always_scroll_or_replace = false;
+    state.page_interval = 5000;
+
+    for (unsigned long t = 0; t <= 20000; t += 100) {
+      CHECK(!state.check(t, false, false, false, 0));
+    }
+  }
+
+  TEST_CASE("fires after page_interval when idle") {
+    IdleReplaceState state;
+    state.always_scroll_or_replace = true;
+    state.page_interval = 5000;
+
+    // First call starts the timer
+    CHECK(!state.check(1000, false, false, false, 0));
+    CHECK(state.idle_since == 1000);
+
+    // Not enough time yet
+    CHECK(!state.check(3000, false, false, false, 0));
+
+    // Just before threshold
+    CHECK(!state.check(5999, false, false, false, 0));
+
+    // At threshold — fires!
+    CHECK(state.check(6000, false, false, false, 0));
+    CHECK(state.idle_since == 0);  // reset after firing
+  }
+
+  TEST_CASE("does not fire on first frame (prev_pinned_count < 0)") {
+    IdleReplaceState state;
+    state.always_scroll_or_replace = true;
+    state.page_interval = 5000;
+
+    for (unsigned long t = 0; t <= 10000; t += 100) {
+      CHECK(!state.check(t, false, false, false, -1));
+    }
+    CHECK(state.idle_since == 0);
+  }
+
+  TEST_CASE("h-scroll active prevents idle timer") {
+    IdleReplaceState state;
+    state.always_scroll_or_replace = true;
+    state.page_interval = 5000;
+
+    // h-scroll active — timer doesn't start
+    CHECK(!state.check(1000, false, true, false, 0));
+    CHECK(state.idle_since == 0);
+
+    CHECK(!state.check(10000, false, true, false, 0));
+    CHECK(state.idle_since == 0);
+  }
+
+  TEST_CASE("post-pause active prevents idle timer") {
+    IdleReplaceState state;
+    state.always_scroll_or_replace = true;
+    state.page_interval = 5000;
+
+    CHECK(!state.check(1000, false, false, true, 0));
+    CHECK(state.idle_since == 0);
+
+    CHECK(!state.check(10000, false, false, true, 0));
+    CHECK(state.idle_since == 0);
+  }
+
+  TEST_CASE("triggered transition resets idle timer") {
+    IdleReplaceState state;
+    state.always_scroll_or_replace = true;
+    state.page_interval = 5000;
+
+    // Start idle timer
+    CHECK(!state.check(1000, false, false, false, 0));
+    CHECK(state.idle_since == 1000);
+
+    // Accumulate some time
+    CHECK(!state.check(4000, false, false, false, 0));
+    CHECK(state.idle_since == 1000);
+
+    // Data change triggers a transition — idle timer resets
+    CHECK(!state.check(4500, true, false, false, 0));
+    CHECK(state.idle_since == 0);
+
+    // Timer restarts from scratch after the interruption
+    CHECK(!state.check(5000, false, false, false, 0));
+    CHECK(state.idle_since == 5000);
+
+    // Full interval from new start
+    CHECK(!state.check(9999, false, false, false, 0));
+    CHECK(state.check(10000, false, false, false, 0));
+  }
+
+  TEST_CASE("h-scroll becoming active mid-idle resets timer") {
+    IdleReplaceState state;
+    state.always_scroll_or_replace = true;
+    state.page_interval = 5000;
+
+    // Start idle timer
+    CHECK(!state.check(1000, false, false, false, 0));
+    CHECK(state.idle_since == 1000);
+
+    // h-scroll becomes active at 3000 — resets timer
+    CHECK(!state.check(3000, false, true, false, 0));
+    CHECK(state.idle_since == 0);
+
+    // h-scroll goes idle again — timer restarts
+    CHECK(!state.check(4000, false, false, false, 0));
+    CHECK(state.idle_since == 4000);
+
+    CHECK(state.check(9000, false, false, false, 0));
+  }
+
+  TEST_CASE("fires repeatedly with correct interval spacing") {
+    IdleReplaceState state;
+    state.always_scroll_or_replace = true;
+    state.page_interval = 5000;
+
+    // First fire (use t=1, not 0 — 0 is sentinel for idle_since)
+    CHECK(!state.check(1, false, false, false, 0));
+    CHECK(state.check(5001, false, false, false, 0));
+
+    // Timer restarted after fire
+    CHECK(!state.check(5001, false, false, false, 0));  // re-initializes
+    CHECK(!state.check(10000, false, false, false, 0));
+    CHECK(state.check(10001, false, false, false, 0));
+
+    // Third fire
+    CHECK(!state.check(10001, false, false, false, 0));
+    CHECK(state.check(15001, false, false, false, 0));
+  }
+
+  TEST_CASE("custom page_interval is respected") {
+    IdleReplaceState state;
+    state.always_scroll_or_replace = true;
+    state.page_interval = 2000;  // shorter
+
+    CHECK(!state.check(1000, false, false, false, 0));
+    CHECK(!state.check(2999, false, false, false, 0));
+    CHECK(state.check(3000, false, false, false, 0));
+  }
+
+  TEST_CASE("works with pinned rows (prev_pinned_count > 0)") {
+    IdleReplaceState state;
+    state.always_scroll_or_replace = true;
+    state.page_interval = 5000;
+
+    CHECK(!state.check(1000, false, false, false, 1));
+    CHECK(state.idle_since == 1000);
+    CHECK(state.check(6000, false, false, false, 1));
+  }
+
+  TEST_CASE("integration: idle → self-replace → post-pause → idle → repeat") {
+    // Simulates the full lifecycle: idle timer fires, transition runs
+    // (which shows as triggered_transition=true or post_pause_active=true),
+    // then back to idle.
+    IdleReplaceState state;
+    state.always_scroll_or_replace = true;
+    state.page_interval = 5000;
+
+    // Phase 1: idle, timer accumulates (use t=1, not 0 — 0 is sentinel)
+    CHECK(!state.check(1, false, false, false, 0));
+    CHECK(!state.check(4000, false, false, false, 0));
+
+    // Phase 2: self-replace fires at 5001
+    CHECK(state.check(5001, false, false, false, 0));
+
+    // Phase 3: transition is active (normally transition_.phase != IDLE,
+    // so check() wouldn't be called, but if it were via triggered_transition):
+    CHECK(!state.check(5100, true, false, false, 0));
+    CHECK(state.idle_since == 0);
+
+    // Phase 4: transition done, post-pause active (timer stays reset)
+    CHECK(!state.check(6000, false, false, true, 0));
+    CHECK(state.idle_since == 0);
+
+    // Phase 5: post-pause ends, idle timer restarts
+    CHECK(!state.check(7000, false, false, false, 0));
+    CHECK(state.idle_since == 7000);
+
+    // Phase 6: fires again after page_interval
+    CHECK(state.check(12000, false, false, false, 0));
+  }
+
+  TEST_CASE("intermittent h-scroll prevents firing") {
+    // Headsign overflow comes and goes — idle timer never accumulates enough
+    IdleReplaceState state;
+    state.always_scroll_or_replace = true;
+    state.page_interval = 5000;
+
+    for (unsigned long t = 0; t < 30000; t += 1000) {
+      // Alternate: 2s idle, 1s scrolling
+      bool scrolling = ((t / 1000) % 3 == 2);
+      bool result = state.check(t, false, scrolling, false, 0);
+      CHECK(!result);  // never accumulates 5 continuous seconds
+    }
+  }
+}

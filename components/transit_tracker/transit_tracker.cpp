@@ -80,6 +80,7 @@ void TransitTracker::dump_config() {
   ESP_LOGCONFIG(TAG, "  Scroll Routes: %s", this->scroll_routes_ ? "true" : "false");
   ESP_LOGCONFIG(TAG, "  Show Pin Icon: %s", this->show_pin_icon_ ? "true" : "false");
   ESP_LOGCONFIG(TAG, "  Respect Pin Inset: %s", this->respect_pin_inset_ ? "true" : "false");
+  ESP_LOGCONFIG(TAG, "  Always Scroll or Replace: %s", this->always_scroll_or_replace_ ? "true" : "false");
 }
 
 void TransitTracker::reconnect() { this->close(); this->connect_ws_(); }
@@ -1260,12 +1261,14 @@ void HOT TransitTracker::draw_schedule() {
 
     bool respect_inset_changed = (this->respect_pin_inset_ != this->committed_respect_pin_inset_)
                                  && eff_pinned > 0;
+    bool triggered_transition = false;
 
     if ((this->diff_.has_changes() || respect_inset_changed) && this->diff_.prev_pinned_count >= 0) {
       // Data/layout changed — start transition
       bool layout_swap = this->diff_.layout_changed || this->diff_.pinned_set_changed || respect_inset_changed;
       this->begin_transition_(this->diff_.prev_trips, this->diff_.prev_is_pinned,
                               this->diff_.prev_pinned_count, layout_swap, now);
+      triggered_transition = true;
     } else if (this->scroll_routes_ && this->diff_.prev_pinned_count >= 0) {
       // Check page timers
       bool pinned_due = false, unpinned_due = false;
@@ -1306,6 +1309,7 @@ void HOT TransitTracker::draw_schedule() {
       if (pinned_due || unpinned_due) {
         this->begin_page_transition_(pinned_pool, unpinned_pool, eff_pinned, eff_unpinned,
                                      pinned_due, unpinned_due, rows, row_pinned, now);
+        triggered_transition = true;
 
         // Re-compute rows with new page indices
         rows.clear(); row_pinned.clear(); keys.clear(); deps.clear();
@@ -1322,6 +1326,26 @@ void HOT TransitTracker::draw_schedule() {
           keys.push_back(unpinned_pool[i].composite_key()); deps.push_back(unpinned_pool[i].departure_time);
         }
       }
+    }
+
+    // Always Scroll or Replace: when the display is completely static
+    // (no h-scroll, no transition, no post-pause hold), trigger a
+    // collapse/replace after page_interval to keep the display alive.
+    if (!triggered_transition && this->always_scroll_or_replace_ && this->diff_.prev_pinned_count >= 0) {
+      bool h_scroll_active = (this->h_scroll_.total_distance > 0 || this->h_scroll_.prev_total_distance > 0);
+      bool post_pause_active = (this->post_pause_end_ != 0 && now < this->post_pause_end_);
+      if (!h_scroll_active && !post_pause_active) {
+        if (this->idle_since_ == 0) {
+          this->idle_since_ = now;
+        } else if (now - this->idle_since_ >= (unsigned long)this->page_interval_) {
+          this->begin_transition_(rows, row_pinned, eff_pinned, false, now);
+          this->idle_since_ = 0;
+        }
+      } else {
+        this->idle_since_ = 0;
+      }
+    } else if (triggered_transition) {
+      this->idle_since_ = 0;
     }
   }
 
