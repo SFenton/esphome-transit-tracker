@@ -1271,8 +1271,11 @@ void HOT TransitTracker::draw_schedule() {
       if (is_dup) {
         switch (it->second) {
           case PIN_GENERAL:
-          case PIN_BOTH:
             general_pool.push_back(t);  // always-pinned duplicates → red pin
+            break;
+          case PIN_BOTH:
+            if (leaving_soon) departure_pool.push_back(t);  // match primary routing
+            else general_pool.push_back(t);
             break;
           case PIN_LEAVING_SOON:
             if (leaving_soon) departure_pool.push_back(t);  // still within threshold → green
@@ -1305,35 +1308,63 @@ void HOT TransitTracker::draw_schedule() {
   // Detect whether we have a split layout (both general and departure pins active)
   bool has_pin_split = (general_pool.size() > 0 && departure_pool.size() > 0);
 
+  // Will the unpinned pool be empty?  Check before computing eff_pinned so
+  // pins can expand to fill all rows when there's nothing else to show.
+  bool unpinned_pool_empty = (demoted_to_unpinned.empty() &&
+                              original_actual_pinned >= (int)visible.size());
+
   // ---- 4c. Compute effective pinned rows with split-aware logic ----
   int eff_pinned;
   int eff_general = 0;
   int eff_departure = 0;
   if (actual_pinned > 0) {
-    eff_pinned = std::min(this->pinned_rows_count_, actual_pinned);
+    if (unpinned_pool_empty) {
+      // No unpinned trips — pins can use ALL rows
+      if (has_pin_split) {
+        // general_pins_count_ determines general rows; remainder → departure
+        eff_general = std::min(this->general_pins_count_, (int)general_pool.size());
+        int dep_slots = this->limit_ - eff_general;
+        eff_departure = std::min(dep_slots, (int)departure_pool.size());
 
-    if (has_pin_split) {
-      // Auto-bump to at least 2 pinned rows when both types are present
-      if (eff_pinned < 2) eff_pinned = std::min(2, this->limit_ - 1);
+        // If departure didn't fill its slots, give surplus back to general
+        int surplus = dep_slots - eff_departure;
+        if (surplus > 0) {
+          int extra = std::min(surplus, (int)general_pool.size() - eff_general);
+          eff_general += extra;
+        }
 
-      // Allocate rows: general first, then departure
-      int gen_want = std::min(this->general_pins_count_, eff_pinned - 1);  // leave ≥1 for departure
-      eff_general = std::min(gen_want, (int)general_pool.size());
-      int dep_slots = eff_pinned - eff_general;
-      eff_departure = std::min(dep_slots, (int)departure_pool.size());
-
-      // If departure didn't fill its slots, give surplus back to general
-      int surplus = dep_slots - eff_departure;
-      if (surplus > 0) {
-        int extra = std::min(surplus, (int)general_pool.size() - eff_general);
-        eff_general += extra;
+        eff_pinned = eff_general + eff_departure;
+      } else {
+        // Single pin type — expand to fill all available rows
+        eff_pinned = std::min(this->limit_, actual_pinned);
       }
-
-      // Shrink eff_pinned to what we actually have
-      eff_pinned = eff_general + eff_departure;
     } else {
-      // Single pin type — respect pinned_rows_count setting and allow paging
+      // Unpinned trips exist — pinned_rows_count_ caps pinned rows as before
       eff_pinned = std::min(this->pinned_rows_count_, actual_pinned);
+
+      if (has_pin_split) {
+        // Auto-bump to at least 2 pinned rows when both types are present
+        if (eff_pinned < 2) eff_pinned = std::min(2, this->limit_ - 1);
+
+        // Allocate rows: general first, then departure
+        int gen_want = std::min(this->general_pins_count_, eff_pinned - 1);  // leave ≥1 for departure
+        eff_general = std::min(gen_want, (int)general_pool.size());
+        int dep_slots = eff_pinned - eff_general;
+        eff_departure = std::min(dep_slots, (int)departure_pool.size());
+
+        // If departure didn't fill its slots, give surplus back to general
+        int surplus = dep_slots - eff_departure;
+        if (surplus > 0) {
+          int extra = std::min(surplus, (int)general_pool.size() - eff_general);
+          eff_general += extra;
+        }
+
+        // Shrink eff_pinned to what we actually have
+        eff_pinned = eff_general + eff_departure;
+      } else {
+        // Single pin type — respect pinned_rows_count setting and allow paging
+        eff_pinned = std::min(this->pinned_rows_count_, actual_pinned);
+      }
     }
   } else {
     eff_pinned = 0;

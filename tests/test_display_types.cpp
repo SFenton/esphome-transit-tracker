@@ -2691,8 +2691,11 @@ static SplitPinResult split_pin_partition(
       if (is_dup) {
         switch (it->second) {
           case PIN_GENERAL:
-          case PIN_BOTH:
             general_pool.push_back(t);
+            break;
+          case PIN_BOTH:
+            if (leaving_soon) departure_pool.push_back(t);
+            else general_pool.push_back(t);
             break;
           case PIN_LEAVING_SOON:
             if (leaving_soon) departure_pool.push_back(t);  // still within threshold
@@ -2719,26 +2722,49 @@ static SplitPinResult split_pin_partition(
 
   bool has_pin_split = (general_pool.size() > 0 && departure_pool.size() > 0);
 
+  // Will the unpinned pool be empty?
+  bool unpinned_pool_empty = (demoted_to_unpinned.empty() &&
+                              original_actual_pinned >= (int)visible.size());
+
   int eff_pinned;
   int eff_general = 0;
   int eff_departure = 0;
   if (actual_pinned > 0) {
-    eff_pinned = std::min(pinned_rows_count, actual_pinned);
-    if (has_pin_split) {
-      if (eff_pinned < 2) eff_pinned = std::min(2, limit - 1);
-      int gen_want = std::min(general_pins_count, eff_pinned - 1);
-      eff_general = std::min(gen_want, (int)general_pool.size());
-      int dep_slots = eff_pinned - eff_general;
-      eff_departure = std::min(dep_slots, (int)departure_pool.size());
-      int surplus = dep_slots - eff_departure;
-      if (surplus > 0) {
-        int extra = std::min(surplus, (int)general_pool.size() - eff_general);
-        eff_general += extra;
+    if (unpinned_pool_empty) {
+      // No unpinned trips — pins can use ALL rows
+      if (has_pin_split) {
+        eff_general = std::min(general_pins_count, (int)general_pool.size());
+        int dep_slots = limit - eff_general;
+        eff_departure = std::min(dep_slots, (int)departure_pool.size());
+        int surplus = dep_slots - eff_departure;
+        if (surplus > 0) {
+          int extra = std::min(surplus, (int)general_pool.size() - eff_general);
+          eff_general += extra;
+        }
+        eff_pinned = eff_general + eff_departure;
+      } else {
+        // Single pin type — expand to fill all available rows
+        eff_pinned = std::min(limit, actual_pinned);
       }
-      eff_pinned = eff_general + eff_departure;
     } else {
-      // Single pin type — respect pinned_rows_count setting and allow paging
+      // Unpinned trips exist — pinned_rows_count caps pinned rows as before
       eff_pinned = std::min(pinned_rows_count, actual_pinned);
+      if (has_pin_split) {
+        if (eff_pinned < 2) eff_pinned = std::min(2, limit - 1);
+        int gen_want = std::min(general_pins_count, eff_pinned - 1);
+        eff_general = std::min(gen_want, (int)general_pool.size());
+        int dep_slots = eff_pinned - eff_general;
+        eff_departure = std::min(dep_slots, (int)departure_pool.size());
+        int surplus = dep_slots - eff_departure;
+        if (surplus > 0) {
+          int extra = std::min(surplus, (int)general_pool.size() - eff_general);
+          eff_general += extra;
+        }
+        eff_pinned = eff_general + eff_departure;
+      } else {
+        // Single pin type — respect pinned_rows_count setting and allow paging
+        eff_pinned = std::min(pinned_rows_count, actual_pinned);
+      }
     }
   } else {
     eff_pinned = 0;
@@ -3170,7 +3196,7 @@ TEST_SUITE("SplitPinLayout") {
     CHECK(r.eff_pinned == 1);
   }
 
-  TEST_CASE("limit=2 with split — can only auto-bump to 1") {
+  TEST_CASE("limit=2 with split — all pinned expands to fill both rows") {
     std::map<std::string, PinMode> pins = {
         {"R1:A", PIN_GENERAL},
         {"R2:B", PIN_LEAVING_SOON},
@@ -3179,8 +3205,25 @@ TEST_SUITE("SplitPinLayout") {
     auto r = split_pin_partition(
         {make_trip("R1", "A", now + 1800), make_trip("R2", "B", now + 300)},
         pins, now, 10, 1, 1, 2);
-    // auto-bump: min(2, limit-1=1) = 1
-    // gen_want=min(1,0)=0, dep_slots=1, eff_departure=1
+    // All trips pinned → unpinned_pool_empty → pins expand to fill all rows
+    // general_pins_count=1 → eff_general=1, dep_slots=limit-1=1, eff_departure=1
+    CHECK(r.eff_pinned == 2);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 0);
+  }
+
+  TEST_CASE("limit=2 with split + unpinned — auto-bump capped at limit-1") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800), make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, 1, 1, 2);
+    // Unpinned trip exists → old auto-bump behavior: min(2, limit-1=1) = 1
     CHECK(r.eff_pinned == 1);
     CHECK(r.eff_general == 0);
     CHECK(r.eff_departure == 1);
@@ -3329,9 +3372,9 @@ TEST_SUITE("SplitPinLayout") {
     CHECK(r.unpinned_pool.size() == 1);  // R3:C
   }
 
-  TEST_CASE("PIN_BOTH dups: leaving-soon first → departure, dup → general (red)") {
+  TEST_CASE("PIN_BOTH dups: leaving-soon first → departure, not-LS dup → general") {
     // Simulates the real scenario: all routes PIN_BOTH, most leaving soon,
-    // duplicates should go to general pool instead of being erased.
+    // duplicates route by their own leaving-soon status (matching primary logic).
     std::map<std::string, PinMode> pins = {
         {"545:DT Seattle", PIN_BOTH},
         {"2Line:S Bellevue", PIN_BOTH},
@@ -3346,20 +3389,65 @@ TEST_SUITE("SplitPinLayout") {
         {make_trip("545", "DT Seattle", now + 60),
          make_trip("2Line", "S Bellevue", now + 120),
          make_trip("BLine", "BTC", now + 300),
-         make_trip("2Line", "S Bellevue", now + 720),   // dup PIN_BOTH
+         make_trip("2Line", "S Bellevue", now + 720),   // dup PIN_BOTH, not LS → general
          make_trip("BLine", "DTR", now + 840),
-         make_trip("BLine", "BTC", now + 900),           // dup PIN_BOTH
-         make_trip("545", "DT Seattle", now + 960)},     // dup PIN_BOTH
+         make_trip("BLine", "BTC", now + 900),           // dup PIN_BOTH, not LS → general
+         make_trip("545", "DT Seattle", now + 960)},     // dup PIN_BOTH, not LS → general
         pins, now, 10, 2, 1, 3);
 
     // First-occurrences leaving soon → departure_pool (green)
     CHECK(r.departure_pool.size() == 3);  // 545, 2Line, BLine BTC
-    // First-occurrence NOT leaving soon + duplicates → general_pool (red)
+    // First-occurrence NOT leaving soon + not-LS duplicates → general_pool (red)
     CHECK(r.general_pool.size() == 4);    // BLine DTR (first) + 2Line dup + BLine BTC dup + 545 dup
     CHECK(r.has_pin_split);
     CHECK(r.actual_pinned == 7);  // all in pools, none erased
     CHECK(r.unpinned_pool.empty());  // no unpinned routes
     CHECK(r.demoted_to_unpinned.empty());  // no PIN_LEAVING_SOON dups
+  }
+
+  TEST_CASE("PIN_BOTH dups: leaving-soon dup → departure (not general)") {
+    // Regression test for the two-green-pin bug:
+    // When a PIN_BOTH route has two trips both within the leaving-soon threshold,
+    // the duplicate must go to departure_pool (green), NOT general_pool.
+    // Old behavior: dup always went to general_pool, but pin color was
+    // re-evaluated as green → visual mismatch (two green pins).
+    std::map<std::string, PinMode> pins = {
+        {"BLine:DTR", PIN_BOTH},
+        {"R2:B", PIN_GENERAL},  // need a general pin to trigger split
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("BLine", "DTR", now + 120),   // first, leaving soon → departure
+         make_trip("BLine", "DTR", now + 300),   // dup, ALSO leaving soon → should be departure
+         make_trip("R2", "B", now + 1800),       // general pin
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, 2, 1, 4);
+
+    // With the fix, leaving-soon dup goes to departure_pool (not general_pool)
+    CHECK(r.departure_pool.size() == 2);  // both BLine trips
+    CHECK(r.general_pool.size() == 1);    // only R2
+    CHECK(r.has_pin_split);
+    CHECK(r.demoted_to_unpinned.empty());
+  }
+
+  TEST_CASE("PIN_BOTH dups: mixed LS — LS dup → departure, not-LS dup → general") {
+    // Two dups of the same PIN_BOTH route: one leaving soon, one not.
+    std::map<std::string, PinMode> pins = {
+        {"BLine:DTR", PIN_BOTH},
+        {"R2:B", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("BLine", "DTR", now + 120),   // first, LS → departure
+         make_trip("BLine", "DTR", now + 300),   // dup, LS → departure
+         make_trip("BLine", "DTR", now + 900),   // dup, NOT LS → general
+         make_trip("R2", "B", now + 1800),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, 2, 1, 5);
+
+    CHECK(r.departure_pool.size() == 2);  // first + LS dup
+    CHECK(r.general_pool.size() == 2);    // R2 + not-LS dup
+    CHECK(r.has_pin_split);
   }
 
   TEST_CASE("PIN_LEAVING_SOON dups within threshold: all stay in departure") {
@@ -3470,6 +3558,171 @@ TEST_SUITE("SplitPinLayout") {
     CHECK(!r.has_pin_split);
     CHECK(r.eff_pinned == 1);
     CHECK(r.pinned_pool.size() == 1);
+  }
+}
+
+// =====================================================================
+// Pin-color consistency — verify row_leaving_soon matches pool assignment
+// =====================================================================
+// Mirrors draw_schedule section 6: for each pinned row, the pin color is
+// derived from the trip's PinMode + departure time.  These tests verify
+// that pool assignment (general vs departure) is consistent with the
+// independently-computed pin color, preventing the "two green pins" bug.
+
+/// Helper: computes row_leaving_soon for a pinned trip, mirroring section 6
+/// of draw_schedule.  Returns true for green pin, false for red.
+static bool compute_row_leaving_soon(
+    const Trip &trip,
+    const std::map<std::string, PinMode> &pinned_routes,
+    unsigned int rtc_now, int threshold_sec) {
+  auto it = pinned_routes.find(trip.composite_key());
+  if (it == pinned_routes.end()) return false;
+  int secs_until = (int)(trip.departure_time - rtc_now);
+  switch (it->second) {
+    case PIN_LEAVING_SOON: return true;  // always green when in pinned section
+    case PIN_BOTH: return (secs_until < threshold_sec);
+    default: return false;
+  }
+}
+
+/// Returns true if any pool assignment contradicts the pin color that would
+/// be rendered.  A "general" trip should be red (ls=false), a "departure"
+/// trip should be green (ls=true).
+static bool has_pool_color_mismatch(
+    const SplitPinResult &r,
+    const std::map<std::string, PinMode> &pinned_routes,
+    unsigned int rtc_now, int threshold_min) {
+  int threshold_sec = threshold_min * 60;
+  // Check general pool: all should render as red (ls=false)
+  for (const auto &t : r.general_pool) {
+    if (compute_row_leaving_soon(t, pinned_routes, rtc_now, threshold_sec))
+      return true;  // would render green but is in general (red) pool
+  }
+  // Check departure pool: all should render as green (ls=true)
+  for (const auto &t : r.departure_pool) {
+    if (!compute_row_leaving_soon(t, pinned_routes, rtc_now, threshold_sec))
+      return true;  // would render red but is in departure (green) pool
+  }
+  return false;
+}
+
+TEST_SUITE("PinColorConsistency") {
+
+  TEST_CASE("PIN_BOTH dup both leaving soon — no color mismatch") {
+    // The exact two-green-pin bug scenario: same PIN_BOTH route, two trips
+    // both within threshold.  Before the fix, the dup went to general_pool
+    // but rendered with a green pin.
+    std::map<std::string, PinMode> pins = {
+        {"BLine:DTR", PIN_BOTH},
+        {"R2:B", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("BLine", "DTR", now + 120),
+         make_trip("BLine", "DTR", now + 300),
+         make_trip("R2", "B", now + 1800),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, 2, 1, 4);
+    CHECK(!has_pool_color_mismatch(r, pins, now, 10));
+  }
+
+  TEST_CASE("PIN_BOTH dup not leaving soon — no color mismatch") {
+    std::map<std::string, PinMode> pins = {
+        {"BLine:DTR", PIN_BOTH},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("BLine", "DTR", now + 120),   // LS → departure
+         make_trip("BLine", "DTR", now + 900),   // not LS → general
+         make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, 2, 1, 4);
+    CHECK(!has_pool_color_mismatch(r, pins, now, 10));
+  }
+
+  TEST_CASE("real-world: multiple PIN_BOTH routes, mixed thresholds") {
+    // Mirrors the user's actual configuration from the screenshot
+    std::map<std::string, PinMode> pins = {
+        {"545:DT Seattle", PIN_BOTH},
+        {"2Line:S Bellevue", PIN_BOTH},
+        {"BLine:BTC", PIN_BOTH},
+        {"BLine:DTR", PIN_BOTH},
+    };
+    unsigned int now = 1000;
+
+    // Scenario A: some leaving soon, some not — classic split
+    auto ra = split_pin_partition(
+        {make_trip("545", "DT Seattle", now + 60),
+         make_trip("2Line", "S Bellevue", now + 120),
+         make_trip("BLine", "BTC", now + 300),
+         make_trip("BLine", "DTR", now + 840),
+         make_trip("545", "DT Seattle", now + 960)},
+        pins, now, 10, 1, 1, 3);
+    CHECK(!has_pool_color_mismatch(ra, pins, now, 10));
+
+    // Scenario B: all leaving soon with duplicates (the rare bug trigger)
+    auto rb = split_pin_partition(
+        {make_trip("545", "DT Seattle", now + 60),
+         make_trip("545", "DT Seattle", now + 120),  // dup, also LS
+         make_trip("2Line", "S Bellevue", now + 180),
+         make_trip("BLine", "BTC", now + 240),
+         make_trip("BLine", "DTR", now + 300)},
+        pins, now, 10, 1, 1, 3);
+    CHECK(!has_pool_color_mismatch(rb, pins, now, 10));
+
+    // Scenario C: dups straddle the threshold boundary
+    auto rc = split_pin_partition(
+        {make_trip("BLine", "DTR", now + 300),   // first, LS
+         make_trip("BLine", "DTR", now + 599),   // dup, just inside threshold (599 < 600)
+         make_trip("BLine", "DTR", now + 601),   // dup, just outside threshold (601 >= 600)
+         make_trip("545", "DT Seattle", now + 1800)},
+        pins, now, 10, 2, 1, 4);
+    CHECK(!has_pool_color_mismatch(rc, pins, now, 10));
+  }
+
+  TEST_CASE("PIN_GENERAL dups never cause mismatch") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R1", "A", now + 2000),  // dup
+         make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, 2, 1, 4);
+    CHECK(!has_pool_color_mismatch(r, pins, now, 10));
+  }
+
+  TEST_CASE("PIN_LEAVING_SOON dups never cause mismatch") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_LEAVING_SOON},
+        {"R2:B", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 300),
+         make_trip("R1", "A", now + 400),  // dup, still LS
+         make_trip("R2", "B", now + 1800),
+         make_trip("R3", "C", now + 500)},
+        pins, now, 10, 2, 1, 4);
+    CHECK(!has_pool_color_mismatch(r, pins, now, 10));
+  }
+
+  TEST_CASE("no split — no mismatch possible") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_BOTH},
+        {"R2:B", PIN_BOTH},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 300),
+         make_trip("R2", "B", now + 400)},
+        pins, now, 10, 2, 1, 3);
+    CHECK(!r.has_pin_split);
+    CHECK(!has_pool_color_mismatch(r, pins, now, 10));
   }
 }
 
@@ -3815,5 +4068,124 @@ TEST_SUITE("SplitPinPaging") {
     auto f1 = build_split_frame(r, gen_p, dep_p);
     CHECK(f1.pinned_pool[0].route_id == "R1");
     CHECK(f1.pinned_pool[1].route_id == "R3");
+  }
+
+  // ---- Pin expansion when unpinned pool is empty ----
+
+  TEST_CASE("non-split: all pinned general → expand to fill all rows") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+        {"R3:C", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 2000)},
+        pins, now, 10, /*pinned_rows=*/1, /*general_pins=*/1, /*limit=*/3);
+    CHECK(!r.has_pin_split);
+    // All trips pinned, no unpinned → expand to fill all 3 rows
+    CHECK(r.eff_pinned == 3);
+    CHECK(r.eff_unpinned == 0);
+    CHECK(r.unpinned_pool.empty());
+    CHECK(r.pinned_pool.size() == 3);
+  }
+
+  TEST_CASE("non-split: all pinned leaving soon → expand to limit") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_LEAVING_SOON},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 300),
+         make_trip("R2", "B", now + 400)},
+        pins, now, 10, /*pinned_rows=*/1, /*general_pins=*/1, /*limit=*/3);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 2);  // min(limit=3, actual=2) = 2
+    CHECK(r.eff_unpinned == 1);
+  }
+
+  TEST_CASE("split: all pinned → general_pins_count controls allocation") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+        {"R3:C", PIN_LEAVING_SOON},
+        {"R4:D", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    // general_pins_count=1 → 1 general row, limit-1=2 departure rows
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 300),
+         make_trip("R4", "D", now + 400)},
+        pins, now, 10, /*pinned_rows=*/1, /*general_pins=*/1, /*limit=*/3);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 2);
+    CHECK(r.eff_pinned == 3);
+    CHECK(r.eff_unpinned == 0);
+  }
+
+  TEST_CASE("split: all pinned, general_pins_count=2 → 2 general, 1 departure") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+        {"R3:C", PIN_LEAVING_SOON},
+        {"R4:D", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 300),
+         make_trip("R4", "D", now + 400)},
+        pins, now, 10, /*pinned_rows=*/1, /*general_pins=*/2, /*limit=*/3);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_general == 2);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_pinned == 3);
+    CHECK(r.eff_unpinned == 0);
+  }
+
+  TEST_CASE("split: all pinned, fewer general than general_pins_count → departure spillover") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+        {"R3:C", PIN_LEAVING_SOON},
+        {"R4:D", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    // general_pins_count=2, but only 1 general trip → departure gets 2 rows
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400),
+         make_trip("R4", "D", now + 500)},
+        pins, now, 10, /*pinned_rows=*/1, /*general_pins=*/2, /*limit=*/3);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_general == 1);  // only 1 general trip available
+    CHECK(r.eff_departure == 2);  // departure takes the surplus
+    CHECK(r.eff_pinned == 3);
+    CHECK(r.eff_unpinned == 0);
+  }
+
+  TEST_CASE("split: some unpinned → expansion does NOT apply") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 300),
+         make_trip("R3", "C", now + 400)},
+        pins, now, 10, /*pinned_rows=*/1, /*general_pins=*/1, /*limit=*/3);
+    CHECK(r.has_pin_split);
+    // Unpinned exists → old auto-bump behavior applies
+    CHECK(r.eff_pinned == 2);
+    CHECK(r.eff_unpinned == 1);
   }
 }
