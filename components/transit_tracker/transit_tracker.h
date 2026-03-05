@@ -82,6 +82,11 @@ class TransitTracker : public Component {
   void set_realtime_color(const Color &color);
   void set_route_color_overrides_from_text(const std::string &text);
 
+  // Default pins from YAML config (matched by route_id on first schedule data)
+  void add_default_pinned_route(const std::string &route_id, PinMode mode) { default_pinned_routes_[route_id] = mode; }
+  void add_default_hidden_route(const std::string &route_id) { default_hidden_routes_.insert(route_id); }
+  void add_default_next_only_route(const std::string &route_id) { default_next_only_routes_.insert(route_id); }
+
 #ifdef USE_TEXT
   void set_hidden_routes_text(text::Text *t) { hidden_routes_text_ = t; }
   void set_pinned_routes_text(text::Text *t) { pinned_routes_text_ = t; }
@@ -190,6 +195,12 @@ class TransitTracker : public Component {
   std::map<std::string, PinMode> pinned_routes_;
   std::set<std::string> next_only_routes_;
   std::map<std::string, std::string> route_stop_map_;
+
+  // Default pins from YAML (applied once on first schedule data)
+  std::map<std::string, PinMode> default_pinned_routes_;
+  std::set<std::string> default_hidden_routes_;
+  std::set<std::string> default_next_only_routes_;
+  bool defaults_applied_{false};
 
   // ---- Animation state (the ENTIRE animation state for the component) ----
   Transition transition_;

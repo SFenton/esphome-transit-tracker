@@ -4358,3 +4358,232 @@ TEST_SUITE("Transition — expand snapshot") {
     CHECK(tr.new_trips.empty());
   }
 }
+
+// =====================================================================
+// Default Pins (YAML `pins:` section)
+// =====================================================================
+
+TEST_SUITE("Default Pins") {
+
+  // Simulates the defaults application logic from transit_tracker.cpp
+  struct DefaultPinsContext {
+    std::map<std::string, PinMode> default_pinned_routes;
+    std::set<std::string> default_hidden_routes;
+    std::set<std::string> default_next_only_routes;
+    bool defaults_applied{false};
+
+    std::map<std::string, PinMode> pinned_routes;
+    std::set<std::string> hidden_routes;
+    std::set<std::string> next_only_routes;
+
+    void apply_defaults(const std::vector<Trip> &trips) {
+      if (defaults_applied) return;
+      defaults_applied = true;
+
+      bool has_runtime_pins = !pinned_routes.empty();
+      bool has_runtime_hidden = !hidden_routes.empty();
+      bool has_runtime_next_only = !next_only_routes.empty();
+
+      if (!has_runtime_pins && !default_pinned_routes.empty()) {
+        std::set<std::string> seen;
+        for (const auto &t : trips) {
+          if (seen.count(t.route_id)) continue;
+          auto it = default_pinned_routes.find(t.route_id);
+          if (it != default_pinned_routes.end()) {
+            pinned_routes[t.composite_key()] = it->second;
+            seen.insert(t.route_id);
+          }
+        }
+      }
+
+      if (!has_runtime_hidden && !default_hidden_routes.empty()) {
+        std::set<std::string> seen;
+        for (const auto &t : trips) {
+          if (seen.count(t.route_id)) continue;
+          if (default_hidden_routes.count(t.route_id)) {
+            hidden_routes.insert(t.composite_key());
+            seen.insert(t.route_id);
+          }
+        }
+      }
+
+      if (!has_runtime_next_only && !default_next_only_routes.empty()) {
+        std::set<std::string> seen;
+        for (const auto &t : trips) {
+          if (seen.count(t.route_id)) continue;
+          if (default_next_only_routes.count(t.route_id)) {
+            next_only_routes.insert(t.composite_key());
+            seen.insert(t.route_id);
+          }
+        }
+      }
+    }
+  };
+
+  TEST_CASE("pinned default applied on first schedule data") {
+    DefaultPinsContext ctx;
+    ctx.default_pinned_routes["R1"] = PIN_GENERAL;
+
+    std::vector<Trip> trips = {make_trip("R1", "Downtown"), make_trip("R2", "Airport")};
+    ctx.apply_defaults(trips);
+
+    CHECK(ctx.pinned_routes.size() == 1);
+    CHECK(ctx.pinned_routes.count("R1:Downtown") == 1);
+    CHECK(ctx.pinned_routes["R1:Downtown"] == PIN_GENERAL);
+    CHECK(ctx.hidden_routes.empty());
+    CHECK(ctx.next_only_routes.empty());
+  }
+
+  TEST_CASE("hidden default applied on first schedule data") {
+    DefaultPinsContext ctx;
+    ctx.default_hidden_routes.insert("R2");
+
+    std::vector<Trip> trips = {make_trip("R1", "Downtown"), make_trip("R2", "Airport")};
+    ctx.apply_defaults(trips);
+
+    CHECK(ctx.hidden_routes.size() == 1);
+    CHECK(ctx.hidden_routes.count("R2:Airport") == 1);
+    CHECK(ctx.pinned_routes.empty());
+  }
+
+  TEST_CASE("next_only default applied on first schedule data") {
+    DefaultPinsContext ctx;
+    ctx.default_next_only_routes.insert("R1");
+
+    std::vector<Trip> trips = {make_trip("R1", "Downtown"), make_trip("R2", "Airport")};
+    ctx.apply_defaults(trips);
+
+    CHECK(ctx.next_only_routes.size() == 1);
+    CHECK(ctx.next_only_routes.count("R1:Downtown") == 1);
+  }
+
+  TEST_CASE("multiple pin modes") {
+    DefaultPinsContext ctx;
+    ctx.default_pinned_routes["R1"] = PIN_LEAVING_SOON;
+    ctx.default_pinned_routes["R2"] = PIN_BOTH;
+
+    std::vector<Trip> trips = {make_trip("R1", "Downtown"), make_trip("R2", "Airport")};
+    ctx.apply_defaults(trips);
+
+    CHECK(ctx.pinned_routes.size() == 2);
+    CHECK(ctx.pinned_routes["R1:Downtown"] == PIN_LEAVING_SOON);
+    CHECK(ctx.pinned_routes["R2:Airport"] == PIN_BOTH);
+  }
+
+  TEST_CASE("defaults only apply once") {
+    DefaultPinsContext ctx;
+    ctx.default_pinned_routes["R1"] = PIN_GENERAL;
+
+    std::vector<Trip> trips1 = {make_trip("R1", "Downtown")};
+    ctx.apply_defaults(trips1);
+    CHECK(ctx.pinned_routes.size() == 1);
+
+    // Second call with different trips — should NOT apply again
+    ctx.pinned_routes.clear();
+    std::vector<Trip> trips2 = {make_trip("R1", "Uptown")};
+    ctx.apply_defaults(trips2);
+    CHECK(ctx.pinned_routes.empty());  // not re-applied
+  }
+
+  TEST_CASE("defaults skipped if runtime pinned_routes already exist") {
+    DefaultPinsContext ctx;
+    ctx.default_pinned_routes["R1"] = PIN_GENERAL;
+
+    // Simulate runtime state loaded from text entity before schedule arrives
+    ctx.pinned_routes["R2:Airport"] = PIN_BOTH;
+
+    std::vector<Trip> trips = {make_trip("R1", "Downtown"), make_trip("R2", "Airport")};
+    ctx.apply_defaults(trips);
+
+    // R1 should NOT be pinned because runtime state existed
+    CHECK(ctx.pinned_routes.size() == 1);
+    CHECK(ctx.pinned_routes.count("R2:Airport") == 1);
+    CHECK(ctx.pinned_routes.count("R1:Downtown") == 0);
+  }
+
+  TEST_CASE("defaults skipped if runtime hidden_routes already exist") {
+    DefaultPinsContext ctx;
+    ctx.default_hidden_routes.insert("R1");
+
+    // Simulate runtime state
+    ctx.hidden_routes.insert("R3:Mall");
+
+    std::vector<Trip> trips = {make_trip("R1", "Downtown")};
+    ctx.apply_defaults(trips);
+
+    // R1 should NOT be hidden because runtime state existed
+    CHECK(ctx.hidden_routes.size() == 1);
+    CHECK(ctx.hidden_routes.count("R3:Mall") == 1);
+    CHECK(ctx.hidden_routes.count("R1:Downtown") == 0);
+  }
+
+  TEST_CASE("route_id matches first trip only (dedup by route_id)") {
+    DefaultPinsContext ctx;
+    ctx.default_pinned_routes["R1"] = PIN_GENERAL;
+
+    // Two trips with same route_id but different headsigns
+    std::vector<Trip> trips = {
+      make_trip("R1", "Downtown"),
+      make_trip("R1", "Uptown"),
+    };
+    ctx.apply_defaults(trips);
+
+    // Only the first trip's composite key should be pinned
+    CHECK(ctx.pinned_routes.size() == 1);
+    CHECK(ctx.pinned_routes.count("R1:Downtown") == 1);
+    CHECK(ctx.pinned_routes.count("R1:Uptown") == 0);
+  }
+
+  TEST_CASE("no defaults configured — nothing applied") {
+    DefaultPinsContext ctx;
+
+    std::vector<Trip> trips = {make_trip("R1", "Downtown")};
+    ctx.apply_defaults(trips);
+
+    CHECK(ctx.pinned_routes.empty());
+    CHECK(ctx.hidden_routes.empty());
+    CHECK(ctx.next_only_routes.empty());
+  }
+
+  TEST_CASE("default for non-existent route_id — silently ignored") {
+    DefaultPinsContext ctx;
+    ctx.default_pinned_routes["NONEXISTENT"] = PIN_GENERAL;
+
+    std::vector<Trip> trips = {make_trip("R1", "Downtown")};
+    ctx.apply_defaults(trips);
+
+    CHECK(ctx.pinned_routes.empty());
+  }
+
+  TEST_CASE("mixed defaults — pin one, hide another, next_only a third") {
+    DefaultPinsContext ctx;
+    ctx.default_pinned_routes["R1"] = PIN_GENERAL;
+    ctx.default_hidden_routes.insert("R2");
+    ctx.default_next_only_routes.insert("R3");
+
+    std::vector<Trip> trips = {
+      make_trip("R1", "Downtown"),
+      make_trip("R2", "Airport"),
+      make_trip("R3", "Mall"),
+    };
+    ctx.apply_defaults(trips);
+
+    CHECK(ctx.pinned_routes.size() == 1);
+    CHECK(ctx.pinned_routes["R1:Downtown"] == PIN_GENERAL);
+    CHECK(ctx.hidden_routes.size() == 1);
+    CHECK(ctx.hidden_routes.count("R2:Airport") == 1);
+    CHECK(ctx.next_only_routes.size() == 1);
+    CHECK(ctx.next_only_routes.count("R3:Mall") == 1);
+  }
+
+  TEST_CASE("composite key with stop_id") {
+    DefaultPinsContext ctx;
+    ctx.default_pinned_routes["R1"] = PIN_GENERAL;
+
+    std::vector<Trip> trips = {make_trip("R1", "Downtown", 1000, false, "S42")};
+    ctx.apply_defaults(trips);
+
+    CHECK(ctx.pinned_routes.size() == 1);
+    CHECK(ctx.pinned_routes.count("R1:Downtown:S42") == 1);
+  }
+}

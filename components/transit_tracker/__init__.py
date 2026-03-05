@@ -28,6 +28,13 @@ UNIT_DISPLAY_VALUES = {
     "none": UnitDisplay.UNIT_DISPLAY_NONE,
 }
 
+PinMode = transit_tracker_ns.enum("PinMode")
+PIN_MODE_VALUES = {
+    "general": PinMode.PIN_GENERAL,
+    "leaving_soon": PinMode.PIN_LEAVING_SOON,
+    "both": PinMode.PIN_BOTH,
+}
+
 CONF_ROUTES = "routes"
 CONF_STOPS = "stops"
 CONF_BASE_URL = "base_url"
@@ -48,6 +55,7 @@ CONF_ROUTE_COLOR_OVERRIDES_TEXT = "route_color_overrides_text"
 CONF_SHOW_PIN_ICON = "show_pin_icon"
 CONF_RESPECT_PIN_INSET = "respect_pin_inset"
 CONF_ALWAYS_SCROLL_OR_REPLACE = "always_scroll_or_replace"
+CONF_PINS = "pins"
 
 
 def validate_ws_url(value):
@@ -92,6 +100,17 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_PINNED_ROUTES_TEXT): cv.use_id(TextEntity) if TextEntity else cv.string,
             cv.Optional(CONF_NEXT_ONLY_ROUTES_TEXT): cv.use_id(TextEntity) if TextEntity else cv.string,
             cv.Optional(CONF_ROUTE_COLOR_OVERRIDES_TEXT): cv.use_id(TextEntity) if TextEntity else cv.string,
+            cv.Optional(CONF_PINS, default=[]): cv.ensure_list(
+                cv.Schema(
+                    {
+                        cv.Required("route_id"): cv.string,
+                        cv.Optional("state", default="pinned"): cv.one_of(
+                            "pinned", "pinned_leaving_soon", "pinned_both",
+                            "hidden", "next_only"
+                        ),
+                    }
+                )
+            ),
             cv.Optional(CONF_STOPS, default=[]): cv.ensure_list(
                 cv.Schema(
                     {
@@ -181,6 +200,20 @@ async def to_code(config):
     if CONF_ROUTE_COLOR_OVERRIDES_TEXT in config and TextEntity is not None:
         text_entity = await cg.get_variable(config[CONF_ROUTE_COLOR_OVERRIDES_TEXT])
         cg.add(var.set_route_color_overrides_text(text_entity))
+
+    for pin in config[CONF_PINS]:
+        state = pin["state"]
+        rid = pin["route_id"]
+        if state == "hidden":
+            cg.add(var.add_default_hidden_route(rid))
+        elif state == "next_only":
+            cg.add(var.add_default_next_only_route(rid))
+        elif state == "pinned_leaving_soon":
+            cg.add(var.add_default_pinned_route(rid, PIN_MODE_VALUES["leaving_soon"]))
+        elif state == "pinned_both":
+            cg.add(var.add_default_pinned_route(rid, PIN_MODE_VALUES["both"]))
+        else:  # "pinned"
+            cg.add(var.add_default_pinned_route(rid, PIN_MODE_VALUES["general"]))
 
     if CONF_ABBREVIATIONS in config:
         for abbreviation in config[CONF_ABBREVIATIONS]:

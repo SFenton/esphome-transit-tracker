@@ -1,0 +1,164 @@
+# ==============================================================================
+# Transit Tracker — Configuration Guide
+# ==============================================================================
+#
+# This file documents all configuration options for the transit_tracker
+# ESPHome component. It is NOT a working config — it's a reference.
+# For a working example, see matrix-portal-s3.yaml.
+#
+# ==============================================================================
+# HOW CONFIGURATION WORKS
+# ==============================================================================
+#
+# The Transit Tracker has two layers of configuration:
+#
+# 1. COMPILE-TIME (this YAML)
+#    - Which stops and routes to track
+#    - Display settings (rows, scroll behavior, time format, etc.)
+#    - Route styling (colors, abbreviations, custom names)
+#    These require a firmware recompile to change.
+#
+# 2. RUNTIME (no recompile needed)
+#    - Route pinning, hiding, and "next only" mode — via MQTT (Home Assistant)
+#    - Route color overrides — via MQTT (Home Assistant)
+#    - All compile-time settings can also be changed at runtime via the
+#      ESPHome web server, API, or the Transit Tracker Configurator app.
+#
+# ==============================================================================
+# ROUTE PINNING & HIDING
+# ==============================================================================
+#
+# Routes can be pinned, hidden, or set to "next only" mode using the `pins:`
+# section in the YAML. These are applied as defaults on the first schedule
+# data from the API. Once applied, they can be overridden at runtime via
+# MQTT (Home Assistant) without a recompile.
+#
+# The `pins:` section uses route_id to match routes. When the API returns
+# trip data, the component finds the first trip matching each route_id and
+# applies the configured state to it.
+#
+# Available states:
+#   pinned              — always pinned to the top of the display
+#   pinned_leaving_soon — pinned only when departing within the threshold
+#   pinned_both         — pinned with both general and leaving-soon behavior
+#   hidden              — hidden from the display entirely
+#   next_only           — only show the next arrival for this route
+#
+# Runtime overrides (MQTT / Home Assistant):
+#   The component auto-discovers routes and creates select entities in Home
+#   Assistant with these options: Off, On, Pinned, Pinned (Leaving Soon),
+#   Pinned (Both). It also creates light entities for per-route color
+#   overrides. These runtime changes persist across reboots and take
+#   priority over YAML defaults.
+#
+#   To use MQTT, add this to your config YAML:
+#
+#     mqtt:
+#       broker: 192.168.1.100    # your MQTT broker IP
+#       discovery: false          # we handle our own HA discovery
+#
+# ==============================================================================
+# TRANSIT TRACKER COMPONENT OPTIONS
+# ==============================================================================
+
+transit_tracker:
+  id: tracker
+
+  # ── Data Source ──────────────────────────────────────────────
+  # WebSocket URL for the Transit Tracker API server.
+  base_url: "wss://tt.horner.tj/"
+
+  # Transit feed code (e.g., "st" for Sound Transit / King County Metro).
+  feed_code: "st"
+
+  # ── Stops & Routes ──────────────────────────────────────────
+  # Define which stops and routes to track. The route_id and stop_id values
+  # come from your transit agency's GTFS data. You can find them at:
+  # https://www.transit.land/operators
+  #
+  # time_offset adjusts departure times to account for walking distance
+  # to the stop (negative = you need to leave earlier).
+  stops:
+    - stop_id: "1_71971"          # Redmond Way & Bear Creek Pkwy
+      time_offset: -8min
+      routes:
+        - "1_100113"              # Route 221
+        - "1_102704"              # Route 250
+    - stop_id: "1_71961"          # Redmond Transit Center
+      time_offset: -10min
+      routes:
+        - "1_102548"              # B Line
+
+  # ── Display ─────────────────────────────────────────────────
+  # Number of rows to show on the display (usually matches your panel height).
+  limit: 3
+
+  # How to show departure times:
+  #   "departure" — countdown to scheduled/predicted departure
+  #   "arrival"   — countdown to arrival time
+  time_display: departure         # departure | arrival
+
+  # How to list arrivals:
+  #   "sequential"    — all arrivals in chronological order
+  #   "nextPerRoute"  — only the next arrival per route
+  list_mode: sequential           # sequential | nextPerRoute
+
+  # Time unit display:
+  #   "long"  — "5 min"
+  #   "short" — "5m"
+  #   "none"  — "5"
+  show_units: long                # long | short | none
+
+  # ── Scrolling ───────────────────────────────────────────────
+  # Scroll long headsign text horizontally instead of truncating.
+  scroll_headsigns: false
+
+  # Show/hide the pin icon next to pinned routes.
+  show_pin_icon: true
+
+  # When pin icon is visible, shift non-pinned row content to maintain
+  # alignment with pinned rows.
+  respect_pin_inset: true
+
+  # Force page transitions even when all arrivals fit on one screen.
+  always_scroll_or_replace: false
+
+  # ── Route Styling ───────────────────────────────────────────
+  # Override the display name and color for specific routes.
+  # Without this, the component uses names and colors from the API.
+  styles:
+    - route_id: "1_102548"        # B Line
+      name: "B"                   # Short name for the badge
+      color: rapidride_red        # Reference to a color: entity
+
+  # Abbreviate long headsign/stop text.
+  abbreviations:
+    - from: "Bellevue Transit Center Crossroads"
+      to: "Bellevue TC"
+    - from: "Transit Center"
+      to: "TC"
+
+  # Default route badge color (when no style is defined and API has no color).
+  # default_route_color: my_green
+
+  # Color for the realtime indicator dot.
+  # realtime_color: my_green
+
+  # ── Pins ────────────────────────────────────────────────────
+  # Default pin/hide state for routes (by route_id).
+  # Applied on first schedule data; overridden at runtime by MQTT.
+  pins:
+    - route_id: "1_102548"        # B Line — pin to top
+      state: pinned               # pinned | pinned_leaving_soon | pinned_both | hidden | next_only
+    # - route_id: "1_100113"      # Route 221 — hide from display
+    #   state: hidden
+    # - route_id: "1_102704"      # Route 250 — only show next arrival
+    #   state: next_only
+
+  # ── Text Entity Bindings (for runtime persistence) ─────────
+  # These connect the component to ESPHome text entities that store
+  # runtime pin/hide state. Required for MQTT and Configurator support.
+  hidden_routes_text: hidden_routes_config
+  pinned_routes_text: pinned_routes_config
+  next_only_routes_text: next_only_routes_config
+  route_color_overrides_text: route_color_overrides_config

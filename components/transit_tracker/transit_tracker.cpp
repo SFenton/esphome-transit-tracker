@@ -173,6 +173,53 @@ void TransitTracker::on_ws_message_(websockets::WebsocketsMessage message) {
                (int)i, t.composite_key().c_str(), (long)t.departure_time, t.is_realtime ? "Y" : "N");
     }
 
+    // Apply default pins from YAML config on first schedule data.
+    // Only applies once; runtime state (MQTT/text entities) takes over after.
+    if (!this->defaults_applied_) {
+      this->defaults_applied_ = true;
+      bool has_runtime_pins = !this->pinned_routes_.empty();
+      bool has_runtime_hidden = !this->hidden_routes_.empty();
+      bool has_runtime_next_only = !this->next_only_routes_.empty();
+
+      if (!has_runtime_pins && !this->default_pinned_routes_.empty()) {
+        std::set<std::string> seen;
+        for (const auto &t : this->schedule_state_.trips) {
+          if (seen.count(t.route_id)) continue;
+          auto it = this->default_pinned_routes_.find(t.route_id);
+          if (it != this->default_pinned_routes_.end()) {
+            std::string key = t.composite_key();
+            this->pinned_routes_[key] = it->second;
+            seen.insert(t.route_id);
+            ESP_LOGD(TAG, "Default pin: %s (mode=%d)", key.c_str(), (int)it->second);
+          }
+        }
+      }
+
+      if (!has_runtime_hidden && !this->default_hidden_routes_.empty()) {
+        std::set<std::string> seen;
+        for (const auto &t : this->schedule_state_.trips) {
+          if (seen.count(t.route_id)) continue;
+          if (this->default_hidden_routes_.count(t.route_id)) {
+            this->hidden_routes_.insert(t.composite_key());
+            seen.insert(t.route_id);
+            ESP_LOGD(TAG, "Default hide: %s", t.composite_key().c_str());
+          }
+        }
+      }
+
+      if (!has_runtime_next_only && !this->default_next_only_routes_.empty()) {
+        std::set<std::string> seen;
+        for (const auto &t : this->schedule_state_.trips) {
+          if (seen.count(t.route_id)) continue;
+          if (this->default_next_only_routes_.count(t.route_id)) {
+            this->next_only_routes_.insert(t.composite_key());
+            seen.insert(t.route_id);
+            ESP_LOGD(TAG, "Default next-only: %s", t.composite_key().c_str());
+          }
+        }
+      }
+    }
+
     this->schedule_state_.mutex.unlock();
 
 #ifdef USE_MQTT
