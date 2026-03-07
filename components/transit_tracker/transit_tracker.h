@@ -61,7 +61,6 @@ class TransitTracker : public Component {
   void set_always_scroll_or_replace(bool v) { always_scroll_or_replace_ = v; }
   void set_scroll_speed(const std::string &speed);
   void set_page_interval(int seconds) { page_interval_ = seconds * 1000; }
-  void set_page_scroll_duration(float seconds) { page_scroll_duration_ = (int)(seconds * 1000); }
   void set_page_pause_duration(int seconds) { page_pause_duration_ = seconds * 1000; }
   void set_pinned_rows_count(int c) { pinned_rows_count_ = std::max(1, std::min(c, limit_ - 1)); }
   int get_pinned_rows_count() const { return pinned_rows_count_; }
@@ -180,7 +179,6 @@ class TransitTracker : public Component {
   bool scroll_routes_{false};
   bool always_scroll_or_replace_{false};
   int page_interval_{5000};
-  int page_scroll_duration_{500};
   int page_pause_duration_{1000};
   int pinned_rows_count_{1};
   int general_pins_count_{1};
