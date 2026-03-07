@@ -42,6 +42,8 @@ static constexpr int kReplacePerRowMs = 500;
 static constexpr int kReplaceStaggerMs = 250;
 /// Pause between collapse and expand phases (ms).
 static constexpr int kReplaceMidPauseMs = 500;
+/// Pause after h-scroll finishes before collapse begins (ms).
+static constexpr int kReplacePrePauseMs = 500;
 /// Width reserved for pin icon (1px margin + 5px icon + 1px margin).
 static constexpr int kPinIconWidth = 7;
 /// Minimum row scale before a collapsing row is considered invisible.
@@ -342,6 +344,7 @@ struct Transition {
   enum Phase {
     IDLE = 0,
     WAIT_SCROLL,   // waiting for h-scroll to reach ~0
+    PRE_PAUSE,     // dwell at home position before collapse begins
     COLLAPSE,      // rows shrinking (replace) or section sliding (v-scroll)
     MID_PAUSE,     // blank pause between collapse and expand
     EXPAND,        // rows growing
