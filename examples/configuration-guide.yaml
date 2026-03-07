@@ -113,9 +113,6 @@ transit_tracker:
   # Scroll long headsign text horizontally instead of truncating.
   scroll_headsigns: false
 
-  # Show/hide the pin icon next to pinned routes.
-  show_pin_icon: true
-
   # When pin icon is visible, shift non-pinned row content to maintain
   # alignment with pinned rows.
   respect_pin_inset: true

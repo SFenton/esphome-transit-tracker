@@ -78,7 +78,6 @@ void TransitTracker::dump_config() {
   ESP_LOGCONFIG(TAG, "  Display departure times: %s", this->display_departure_times_ ? "true" : "false");
   ESP_LOGCONFIG(TAG, "  Scroll Headsigns: %s", this->scroll_headsigns_ ? "true" : "false");
   ESP_LOGCONFIG(TAG, "  Scroll Routes: %s", this->scroll_routes_ ? "true" : "false");
-  ESP_LOGCONFIG(TAG, "  Show Pin Icon: %s", this->show_pin_icon_ ? "true" : "false");
   ESP_LOGCONFIG(TAG, "  Respect Pin Inset: %s", this->respect_pin_inset_ ? "true" : "false");
   ESP_LOGCONFIG(TAG, "  Always Scroll or Replace: %s", this->always_scroll_or_replace_ ? "true" : "false");
 }
@@ -822,7 +821,7 @@ void TransitTracker::draw_trip(
   int dh = this->display_->get_height();
 
   // Pin icon (drawn in the inset margin if this row is pinned)
-  if (is_pinned && x_start > 0 && this->show_pin_icon_ && !no_draw) {
+  if (is_pinned && x_start > 0 && !no_draw) {
     Color pin_color = is_leaving_soon ? Color(0x00FF00) : Color(0xFF0000); // green if leaving soon, else red
     int px = 1; // 1px left margin; icon occupies columns px..px+4 (5 wide)
     int py = y_offset + 1;
@@ -948,7 +947,7 @@ void TransitTracker::compute_h_scroll_(const std::vector<Trip> &trips, int fh,
   }
 
   // Freeze h-scroll during collapse/expand/post-pause animations
-  bool anim_active = (this->transition_.phase >= Transition::COLLAPSE &&
+  bool anim_active = (this->transition_.phase >= Transition::PRE_PAUSE &&
                       this->transition_.phase <= Transition::POST_PAUSE);
   if (anim_active || (this->post_pause_end_ != 0 && now < this->post_pause_end_)) {
     this->h_scroll_.offset = 0;
@@ -999,10 +998,12 @@ void TransitTracker::begin_transition_(
   if (scroll_active && this->h_scroll_.offset >= kScrollNearZeroPx) {
     this->transition_.phase = Transition::WAIT_SCROLL;
     this->transition_.phase_start = now;
+    ESP_LOGD(TAG, "Transition: -> WAIT_SCROLL (scroll offset=%d)", this->h_scroll_.offset);
   } else {
-    this->transition_.phase = Transition::COLLAPSE;
+    this->transition_.phase = Transition::PRE_PAUSE;
     this->transition_.phase_start = now;
     if (scroll_active) this->h_scroll_.reset(now);
+    ESP_LOGD(TAG, "Transition: -> PRE_PAUSE (%dms)", kReplacePrePauseMs);
   }
 }
 
@@ -1040,10 +1041,12 @@ void TransitTracker::begin_page_transition_(
   if (scroll_active && this->h_scroll_.offset >= kScrollNearZeroPx) {
     this->transition_.phase = Transition::WAIT_SCROLL;
     this->transition_.phase_start = now;
+    ESP_LOGD(TAG, "Page transition: -> WAIT_SCROLL (scroll offset=%d)", this->h_scroll_.offset);
   } else {
-    this->transition_.phase = Transition::COLLAPSE;
+    this->transition_.phase = Transition::PRE_PAUSE;
     this->transition_.phase_start = now;
     if (scroll_active) this->h_scroll_.reset(now);
+    ESP_LOGD(TAG, "Page transition: -> PRE_PAUSE (%dms)", kReplacePrePauseMs);
   }
 }
 
@@ -1056,22 +1059,32 @@ void TransitTracker::tick_transition_(unsigned long now, int fh,
 
   switch (this->transition_.phase) {
     case Transition::WAIT_SCROLL:
-      // Wait for h-scroll to reach near-zero, then start collapse
+      // Wait for h-scroll to reach near-zero, then start pre-pause
       if (this->h_scroll_.idle || this->h_scroll_.total_distance == 0) {
-        this->transition_.phase = Transition::COLLAPSE;
+        ESP_LOGD(TAG, "Transition: WAIT_SCROLL -> PRE_PAUSE (scroll idle after %lums)", elapsed);
+        this->transition_.phase = Transition::PRE_PAUSE;
         this->transition_.phase_start = now;
         this->h_scroll_.reset(now);
       } else if (elapsed > 10000) {
         // Safety timeout: don't wait forever
-        ESP_LOGW(TAG, "WAIT_SCROLL timeout, forcing collapse");
-        this->transition_.phase = Transition::COLLAPSE;
+        ESP_LOGW(TAG, "WAIT_SCROLL timeout, forcing PRE_PAUSE");
+        this->transition_.phase = Transition::PRE_PAUSE;
         this->transition_.phase_start = now;
         this->h_scroll_.reset(now);
       }
       break;
 
+    case Transition::PRE_PAUSE:
+      if ((int)elapsed >= kReplacePrePauseMs) {
+        ESP_LOGD(TAG, "Transition: PRE_PAUSE -> COLLAPSE (after %lums)", elapsed);
+        this->transition_.phase = Transition::COLLAPSE;
+        this->transition_.phase_start = now;
+      }
+      break;
+
     case Transition::COLLAPSE:
       if ((int)elapsed >= this->transition_.collapse_duration_ms()) {
+        ESP_LOGD(TAG, "Transition: COLLAPSE -> MID_PAUSE (after %lums)", elapsed);
         this->transition_.phase = Transition::MID_PAUSE;
         this->transition_.phase_start = now;
       }
@@ -1079,6 +1092,7 @@ void TransitTracker::tick_transition_(unsigned long now, int fh,
 
     case Transition::MID_PAUSE:
       if ((int)elapsed >= kReplaceMidPauseMs) {
+        ESP_LOGD(TAG, "Transition: MID_PAUSE -> EXPAND (after %lums)", elapsed);
         this->transition_.phase = Transition::EXPAND;
         this->transition_.phase_start = now;
         // Update stagger_rows for expand (layout may have changed)
@@ -1089,6 +1103,7 @@ void TransitTracker::tick_transition_(unsigned long now, int fh,
 
     case Transition::EXPAND:
       if ((int)elapsed >= this->transition_.expand_duration_ms()) {
+        ESP_LOGD(TAG, "Transition: EXPAND -> POST_PAUSE (after %lums)", elapsed);
         this->transition_.phase = Transition::POST_PAUSE;
         this->transition_.phase_start = now;
       }
@@ -1096,7 +1111,15 @@ void TransitTracker::tick_transition_(unsigned long now, int fh,
 
     case Transition::POST_PAUSE:
       if ((int)elapsed >= this->page_pause_duration_) {
-        this->transition_.reset();
+        ESP_LOGD(TAG, "Transition: POST_PAUSE -> IDLE (after %lums)", elapsed);
+        // Transition to IDLE but preserve new_trips so that step 15 can
+        // commit the snapshot (= what the user just saw).  Without this,
+        // reset() clears new_trips and step 15 commits live rows instead,
+        // causing a one-frame visual snap if data changed mid-transition.
+        this->transition_.phase = Transition::IDLE;
+        this->transition_.old_trips.clear();
+        this->transition_.old_is_pinned.clear();
+        this->transition_.old_is_leaving_soon.clear();
         // Brief h-scroll hold after animation
         this->post_pause_end_ = now + 500;
         this->pinned_pager_.page_timer = now;
@@ -1120,11 +1143,13 @@ void TransitTracker::render_frame_(
 
   auto phase = this->transition_.phase;
   bool use_old = (phase == Transition::WAIT_SCROLL ||
+                  phase == Transition::PRE_PAUSE ||
                   phase == Transition::COLLAPSE ||
                   phase == Transition::MID_PAUSE);
-  bool use_new_snapshot = (phase == Transition::EXPAND ||
-                           phase == Transition::POST_PAUSE) &&
-                          !this->transition_.new_trips.empty();
+  bool use_new_snapshot = !this->transition_.new_trips.empty() &&
+                          (phase == Transition::EXPAND ||
+                           phase == Transition::POST_PAUSE ||
+                           phase == Transition::IDLE);
 
   const auto &draw_rows = use_old ? this->transition_.old_trips
                           : (use_new_snapshot ? this->transition_.new_trips : rows);
@@ -1137,11 +1162,11 @@ void TransitTracker::render_frame_(
   int save_inset = this->frame_pin_inset_;
   bool save_respect = this->frame_respect_pin_inset_;
   if (use_old) {
-    this->frame_pin_inset_ = (this->transition_.old_eff_pinned > 0 && this->show_pin_icon_)
+    this->frame_pin_inset_ = (this->transition_.old_eff_pinned > 0)
                                  ? kPinIconWidth : 0;
     this->frame_respect_pin_inset_ = this->transition_.old_respect_pin_inset;
   } else if (use_new_snapshot) {
-    this->frame_pin_inset_ = (this->transition_.new_eff_pinned > 0 && this->show_pin_icon_)
+    this->frame_pin_inset_ = (this->transition_.new_eff_pinned > 0)
                                  ? kPinIconWidth : 0;
   }
 
@@ -1187,7 +1212,7 @@ void TransitTracker::render_frame_(
       this->display_->end_clipping();
 
     } else {
-      // IDLE, WAIT_SCROLL, POST_PAUSE — full rows with optional h-scroll
+      // IDLE, WAIT_SCROLL, PRE_PAUSE, POST_PAUSE — full rows with optional h-scroll
       this->draw_trip(draw_rows[i], y, fh, now, rtc_now, false, nullptr, nullptr, h_off, h_dist, draw_pinned[i], ls);
     }
   }
@@ -1505,7 +1530,7 @@ void HOT TransitTracker::draw_schedule() {
   int y_base = (this->display_->get_height() % max_h) / 2;
 
   // ---- 8. Per-frame state ----
-  this->frame_pin_inset_ = (eff_pinned > 0 && this->show_pin_icon_) ? kPinIconWidth : 0;
+  this->frame_pin_inset_ = (eff_pinned > 0) ? kPinIconWidth : 0;
   this->frame_respect_pin_inset_ = this->respect_pin_inset_;
 
   // Build a set of pinned route keys for diff tracking
@@ -1525,6 +1550,7 @@ void HOT TransitTracker::draw_schedule() {
   if (this->transition_.phase != Transition::IDLE) {
     // Mid-transition: phases that render old content
     bool phase_uses_old = (this->transition_.phase == Transition::WAIT_SCROLL ||
+                           this->transition_.phase == Transition::PRE_PAUSE ||
                            this->transition_.phase == Transition::COLLAPSE ||
                            this->transition_.phase == Transition::MID_PAUSE);
     if (phase_uses_old && !this->transition_.old_trips.empty()) {
@@ -1536,6 +1562,14 @@ void HOT TransitTracker::draw_schedule() {
       measure_rows = &this->transition_.new_trips;
       measure_eff_pinned = this->transition_.new_eff_pinned;
     }
+  } else if (!this->transition_.new_trips.empty()) {
+    // Just-completed transition: measure against the snapshot (what the user
+    // just saw) so that h-scroll and clipping are consistent this frame.
+    // Step 15 will commit the snapshot and clear new_trips; step 12 is
+    // skipped this frame so we don't start a new transition against stale diff.
+    measure_rows = &this->transition_.new_trips;
+    measure_eff_pinned = this->transition_.new_eff_pinned;
+    rendering_old_layout = true;
   } else {
     // IDLE: peek at diff to detect an impending layout change so that the
     // measurements below (and begin_transition_'s WAIT vs COLLAPSE decision)
@@ -1556,7 +1590,7 @@ void HOT TransitTracker::draw_schedule() {
     int saved_inset = this->frame_pin_inset_;
     bool saved_respect = this->frame_respect_pin_inset_;
     if (rendering_old_layout) {
-      this->frame_pin_inset_ = (measure_eff_pinned > 0 && this->show_pin_icon_) ? kPinIconWidth : 0;
+      this->frame_pin_inset_ = (measure_eff_pinned > 0) ? kPinIconWidth : 0;
       this->frame_respect_pin_inset_ = this->committed_respect_pin_inset_;
     }
     this->compute_h_scroll_(*measure_rows, fh, now, rtc_now);
@@ -1569,7 +1603,7 @@ void HOT TransitTracker::draw_schedule() {
     int saved_inset = this->frame_pin_inset_;
     bool saved_respect = this->frame_respect_pin_inset_;
     if (rendering_old_layout) {
-      this->frame_pin_inset_ = (measure_eff_pinned > 0 && this->show_pin_icon_) ? kPinIconWidth : 0;
+      this->frame_pin_inset_ = (measure_eff_pinned > 0) ? kPinIconWidth : 0;
       this->frame_respect_pin_inset_ = this->committed_respect_pin_inset_;
     }
     this->compute_uniform_clipping_(*measure_rows, rtc_now);
@@ -1578,7 +1612,10 @@ void HOT TransitTracker::draw_schedule() {
   }
 
   // ---- 12. Change detection & transition planning (only when idle) ----
-  if (this->transition_.phase == Transition::IDLE) {
+  // Skip when new_trips is present: a transition just completed and step 15
+  // hasn't committed the snapshot yet.  Acting on the stale diff would start
+  // a new transition from the wrong baseline.
+  if (this->transition_.phase == Transition::IDLE && this->transition_.new_trips.empty()) {
     // diff_.compute() already ran above in step 9
 
     bool respect_inset_changed = (this->respect_pin_inset_ != this->committed_respect_pin_inset_)

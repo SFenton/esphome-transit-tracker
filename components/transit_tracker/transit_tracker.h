@@ -57,7 +57,6 @@ class TransitTracker : public Component {
   void set_uniform_headsign_start(bool v) { uniform_headsign_start_ = v; }
   void set_uniform_headsign_end(bool v) { uniform_headsign_end_ = v; }
   void set_scroll_routes(bool v);
-  void set_show_pin_icon(bool v) { show_pin_icon_ = v; }
   void set_respect_pin_inset(bool v) { respect_pin_inset_ = v; }
   void set_always_scroll_or_replace(bool v) { always_scroll_or_replace_ = v; }
   void set_scroll_speed(const std::string &speed);
@@ -175,7 +174,6 @@ class TransitTracker : public Component {
   std::map<std::string, RouteStyle> route_styles_;
   std::map<std::string, Color> route_color_overrides_;
   bool scroll_headsigns_{false};
-  bool show_pin_icon_{true};
   bool respect_pin_inset_{true};
   bool uniform_headsign_start_{false};
   bool uniform_headsign_end_{false};

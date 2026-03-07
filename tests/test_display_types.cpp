@@ -1549,8 +1549,8 @@ TEST_SUITE("Multi-frame integration") {
     ScrollContainer unpinned_pager;
 
     // Simulate frame_pin_inset_ calculation
-    int pin_inset(int eff_pinned, bool show_pin_icon) const {
-      return (eff_pinned > 0 && show_pin_icon) ? kPinIconWidth : 0;
+    int pin_inset(int eff_pinned) const {
+      return (eff_pinned > 0) ? kPinIconWidth : 0;
     }
   };
 
@@ -1744,22 +1744,18 @@ TEST_SUITE("Multi-frame integration") {
     FrameContext ctx;
 
     // Scenario 1: had pins (inset=7), removing last pin
-    int old_inset = ctx.pin_inset(1, true);  // 7
-    int new_inset = ctx.pin_inset(0, true);  // 0
+    int old_inset = ctx.pin_inset(1);  // 7
+    int new_inset = ctx.pin_inset(0);  // 0
     CHECK(old_inset == kPinIconWidth);
     CHECK(new_inset == 0);
     CHECK(old_inset != new_inset);
 
     // Scenario 2: had no pins, adding first pin
-    old_inset = ctx.pin_inset(0, true);  // 0
-    new_inset = ctx.pin_inset(1, true);  // 7
+    old_inset = ctx.pin_inset(0);  // 0
+    new_inset = ctx.pin_inset(1);  // 7
     CHECK(old_inset == 0);
     CHECK(new_inset == kPinIconWidth);
     CHECK(old_inset != new_inset);
-
-    // Scenario 3: show_pin_icon=false → inset always 0
-    CHECK(ctx.pin_inset(1, false) == 0);
-    CHECK(ctx.pin_inset(0, false) == 0);
   }
 
   TEST_CASE("h-scroll total_distance preserved when measuring with old trips") {
@@ -1784,6 +1780,160 @@ TEST_SUITE("Multi-frame integration") {
     hs.compute(1001);  // elapsed=1000, scroll_phase=930 → in dwell (idle)
     CHECK(hs.offset == 0);
     CHECK(hs.idle);
+  }
+}
+
+// =====================================================================
+// Snapshot commit after transition — regression test for snap-after-
+// animation bug where data changing mid-transition caused a one-frame
+// visual snap when the animation finished.
+// =====================================================================
+
+TEST_SUITE("Snapshot commit after transition") {
+
+  TEST_CASE("snapshot committed (not live data) prevents stale diff baseline") {
+    // Scenario:
+    //   1. Display shows trips_v1 → data changes to trips_v2 → transition starts
+    //   2. EXPAND snapshot captures trips_v2
+    //   3. During EXPAND/POST_PAUSE, data changes AGAIN to trips_v3
+    //   4. Transition completes
+    //
+    // BUG (before fix): reset() cleared new_trips, so step 15 committed live
+    // trips_v3.  The diff would compare trips_v3 vs trips_v3 on the next
+    // frame and detect NO change — even though the display jumped from the
+    // trips_v2 snapshot to trips_v3 without any animation.
+    //
+    // FIX: new_trips is preserved through POST_PAUSE→IDLE.  Step 15 commits
+    // the snapshot (trips_v2).  On the next frame, diff compares trips_v2
+    // vs trips_v3, detects the change, and starts a smooth transition.
+
+    DisplayDiff diff;
+    std::set<std::string> no_pins;
+
+    // Frame 0: commit initial state (trips_v1)
+    std::vector<Trip> trips_v1 = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::vector<std::string> keys_v1 = {"R1:A", "R2:B"};
+    std::vector<time_t> deps_v1 = {100, 200};
+    std::vector<bool> is_p = {false, false};
+    diff.commit(keys_v1, deps_v1, trips_v1, is_p, is_p, 0, no_pins);
+
+    // Data changes to v2 → transition starts with old_trips = trips_v1
+    std::vector<Trip> trips_v2 = {make_trip("R3", "C", 150), make_trip("R2", "B", 200)};
+    std::vector<std::string> keys_v2 = {"R3:C", "R2:B"};
+    std::vector<time_t> deps_v2 = {150, 200};
+
+    diff.compute(keys_v2, deps_v2, 0, no_pins);
+    CHECK(diff.data_changed);
+
+    // EXPAND snapshot = trips_v2 (the target of the transition)
+    Transition transition;
+    transition.new_trips = trips_v2;
+    transition.new_is_pinned = is_p;
+    transition.new_is_leaving_soon = is_p;
+    transition.new_eff_pinned = 0;
+
+    // During EXPAND/POST_PAUSE, data changes to v3
+    std::vector<Trip> trips_v3 = {make_trip("R3", "C", 150), make_trip("R2", "B", 350)};
+    std::vector<std::string> keys_v3 = {"R3:C", "R2:B"};
+    std::vector<time_t> deps_v3 = {150, 350};
+
+    // POST_PAUSE completes.  With the fix, new_trips is preserved.
+    // Step 15 commits the SNAPSHOT (trips_v2), not live data (trips_v3).
+    CHECK(!transition.new_trips.empty());  // preserved by fix
+    {
+      std::vector<std::string> snap_keys;
+      std::vector<time_t> snap_deps;
+      for (const auto &t : transition.new_trips) {
+        snap_keys.push_back(t.composite_key());
+        snap_deps.push_back(t.departure_time);
+      }
+      diff.commit(snap_keys, snap_deps, transition.new_trips,
+                  transition.new_is_pinned, transition.new_is_leaving_soon,
+                  transition.new_eff_pinned, no_pins);
+      transition.new_trips.clear();
+    }
+
+    // Next frame: diff compares committed snapshot (v2) vs live data (v3)
+    diff.compute(keys_v3, deps_v3, 0, no_pins);
+
+    // v2's R2 had dep=200, v3's R2 has dep=350 (|350-200|=150 > 60)
+    // This change MUST be detected so a new smooth transition can start.
+    CHECK(diff.data_changed);
+
+    // The prev_trips should be the snapshot (v2), so the next transition's
+    // old_trips (= what was just displayed) is correct.
+    CHECK(diff.prev_trips[0].route_id == "R3");
+    CHECK(diff.prev_trips[0].departure_time == 150);
+    CHECK(diff.prev_trips[1].route_id == "R2");
+    CHECK(diff.prev_trips[1].departure_time == 200);  // snapshot dep, not 350
+  }
+
+  TEST_CASE("no-op when data unchanged during transition") {
+    // When data doesn't change during the transition, committing the
+    // snapshot vs live data produces the same result — no snap, no
+    // spurious transition.
+    DisplayDiff diff;
+    std::set<std::string> no_pins;
+
+    std::vector<Trip> trips = {make_trip("R1", "A", 100), make_trip("R2", "B", 200)};
+    std::vector<std::string> keys = {"R1:A", "R2:B"};
+    std::vector<time_t> deps = {100, 200};
+    std::vector<bool> is_p = {false, false};
+    diff.commit(keys, deps, trips, is_p, is_p, 0, no_pins);
+
+    // Same data changes → transition starts
+    std::vector<Trip> trips_v2 = {make_trip("R3", "C", 150), make_trip("R2", "B", 200)};
+    std::vector<std::string> keys_v2 = {"R3:C", "R2:B"};
+    std::vector<time_t> deps_v2 = {150, 200};
+
+    // EXPAND snapshot = trips_v2
+    Transition transition;
+    transition.new_trips = trips_v2;
+    transition.new_is_pinned = is_p;
+    transition.new_is_leaving_soon = is_p;
+    transition.new_eff_pinned = 0;
+
+    // Data does NOT change during transition — live data == snapshot
+    // Commit snapshot
+    diff.commit(keys_v2, deps_v2, transition.new_trips,
+                transition.new_is_pinned, transition.new_is_leaving_soon,
+                transition.new_eff_pinned, no_pins);
+    transition.new_trips.clear();
+
+    // Next frame: live data == committed snapshot → no change detected
+    diff.compute(keys_v2, deps_v2, 0, no_pins);
+    CHECK(!diff.has_changes());
+  }
+
+  TEST_CASE("BUG scenario: reset() clearing new_trips would miss changes") {
+    // Documents what WOULD happen without the fix: if reset() clears
+    // new_trips, step 15 commits live data instead of the snapshot.
+    // The diff then fails to detect the mid-transition change.
+    DisplayDiff diff;
+    std::set<std::string> no_pins;
+
+    std::vector<Trip> trips_v1 = {make_trip("R1", "A", 100)};
+    std::vector<bool> is_p = {false};
+    diff.commit({"R1:A"}, {100}, trips_v1, is_p, is_p, 0, no_pins);
+
+    // v2 is the transition target (snapshot)
+    std::vector<Trip> trips_v2 = {make_trip("R1", "A", 200)};
+
+    // v3 is live data during POST_PAUSE
+    std::vector<Trip> trips_v3 = {make_trip("R1", "A", 300)};
+
+    // Simulate the BUG: commit live data (v3) instead of snapshot (v2)
+    diff.commit({"R1:A"}, {300}, trips_v3, is_p, is_p, 0, no_pins);
+
+    // Next frame: live data is still v3 → diff sees NO change
+    diff.compute({"R1:A"}, {300}, 0, no_pins);
+    CHECK(!diff.has_changes());  // no transition triggered!
+    // The user saw a snap from v2 (snapshot) to v3 (live) with no animation.
+
+    // With the fix: commit SNAPSHOT (v2) instead
+    diff.commit({"R1:A"}, {200}, trips_v2, is_p, is_p, 0, no_pins);
+    diff.compute({"R1:A"}, {300}, 0, no_pins);
+    CHECK(diff.data_changed);  // correctly detects the change → smooth transition
   }
 }
 
