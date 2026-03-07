@@ -3881,43 +3881,43 @@ TEST_SUITE("PinColorConsistency") {
 // over both general and departure sub-pools in split mode
 // =====================================================================
 
+// Helper: simulates the split-mode paging logic from draw_schedule.
+// Uses pinned_pager_ for general and departure_pager_ for departure.
+struct SplitPagingFrame {
+  std::vector<Trip> pinned_pool;
+  std::vector<Trip> unpinned_pool;
+};
+
+static SplitPagingFrame build_split_frame(
+    const SplitPinResult &r,
+    ScrollContainer &gen_pager, ScrollContainer &dep_pager) {
+  SplitPagingFrame f;
+  if (r.has_pin_split) {
+    gen_pager.clamp((int)r.general_pool.size(), r.eff_general);
+    dep_pager.clamp((int)r.departure_pool.size(), r.eff_departure);
+    int g_si = gen_pager.start_index((int)r.general_pool.size(), r.eff_general);
+    int g_ei = gen_pager.end_index((int)r.general_pool.size(), r.eff_general);
+    int d_si = dep_pager.start_index((int)r.departure_pool.size(), r.eff_departure);
+    int d_ei = dep_pager.end_index((int)r.departure_pool.size(), r.eff_departure);
+    for (int i = g_si; i < g_ei; i++)
+      f.pinned_pool.push_back(r.general_pool[i]);
+    for (int i = d_si; i < d_ei; i++)
+      f.pinned_pool.push_back(r.departure_pool[i]);
+  } else if (r.eff_pinned > 0) {
+    f.pinned_pool = r.pinned_pool;
+  }
+  f.unpinned_pool = r.unpinned_pool;
+  return f;
+}
+
+// Helper to advance both pagers together (mirrors draw_schedule behavior)
+static void advance_both(const SplitPinResult &r,
+                          ScrollContainer &gen_pager, ScrollContainer &dep_pager) {
+  gen_pager.advance_page((int)r.general_pool.size(), r.eff_general);
+  dep_pager.advance_page((int)r.departure_pool.size(), r.eff_departure);
+}
+
 TEST_SUITE("SplitPinPaging") {
-
-  // Helper: simulates the split-mode paging logic from draw_schedule.
-  // Uses pinned_pager_ for general and departure_pager_ for departure.
-  struct SplitPagingFrame {
-    std::vector<Trip> pinned_pool;
-    std::vector<Trip> unpinned_pool;
-  };
-
-  static SplitPagingFrame build_split_frame(
-      const SplitPinResult &r,
-      ScrollContainer &gen_pager, ScrollContainer &dep_pager) {
-    SplitPagingFrame f;
-    if (r.has_pin_split) {
-      gen_pager.clamp((int)r.general_pool.size(), r.eff_general);
-      dep_pager.clamp((int)r.departure_pool.size(), r.eff_departure);
-      int g_si = gen_pager.start_index((int)r.general_pool.size(), r.eff_general);
-      int g_ei = gen_pager.end_index((int)r.general_pool.size(), r.eff_general);
-      int d_si = dep_pager.start_index((int)r.departure_pool.size(), r.eff_departure);
-      int d_ei = dep_pager.end_index((int)r.departure_pool.size(), r.eff_departure);
-      for (int i = g_si; i < g_ei; i++)
-        f.pinned_pool.push_back(r.general_pool[i]);
-      for (int i = d_si; i < d_ei; i++)
-        f.pinned_pool.push_back(r.departure_pool[i]);
-    } else if (r.eff_pinned > 0) {
-      f.pinned_pool = r.pinned_pool;
-    }
-    f.unpinned_pool = r.unpinned_pool;
-    return f;
-  }
-
-  // Helper to advance both pagers together (mirrors draw_schedule behavior)
-  static void advance_both(const SplitPinResult &r,
-                            ScrollContainer &gen_pager, ScrollContainer &dep_pager) {
-    gen_pager.advance_page((int)r.general_pool.size(), r.eff_general);
-    dep_pager.advance_page((int)r.departure_pool.size(), r.eff_departure);
-  }
 
   TEST_CASE("1 red + 2 green: departure pages, general stays fixed") {
     std::map<std::string, PinMode> pins = {
@@ -4735,5 +4735,1247 @@ TEST_SUITE("Default Pins") {
 
     CHECK(ctx.pinned_routes.size() == 1);
     CHECK(ctx.pinned_routes.count("R1:Downtown:S42") == 1);
+  }
+}
+
+// =====================================================================
+// Multi-panel / 6-row configuration tests
+//
+// The tests above largely assume a 3-row panel (limit=3).  The following
+// suites exercise 6-row panels and various configurations of
+// pinned_rows_count, general_pins_count, and different pin populations
+// to ensure the layout, paging, transition, and diff logic all hold for
+// larger displays.
+// =====================================================================
+
+// =====================================================================
+// SplitPinLayout — 6-row panel configurations
+// =====================================================================
+
+TEST_SUITE("SplitPinLayout — 6-row panel") {
+
+  // ---- No pins: all 6 rows unpinned ----
+
+  TEST_CASE("6-row: no pins — all rows unpinned") {
+    std::map<std::string, PinMode> pins;
+    unsigned int now = 1000;
+    std::vector<Trip> trips;
+    for (int i = 0; i < 8; i++)
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), now + 100 * (i + 1)));
+    auto r = split_pin_partition(trips, pins, now, 10, 1, 1, /*limit=*/6);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 0);
+    CHECK(r.eff_unpinned == 6);
+    CHECK(r.pinned_pool.empty());
+    CHECK(r.unpinned_pool.size() == 8);
+  }
+
+  // ---- Single general pin on a 6-row panel ----
+
+  TEST_CASE("6-row: 1 general pin, pinned_rows=1 — 1 pinned, 5 unpinned") {
+    std::map<std::string, PinMode> pins = {{"R1:H1", PIN_GENERAL}};
+    unsigned int now = 1000;
+    std::vector<Trip> trips;
+    for (int i = 1; i <= 7; i++)
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), now + 100 * i));
+    auto r = split_pin_partition(trips, pins, now, 10, /*pinned_rows=*/1, /*general_pins=*/1, /*limit=*/6);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 1);
+    CHECK(r.eff_unpinned == 5);
+    CHECK(r.pinned_pool.size() == 1);
+    CHECK(r.pinned_pool[0].route_id == "R1");
+  }
+
+  // ---- Multiple general pins filling half the panel ----
+
+  TEST_CASE("6-row: 3 general pins, pinned_rows=3 — 3 pinned, 3 unpinned") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:H1", PIN_GENERAL},
+        {"R2:H2", PIN_GENERAL},
+        {"R3:H3", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    std::vector<Trip> trips;
+    for (int i = 1; i <= 8; i++)
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), now + 100 * i));
+    auto r = split_pin_partition(trips, pins, now, 10, /*pinned_rows=*/3, /*general_pins=*/1, /*limit=*/6);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 3);
+    CHECK(r.eff_unpinned == 3);
+    CHECK(r.pinned_pool.size() == 3);
+  }
+
+  // ---- Pins expand to fill all 6 rows when no unpinned trips exist ----
+
+  TEST_CASE("6-row: 5 general pins, all pinned, no unpinned — fills 5 rows") {
+    std::map<std::string, PinMode> pins;
+    unsigned int now = 1000;
+    std::vector<Trip> trips;
+    for (int i = 1; i <= 5; i++) {
+      std::string key = "R" + std::to_string(i) + ":H" + std::to_string(i);
+      pins[key] = PIN_GENERAL;
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), now + 100 * i));
+    }
+    auto r = split_pin_partition(trips, pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/1, /*limit=*/6);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 5);  // expands from pinned_rows=2 because no unpinned
+    CHECK(r.eff_unpinned == 1);  // 6 - 5
+    CHECK(r.unpinned_pool.empty());
+  }
+
+  TEST_CASE("6-row: all 6 trips pinned general — fills all rows") {
+    std::map<std::string, PinMode> pins;
+    unsigned int now = 1000;
+    std::vector<Trip> trips;
+    for (int i = 1; i <= 6; i++) {
+      std::string key = "R" + std::to_string(i) + ":H" + std::to_string(i);
+      pins[key] = PIN_GENERAL;
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), now + 100 * i));
+    }
+    auto r = split_pin_partition(trips, pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/1, /*limit=*/6);
+    CHECK(r.eff_pinned == 6);
+    CHECK(r.eff_unpinned == 0);
+  }
+
+  // ---- Split mode on 6-row panel: general + departure ----
+
+  TEST_CASE("6-row: split — 2 general + 2 departure, pinned_rows=4") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"G2:B", PIN_GENERAL},
+        {"D1:C", PIN_LEAVING_SOON},
+        {"D2:D", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("G2", "B", now + 1900),
+         make_trip("D1", "C", now + 300),
+         make_trip("D2", "D", now + 400),
+         make_trip("U1", "E", now + 500),
+         make_trip("U2", "F", now + 600),
+         make_trip("U3", "G", now + 700)},
+        pins, now, 10, /*pinned_rows=*/4, /*general_pins=*/2, /*limit=*/6);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 4);
+    CHECK(r.eff_general == 2);
+    CHECK(r.eff_departure == 2);
+    CHECK(r.eff_unpinned == 2);
+    CHECK(r.pinned_pool[0].route_id == "G1");
+    CHECK(r.pinned_pool[1].route_id == "G2");
+    CHECK(r.pinned_pool[2].route_id == "D1");
+    CHECK(r.pinned_pool[3].route_id == "D2");
+  }
+
+  TEST_CASE("6-row: split — 1 general + 4 departure, general_pins=1, pinned_rows=5") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"D1:B", PIN_LEAVING_SOON},
+        {"D2:C", PIN_LEAVING_SOON},
+        {"D3:D", PIN_LEAVING_SOON},
+        {"D4:E", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("D1", "B", now + 200),
+         make_trip("D2", "C", now + 300),
+         make_trip("D3", "D", now + 400),
+         make_trip("D4", "E", now + 500),
+         make_trip("U1", "F", now + 600),
+         make_trip("U2", "G", now + 700)},
+        pins, now, 10, /*pinned_rows=*/5, /*general_pins=*/1, /*limit=*/6);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 5);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 4);
+    CHECK(r.eff_unpinned == 1);
+  }
+
+  TEST_CASE("6-row: split — 3 general + 1 departure, general_pins=3, pinned_rows=4") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"G2:B", PIN_GENERAL},
+        {"G3:C", PIN_GENERAL},
+        {"D1:D", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("G2", "B", now + 1900),
+         make_trip("G3", "C", now + 2000),
+         make_trip("D1", "D", now + 300),
+         make_trip("U1", "E", now + 500),
+         make_trip("U2", "F", now + 600)},
+        pins, now, 10, /*pinned_rows=*/4, /*general_pins=*/3, /*limit=*/6);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 4);
+    CHECK(r.eff_general == 3);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 2);
+  }
+
+  TEST_CASE("6-row: split auto-bump from pinned_rows=1 to 2") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"D1:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("D1", "B", now + 300),
+         make_trip("U1", "C", now + 400),
+         make_trip("U2", "D", now + 500),
+         make_trip("U3", "E", now + 600),
+         make_trip("U4", "F", now + 700)},
+        pins, now, 10, /*pinned_rows=*/1, /*general_pins=*/1, /*limit=*/6);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 2);  // auto-bumped from 1
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 4);
+  }
+
+  TEST_CASE("6-row: split surplus gives departure slots back to general") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"G2:B", PIN_GENERAL},
+        {"G3:C", PIN_GENERAL},
+        {"G4:D", PIN_GENERAL},
+        {"D1:E", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("G2", "B", now + 1900),
+         make_trip("G3", "C", now + 2000),
+         make_trip("G4", "D", now + 2100),
+         make_trip("D1", "E", now + 300),
+         make_trip("U1", "F", now + 600)},
+        pins, now, 10, /*pinned_rows=*/5, /*general_pins=*/2, /*limit=*/6);
+    // gen_want = min(2, 5-1) = 2, eff_general = 2
+    // dep_slots = 5 - 2 = 3, eff_departure = min(3, 1) = 1
+    // surplus = 3 - 1 = 2, extra = min(2, 4-2) = 2 → eff_general = 4
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 5);
+    CHECK(r.eff_general == 4);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 1);
+  }
+
+  // ---- All pinned, no unpinned — pins expand to fill 6 rows ----
+
+  TEST_CASE("6-row: all pinned split — expands to fill all rows") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"G2:B", PIN_GENERAL},
+        {"D1:C", PIN_LEAVING_SOON},
+        {"D2:D", PIN_LEAVING_SOON},
+        {"D3:E", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("G2", "B", now + 1900),
+         make_trip("D1", "C", now + 200),
+         make_trip("D2", "D", now + 300),
+         make_trip("D3", "E", now + 400)},
+        pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/1, /*limit=*/6);
+    // unpinned_pool_empty=true → pins expand
+    // eff_general = min(1, 2) = 1, dep_slots = 6 - 1 = 5, eff_departure = min(5, 3) = 3
+    // surplus = 2, extra = min(2, 2-1) = 1 → eff_general = 2
+    CHECK(r.eff_pinned == 5);
+    CHECK(r.eff_general == 2);
+    CHECK(r.eff_departure == 3);
+    CHECK(r.eff_unpinned == 1);
+    CHECK(r.unpinned_pool.empty());
+  }
+
+  TEST_CASE("6-row: 6 general pins, no unpinned — single type fills all rows") {
+    std::map<std::string, PinMode> pins;
+    unsigned int now = 1000;
+    std::vector<Trip> trips;
+    for (int i = 1; i <= 6; i++) {
+      std::string key = "R" + std::to_string(i) + ":H" + std::to_string(i);
+      pins[key] = PIN_GENERAL;
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), now + 100 * i));
+    }
+    auto r = split_pin_partition(trips, pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/1, /*limit=*/6);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 6);
+    CHECK(r.eff_unpinned == 0);
+  }
+
+  // ---- PIN_BOTH mix on 6-row panel ----
+
+  TEST_CASE("6-row: PIN_BOTH — 3 leaving soon, 2 not — split") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_BOTH},
+        {"R2:B", PIN_BOTH},
+        {"R3:C", PIN_BOTH},
+        {"R4:D", PIN_BOTH},
+        {"R5:E", PIN_BOTH},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 120),   // LS
+         make_trip("R2", "B", now + 300),    // LS
+         make_trip("R3", "C", now + 400),    // LS (within 10 min)
+         make_trip("R4", "D", now + 1800),   // not LS → general
+         make_trip("R5", "E", now + 2400),   // not LS → general
+         make_trip("U1", "F", now + 500)},   // unpinned
+        pins, now, 10, /*pinned_rows=*/4, /*general_pins=*/2, /*limit=*/6);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_general == 2);
+    CHECK(r.eff_departure == 2);
+    CHECK(r.eff_pinned == 4);
+    CHECK(r.eff_unpinned == 2);
+    // Color consistency check
+    CHECK(!has_pool_color_mismatch(r, pins, now, 10));
+  }
+
+  // ---- Large general_pins_count on 6-row ----
+
+  TEST_CASE("6-row: general_pins=4, pinned_rows=5 — 4 general + 1 departure") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"G2:B", PIN_GENERAL},
+        {"G3:C", PIN_GENERAL},
+        {"G4:D", PIN_GENERAL},
+        {"D1:E", PIN_LEAVING_SOON},
+        {"D2:F", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("G2", "B", now + 1900),
+         make_trip("G3", "C", now + 2000),
+         make_trip("G4", "D", now + 2100),
+         make_trip("D1", "E", now + 300),
+         make_trip("D2", "F", now + 400),
+         make_trip("U1", "G", now + 700)},
+        pins, now, 10, /*pinned_rows=*/5, /*general_pins=*/4, /*limit=*/6);
+    CHECK(r.has_pin_split);
+    // gen_want = min(4, 5-1) = 4, eff_general = 4
+    // dep_slots = 5 - 4 = 1, eff_departure = 1
+    CHECK(r.eff_pinned == 5);
+    CHECK(r.eff_general == 4);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 1);
+  }
+
+  // ---- pinned_rows_count = limit - 1 (max pinned) ----
+
+  TEST_CASE("6-row: pinned_rows=5 (max), 4 general + 2 departure") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"G2:B", PIN_GENERAL},
+        {"G3:C", PIN_GENERAL},
+        {"G4:D", PIN_GENERAL},
+        {"D1:E", PIN_LEAVING_SOON},
+        {"D2:F", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("G2", "B", now + 1900),
+         make_trip("G3", "C", now + 2000),
+         make_trip("G4", "D", now + 2100),
+         make_trip("D1", "E", now + 300),
+         make_trip("D2", "F", now + 400),
+         make_trip("U1", "G", now + 700)},
+        pins, now, 10, /*pinned_rows=*/5, /*general_pins=*/2, /*limit=*/6);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 5);
+    // gen_want=2, dep_slots=3, eff_departure=min(3,2)=2, surplus=1, extra=1 → eff_general=3
+    CHECK(r.eff_general == 3);
+    CHECK(r.eff_departure == 2);
+    CHECK(r.eff_unpinned == 1);
+  }
+
+  // ---- Fewer pinned trips than slots requested ----
+
+  TEST_CASE("6-row: pinned_rows=5, only 2 actual pins — shrinks to 2") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"D1:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("D1", "B", now + 300),
+         make_trip("U1", "C", now + 400),
+         make_trip("U2", "D", now + 500),
+         make_trip("U3", "E", now + 600),
+         make_trip("U4", "F", now + 700)},
+        pins, now, 10, /*pinned_rows=*/5, /*general_pins=*/2, /*limit=*/6);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 2);  // shrinks to actual
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 4);
+  }
+
+  // ---- Dedup interaction with 6 rows ----
+
+  TEST_CASE("6-row: PIN_GENERAL duplicates stay in general pool") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"D1:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R1", "A", now + 1900),  // dup
+         make_trip("R1", "A", now + 2000),  // dup
+         make_trip("D1", "B", now + 300),
+         make_trip("U1", "C", now + 400),
+         make_trip("U2", "D", now + 500)},
+        pins, now, 10, /*pinned_rows=*/4, /*general_pins=*/2, /*limit=*/6);
+    CHECK(r.general_pool.size() == 3);  // first + 2 dups
+    CHECK(r.departure_pool.size() == 1);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 4);
+    CHECK(!has_pool_color_mismatch(r, pins, now, 10));
+  }
+}
+
+// =====================================================================
+// ScrollContainer — 6-row panel paging
+// =====================================================================
+
+TEST_SUITE("ScrollContainer — 6-row panel") {
+
+  TEST_CASE("6-row: pool of 10 items, 6 slots — 5 pages") {
+    ScrollContainer sc;
+    CHECK(sc.page_count(10, 6) == 5);
+    CHECK(sc.needs_paging(10, 6));
+  }
+
+  TEST_CASE("6-row: pool of 6, 6 slots — no paging") {
+    ScrollContainer sc;
+    CHECK(sc.page_count(6, 6) == 1);
+    CHECK(!sc.needs_paging(6, 6));
+  }
+
+  TEST_CASE("6-row: advance_page cycles through all pages") {
+    ScrollContainer sc;
+    sc.page_offset = 0;
+    int pool = 10, slots = 6;
+    int pages = sc.page_count(pool, slots);  // 5 pages
+
+    for (int i = 0; i < pages; i++) {
+      CHECK(sc.page_offset == i);
+      sc.advance_page(pool, slots);
+    }
+    CHECK(sc.page_offset == 0);  // wrapped
+  }
+
+  TEST_CASE("6-row: start_index and end_index cover correct window") {
+    ScrollContainer sc;
+    int pool = 10, slots = 6;
+
+    sc.page_offset = 0;
+    CHECK(sc.start_index(pool, slots) == 0);
+    CHECK(sc.end_index(pool, slots) == 6);
+
+    sc.page_offset = 2;
+    CHECK(sc.start_index(pool, slots) == 2);
+    CHECK(sc.end_index(pool, slots) == 8);
+
+    sc.page_offset = 4;  // last page
+    CHECK(sc.start_index(pool, slots) == 4);
+    CHECK(sc.end_index(pool, slots) == 10);
+  }
+
+  TEST_CASE("6-row: clamp handles pool shrinking from many to few") {
+    ScrollContainer sc;
+    sc.page_offset = 8;
+    sc.clamp(10, 6);
+    CHECK(sc.page_offset == 4);  // max page for pool=10, slots=6
+
+    sc.clamp(6, 6);  // pool shrinks to exactly 6
+    CHECK(sc.page_offset == 0);
+  }
+
+  TEST_CASE("6-row: split paging — 3 general slots, pool of 5") {
+    ScrollContainer gen_p, dep_p;
+    gen_p.reset(); dep_p.reset();
+
+    // Simulate: 3 general slots with a pool of 5, 3 departure slots with pool of 3
+    int gen_pool = 5, gen_slots = 3;
+    int dep_pool = 3, dep_slots = 3;
+
+    CHECK(gen_p.needs_paging(gen_pool, gen_slots));
+    CHECK(!dep_p.needs_paging(dep_pool, dep_slots));
+
+    // Page 0: general shows items 0-2
+    CHECK(gen_p.start_index(gen_pool, gen_slots) == 0);
+    CHECK(gen_p.end_index(gen_pool, gen_slots) == 3);
+
+    gen_p.advance_page(gen_pool, gen_slots);
+    CHECK(gen_p.start_index(gen_pool, gen_slots) == 1);
+
+    gen_p.advance_page(gen_pool, gen_slots);
+    CHECK(gen_p.start_index(gen_pool, gen_slots) == 2);  // items 2-4
+  }
+}
+
+// =====================================================================
+// Transition — 6-row stagger timing
+// =====================================================================
+
+TEST_SUITE("Transition — 6-row stagger") {
+
+  TEST_CASE("6-row: cascade with 6 stagger rows") {
+    Transition tr;
+    tr.stagger_rows = 6;
+    // cascade = 250 * (6-1) = 1250
+    CHECK(tr.cascade_ms() == 1250);
+    // collapse = 500 + 1250 = 1750
+    CHECK(tr.collapse_duration_ms() == 1750);
+    CHECK(tr.expand_duration_ms() == 1750);
+    // total = 1750 + 500 + 1750 = 4000
+    CHECK(tr.total_replace_ms() == 4000);
+  }
+
+  TEST_CASE("6-row: last row (row 5) starts at stagger offset 1250ms") {
+    Transition tr;
+    tr.stagger_rows = 6;
+
+    int last_row = 5;
+    int last_start = last_row * kReplaceStaggerMs;  // 1250
+    CHECK(last_start == 1250);
+
+    // Before start: still fully visible (collapse)
+    CHECK(tr.row_scale(last_row, last_start - 1, false) == doctest::Approx(1.0f));
+
+    // At start: fully visible
+    CHECK(tr.row_scale(last_row, last_start, false) == doctest::Approx(1.0f));
+
+    // At end (start + 500): fully collapsed
+    CHECK(tr.row_scale(last_row, last_start + kReplacePerRowMs, false) == doctest::Approx(0.0f));
+
+    // Expand: reversed
+    CHECK(tr.row_scale(last_row, last_start, true) == doctest::Approx(0.0f));
+    CHECK(tr.row_scale(last_row, last_start + kReplacePerRowMs, true) == doctest::Approx(1.0f));
+  }
+
+  TEST_CASE("6-row: all rows collapse in sequence") {
+    Transition tr;
+    tr.stagger_rows = 6;
+
+    // At t=0, all rows should be visible (scales = 1)
+    for (int row = 0; row < 6; row++) {
+      CHECK(tr.row_scale(row, 0, false) == doctest::Approx(1.0f));
+    }
+
+    // At t=collapse_duration (1750ms), all rows should be collapsed (scales = 0)
+    unsigned long collapse_end = tr.collapse_duration_ms();
+    for (int row = 0; row < 6; row++) {
+      CHECK(tr.row_scale(row, collapse_end, false) == doctest::Approx(0.0f));
+    }
+  }
+
+  TEST_CASE("6-row: mid-animation, rows at different stages of collapse") {
+    Transition tr;
+    tr.stagger_rows = 6;
+
+    // At t=600ms:
+    // Row 0: started at 0, elapsed=600, 600/500=1.0 → collapsed
+    // Row 1: started at 250, elapsed=350, 350/500=0.7 → partially collapsed
+    // Row 2: started at 500, elapsed=100, 100/500=0.2 → barely started
+    // Row 3: started at 750, not started → still visible
+    float s0 = tr.row_scale(0, 600, false);
+    float s1 = tr.row_scale(1, 600, false);
+    float s2 = tr.row_scale(2, 600, false);
+    float s3 = tr.row_scale(3, 600, false);
+
+    CHECK(s0 == doctest::Approx(0.0f));
+    CHECK(s1 > 0.0f);
+    CHECK(s1 < 1.0f);
+    CHECK(s2 > s1);  // row 2 less collapsed than row 1
+    CHECK(s3 == doctest::Approx(1.0f));
+  }
+
+  TEST_CASE("6-row: reset clears all state") {
+    Transition tr;
+    tr.phase = Transition::COLLAPSE;
+    tr.stagger_rows = 6;
+    for (int i = 0; i < 6; i++)
+      tr.old_trips.push_back(make_trip("R" + std::to_string(i), "H"));
+    tr.reset();
+    CHECK(tr.phase == Transition::IDLE);
+    CHECK(tr.stagger_rows == 0);
+    CHECK(tr.old_trips.empty());
+  }
+}
+
+// =====================================================================
+// DisplayDiff — 6-row panel scenarios
+// =====================================================================
+
+TEST_SUITE("DisplayDiff — 6-row panel") {
+
+  static void commit_frame_6(DisplayDiff &diff,
+                              const std::vector<Trip> &trips,
+                              int pinned_count,
+                              const std::set<std::string> &pinned_routes) {
+    std::vector<std::string> keys;
+    std::vector<time_t> deps;
+    std::vector<bool> is_p;
+    for (size_t i = 0; i < trips.size(); i++) {
+      keys.push_back(trips[i].composite_key());
+      deps.push_back(trips[i].departure_time);
+      is_p.push_back((int)i < pinned_count);
+    }
+    diff.commit(keys, deps, trips, is_p, is_p, pinned_count, pinned_routes);
+  }
+
+  static void compute_frame_6(DisplayDiff &diff,
+                               const std::vector<Trip> &trips,
+                               int pinned_count,
+                               const std::set<std::string> &pinned_routes) {
+    std::vector<std::string> keys;
+    std::vector<time_t> deps;
+    for (const auto &t : trips) {
+      keys.push_back(t.composite_key());
+      deps.push_back(t.departure_time);
+    }
+    diff.compute(keys, deps, pinned_count, pinned_routes);
+  }
+
+  TEST_CASE("6-row: first frame — no diff") {
+    DisplayDiff diff;
+    std::vector<Trip> trips;
+    for (int i = 0; i < 6; i++)
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), 100 + 100 * i));
+    std::set<std::string> no_pins;
+    compute_frame_6(diff, trips, 0, no_pins);
+    CHECK(!diff.has_changes());
+  }
+
+  TEST_CASE("6-row: pin 3 of 6 — layout_changed") {
+    DisplayDiff diff;
+    std::vector<Trip> trips;
+    for (int i = 0; i < 6; i++)
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), 100 + 100 * i));
+    std::set<std::string> no_pins;
+    commit_frame_6(diff, trips, 0, no_pins);
+
+    std::set<std::string> pins3 = {"R0:H0", "R1:H1", "R2:H2"};
+    compute_frame_6(diff, trips, 3, pins3);
+    CHECK(diff.layout_changed);
+    CHECK(diff.has_changes());
+  }
+
+  TEST_CASE("6-row: change 1 of 6 trips — data_changed") {
+    DisplayDiff diff;
+    std::vector<Trip> trips;
+    for (int i = 0; i < 6; i++)
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), 100 + 100 * i));
+    std::set<std::string> no_pins;
+    commit_frame_6(diff, trips, 0, no_pins);
+
+    // Change last trip
+    trips[5] = make_trip("RX", "HX", 999);
+    compute_frame_6(diff, trips, 0, no_pins);
+    CHECK(diff.data_changed);
+  }
+
+  TEST_CASE("6-row: no change after commit — stable") {
+    DisplayDiff diff;
+    std::vector<Trip> trips;
+    for (int i = 0; i < 6; i++)
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), 100 + 100 * i));
+    std::set<std::string> no_pins;
+    commit_frame_6(diff, trips, 0, no_pins);
+    compute_frame_6(diff, trips, 0, no_pins);
+    CHECK(!diff.has_changes());
+  }
+
+  TEST_CASE("6-row: swap pinned set — pinned_set_changed") {
+    DisplayDiff diff;
+    std::vector<Trip> trips;
+    for (int i = 0; i < 6; i++)
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), 100 + 100 * i));
+    std::set<std::string> pins_v1 = {"R0:H0", "R1:H1"};
+    commit_frame_6(diff, trips, 2, pins_v1);
+
+    std::set<std::string> pins_v2 = {"R2:H2", "R3:H3"};
+    compute_frame_6(diff, trips, 2, pins_v2);
+    CHECK(diff.pinned_set_changed);
+    CHECK(!diff.layout_changed);  // count stayed at 2
+    CHECK(diff.has_changes());
+  }
+
+  TEST_CASE("6-row: size change from 4 to 6 trips — data_changed") {
+    DisplayDiff diff;
+    std::vector<Trip> trips4;
+    for (int i = 0; i < 4; i++)
+      trips4.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), 100 + 100 * i));
+    std::set<std::string> no_pins;
+    commit_frame_6(diff, trips4, 0, no_pins);
+
+    std::vector<Trip> trips6;
+    for (int i = 0; i < 6; i++)
+      trips6.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), 100 + 100 * i));
+    compute_frame_6(diff, trips6, 0, no_pins);
+    CHECK(diff.data_changed);
+  }
+
+  TEST_CASE("6-row: multiple pins added at once — layout_changed") {
+    DisplayDiff diff;
+    std::vector<Trip> trips;
+    for (int i = 0; i < 6; i++)
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), 100 + 100 * i));
+    std::set<std::string> no_pins;
+    commit_frame_6(diff, trips, 0, no_pins);
+
+    std::set<std::string> pins4 = {"R0:H0", "R1:H1", "R2:H2", "R3:H3"};
+    compute_frame_6(diff, trips, 4, pins4);
+    CHECK(diff.layout_changed);
+  }
+}
+
+// =====================================================================
+// dedup_pinned_section — larger pin counts
+// =====================================================================
+
+TEST_SUITE("dedup_pinned_section — larger panels") {
+
+  TEST_CASE("6 pinned, no dups — all preserved") {
+    std::vector<Trip> trips;
+    for (int i = 0; i < 6; i++)
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), 100 + 100 * i));
+    int pc = 6;
+    dedup_pinned_section(trips, pc);
+    CHECK(pc == 6);
+    CHECK(trips.size() == 6);
+  }
+
+  TEST_CASE("6 pinned, 2 dups — reduced to 4 pinned") {
+    std::vector<Trip> trips = {
+        make_trip("R1", "A", 100),
+        make_trip("R2", "B", 200),
+        make_trip("R1", "A", 300),  // dup
+        make_trip("R3", "C", 400),
+        make_trip("R2", "B", 500),  // dup
+        make_trip("R4", "D", 600),
+        make_trip("R5", "E", 700),  // unpinned
+    };
+    int pc = 6;
+    dedup_pinned_section(trips, pc);
+    CHECK(pc == 4);
+    CHECK(trips.size() == 5);  // 4 pinned + 1 unpinned
+    CHECK(trips[0].route_id == "R1");
+    CHECK(trips[1].route_id == "R2");
+    CHECK(trips[2].route_id == "R3");
+    CHECK(trips[3].route_id == "R4");
+    CHECK(trips[4].route_id == "R5");  // unpinned preserved
+  }
+
+  TEST_CASE("all 6 are same key — deduped to 1") {
+    std::vector<Trip> trips;
+    for (int i = 0; i < 6; i++)
+      trips.push_back(make_trip("R1", "A", 100 + 100 * i));
+    trips.push_back(make_trip("R2", "B", 800));  // unpinned
+    int pc = 6;
+    dedup_pinned_section(trips, pc);
+    CHECK(pc == 1);
+    CHECK(trips.size() == 2);  // 1 pinned + 1 unpinned
+    CHECK(trips[0].departure_time == 100);  // first kept
+    CHECK(trips[1].route_id == "R2");
+  }
+
+  TEST_CASE("8 pinned with mixed keys — correct dedup count") {
+    std::vector<Trip> trips = {
+        make_trip("R1", "A", 100),
+        make_trip("R2", "B", 200),
+        make_trip("R3", "C", 300),
+        make_trip("R1", "A", 400),  // dup
+        make_trip("R4", "D", 500),
+        make_trip("R2", "B", 600),  // dup
+        make_trip("R5", "E", 700),
+        make_trip("R3", "C", 800),  // dup
+    };
+    int pc = 8;
+    dedup_pinned_section(trips, pc);
+    CHECK(pc == 5);   // R1, R2, R3, R4, R5
+    CHECK(trips.size() == 5);
+  }
+}
+
+// =====================================================================
+// Multi-frame integration — 6-row lifecycle
+// =====================================================================
+
+TEST_SUITE("Multi-frame integration — 6-row") {
+
+  struct FrameContext6 {
+    DisplayDiff diff;
+    Transition transition;
+    HScrollState h_scroll;
+    ScrollContainer pinned_pager;
+    ScrollContainer unpinned_pager;
+  };
+
+  TEST_CASE("6-row: idle → add 3 pins → transition → idle") {
+    FrameContext6 ctx;
+    std::vector<Trip> trips;
+    for (int i = 0; i < 6; i++)
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), 100 + 100 * i));
+    std::set<std::string> no_pins;
+
+    // Frame 0: no pins, commit
+    {
+      std::vector<std::string> keys;
+      std::vector<time_t> deps;
+      std::vector<bool> is_p;
+      for (const auto &t : trips) {
+        keys.push_back(t.composite_key());
+        deps.push_back(t.departure_time);
+        is_p.push_back(false);
+      }
+      ctx.diff.compute(keys, deps, 0, no_pins);
+      CHECK(!ctx.diff.has_changes());
+      ctx.diff.commit(keys, deps, trips, is_p, is_p, 0, no_pins);
+    }
+
+    // Frame 1: add 3 pins
+    std::set<std::string> pins3 = {"R0:H0", "R1:H1", "R2:H2"};
+    {
+      std::vector<std::string> keys;
+      std::vector<time_t> deps;
+      for (const auto &t : trips) {
+        keys.push_back(t.composite_key());
+        deps.push_back(t.departure_time);
+      }
+      ctx.diff.compute(keys, deps, 3, pins3);
+      CHECK(ctx.diff.layout_changed);
+
+      // Start transition
+      ctx.transition.reset();
+      ctx.transition.old_trips = ctx.diff.prev_trips;
+      ctx.transition.old_is_pinned = ctx.diff.prev_is_pinned;
+      ctx.transition.old_eff_pinned = 0;
+      ctx.transition.stagger_rows = 6;
+      ctx.transition.phase = Transition::COLLAPSE;
+      ctx.transition.phase_start = 1000;
+
+      CHECK(ctx.transition.stagger_rows == 6);
+      CHECK(ctx.transition.collapse_duration_ms() == 1750);
+    }
+
+    // Collapse completes after 1750ms, then mid-pause, then expand
+    {
+      ctx.transition.phase = Transition::EXPAND;
+      ctx.transition.phase_start = 3250;  // 1000 + 1750 + 500
+      ctx.transition.stagger_rows = 6;
+
+      // Mid-expand at 500ms: row 0 fully visible, row 5 not started
+      float row0 = ctx.transition.row_scale(0, 500, true);
+      float row5 = ctx.transition.row_scale(5, 500, true);
+      CHECK(row0 == doctest::Approx(1.0f));
+      CHECK(row5 == doctest::Approx(0.0f));
+    }
+
+    // Transition completes
+    {
+      ctx.transition.reset();
+      CHECK(ctx.transition.phase == Transition::IDLE);
+
+      std::vector<std::string> keys;
+      std::vector<time_t> deps;
+      std::vector<bool> is_p;
+      for (size_t i = 0; i < trips.size(); i++) {
+        keys.push_back(trips[i].composite_key());
+        deps.push_back(trips[i].departure_time);
+        is_p.push_back(i < 3);
+      }
+      ctx.diff.commit(keys, deps, trips, is_p, is_p, 3, pins3);
+      CHECK(ctx.diff.prev_pinned_count == 3);
+    }
+  }
+
+  TEST_CASE("6-row: paging 10-trip unpinned pool with no pins") {
+    ScrollContainer pager;
+    pager.reset();
+    int pool_size = 10;
+    int slot_count = 6;
+
+    CHECK(pager.needs_paging(pool_size, slot_count));
+    CHECK(pager.page_count(pool_size, slot_count) == 5);
+
+    // Cycle through all pages
+    for (int page = 0; page < 5; page++) {
+      CHECK(pager.page_offset == page);
+      int si = pager.start_index(pool_size, slot_count);
+      int ei = pager.end_index(pool_size, slot_count);
+      CHECK(ei - si == slot_count);
+      CHECK(si == page);
+      pager.advance_page(pool_size, slot_count);
+    }
+    CHECK(pager.page_offset == 0);  // wrapped
+  }
+
+  TEST_CASE("6-row: split paging — 3 general + 3 departure slots") {
+    // A realistic 6-row split: 3 general rows + 3 departure rows
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"G2:B", PIN_GENERAL},
+        {"G3:C", PIN_GENERAL},
+        {"G4:D", PIN_GENERAL},
+        {"G5:E", PIN_GENERAL},
+        {"D1:F", PIN_LEAVING_SOON},
+        {"D2:G", PIN_LEAVING_SOON},
+        {"D3:H", PIN_LEAVING_SOON},
+        {"D4:I", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("G2", "B", now + 1900),
+         make_trip("G3", "C", now + 2000),
+         make_trip("G4", "D", now + 2100),
+         make_trip("G5", "E", now + 2200),
+         make_trip("D1", "F", now + 200),
+         make_trip("D2", "G", now + 300),
+         make_trip("D3", "H", now + 400),
+         make_trip("D4", "I", now + 500)},
+        pins, now, 10, /*pinned_rows=*/6, /*general_pins=*/3, /*limit=*/6);
+
+    // All pinned, no unpinned → expand to fill all 6 rows
+    // gen: 3 slots for pool of 5 → needs paging
+    // dep: 3 slots for pool of 4 → needs paging
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_general == 3);
+    CHECK(r.eff_departure == 3);
+    CHECK(r.eff_pinned == 6);
+
+    ScrollContainer gen_p, dep_p;
+    gen_p.reset(); dep_p.reset();
+
+    CHECK(gen_p.needs_paging((int)r.general_pool.size(), r.eff_general));
+    CHECK(dep_p.needs_paging((int)r.departure_pool.size(), r.eff_departure));
+
+    // Page through general pool: G1-G3, G2-G4, G3-G5
+    auto f0 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f0.pinned_pool.size() == 6);
+    CHECK(f0.pinned_pool[0].route_id == "G1");
+    CHECK(f0.pinned_pool[1].route_id == "G2");
+    CHECK(f0.pinned_pool[2].route_id == "G3");
+    CHECK(f0.pinned_pool[3].route_id == "D1");
+    CHECK(f0.pinned_pool[4].route_id == "D2");
+    CHECK(f0.pinned_pool[5].route_id == "D3");
+
+    gen_p.advance_page((int)r.general_pool.size(), r.eff_general);
+    dep_p.advance_page((int)r.departure_pool.size(), r.eff_departure);
+
+    auto f1 = build_split_frame(r, gen_p, dep_p);
+    CHECK(f1.pinned_pool[0].route_id == "G2");
+    CHECK(f1.pinned_pool[3].route_id == "D2");
+  }
+
+  TEST_CASE("6-row: h-scroll works with 6 visible rows") {
+    // Verify h-scroll state doesn't interact poorly with row count
+    HScrollState hs;
+    hs.scroll_speed = 50;
+    hs.reset(1);
+    hs.update_distance(200, true);  // long headsign → total = 220
+
+    // Multiple compute cycles
+    hs.compute(1001);  // 1000ms at 50px/s = 50px
+    CHECK(hs.offset == 50);
+    CHECK(!hs.idle);
+
+    // Verify wind-down still works
+    hs.update_distance(0, false);
+    unsigned long scroll_phase = 220UL * 1000 / 50;  // 4400ms
+    hs.compute(1 + scroll_phase + 1);  // past first scroll phase, in dwell
+    CHECK(hs.idle);
+    CHECK(hs.prev_total_distance == 0);
+  }
+}
+
+// =====================================================================
+// SplitPinLayout — 4-row and 8-row panels (additional sizes)
+// =====================================================================
+
+TEST_SUITE("SplitPinLayout — various panel sizes") {
+
+  TEST_CASE("4-row: split — 1 general + 1 departure, 2 unpinned") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"D1:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("D1", "B", now + 300),
+         make_trip("U1", "C", now + 400),
+         make_trip("U2", "D", now + 500)},
+        pins, now, 10, /*pinned_rows=*/2, /*general_pins=*/1, /*limit=*/4);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 2);
+    CHECK(r.eff_general == 1);
+    CHECK(r.eff_departure == 1);
+    CHECK(r.eff_unpinned == 2);
+  }
+
+  TEST_CASE("4-row: 3 general pins, pinned_rows=3 — squeezes to 3 pinned, 1 unpinned") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_GENERAL},
+        {"R2:B", PIN_GENERAL},
+        {"R3:C", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 1800),
+         make_trip("R2", "B", now + 1900),
+         make_trip("R3", "C", now + 2000),
+         make_trip("U1", "D", now + 400)},
+        pins, now, 10, /*pinned_rows=*/3, /*general_pins=*/1, /*limit=*/4);
+    CHECK(!r.has_pin_split);
+    CHECK(r.eff_pinned == 3);
+    CHECK(r.eff_unpinned == 1);
+  }
+
+  TEST_CASE("8-row: split — 3 general + 3 departure, 2 unpinned") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"G2:B", PIN_GENERAL},
+        {"G3:C", PIN_GENERAL},
+        {"D1:D", PIN_LEAVING_SOON},
+        {"D2:E", PIN_LEAVING_SOON},
+        {"D3:F", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("G2", "B", now + 1900),
+         make_trip("G3", "C", now + 2000),
+         make_trip("D1", "D", now + 200),
+         make_trip("D2", "E", now + 300),
+         make_trip("D3", "F", now + 400),
+         make_trip("U1", "G", now + 500),
+         make_trip("U2", "H", now + 600)},
+        pins, now, 10, /*pinned_rows=*/6, /*general_pins=*/3, /*limit=*/8);
+    CHECK(r.has_pin_split);
+    CHECK(r.eff_pinned == 6);
+    CHECK(r.eff_general == 3);
+    CHECK(r.eff_departure == 3);
+    CHECK(r.eff_unpinned == 2);
+  }
+
+  TEST_CASE("8-row: general_pins=5, pinned_rows=7 — surplus fills general") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"G2:B", PIN_GENERAL},
+        {"G3:C", PIN_GENERAL},
+        {"G4:D", PIN_GENERAL},
+        {"G5:E", PIN_GENERAL},
+        {"G6:F", PIN_GENERAL},
+        {"D1:G", PIN_LEAVING_SOON},
+        {"D2:H", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("G2", "B", now + 1900),
+         make_trip("G3", "C", now + 2000),
+         make_trip("G4", "D", now + 2100),
+         make_trip("G5", "E", now + 2200),
+         make_trip("G6", "F", now + 2300),
+         make_trip("D1", "G", now + 300),
+         make_trip("D2", "H", now + 400),
+         make_trip("U1", "I", now + 600)},
+        pins, now, 10, /*pinned_rows=*/7, /*general_pins=*/5, /*limit=*/8);
+    CHECK(r.has_pin_split);
+    // gen_want = min(5, 7-1) = 5, eff_general = 5
+    // dep_slots = 7 - 5 = 2, eff_departure = 2
+    CHECK(r.eff_pinned == 7);
+    CHECK(r.eff_general == 5);
+    CHECK(r.eff_departure == 2);
+    CHECK(r.eff_unpinned == 1);
+  }
+
+  TEST_CASE("2-row: split auto-bump capped at limit-1=1") {
+    std::map<std::string, PinMode> pins = {
+        {"G1:A", PIN_GENERAL},
+        {"D1:B", PIN_LEAVING_SOON},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("G1", "A", now + 1800),
+         make_trip("D1", "B", now + 300),
+         make_trip("U1", "C", now + 400)},
+        pins, now, 10, /*pinned_rows=*/1, /*general_pins=*/1, /*limit=*/2);
+    // auto-bump: min(2, limit-1=1) = 1 → stays at 1
+    CHECK(r.eff_pinned == 1);
+    CHECK(r.eff_unpinned == 1);
+  }
+
+  TEST_CASE("10-row: all leaving-soon pins, no general — no split") {
+    std::map<std::string, PinMode> pins;
+    unsigned int now = 1000;
+    std::vector<Trip> trips;
+    for (int i = 1; i <= 8; i++) {
+      std::string key = "R" + std::to_string(i) + ":H" + std::to_string(i);
+      pins[key] = PIN_LEAVING_SOON;
+      trips.push_back(make_trip("R" + std::to_string(i), "H" + std::to_string(i), now + 50 * i));
+    }
+    // Add unpinned trips
+    trips.push_back(make_trip("U1", "X", now + 600));
+    trips.push_back(make_trip("U2", "Y", now + 700));
+
+    auto r = split_pin_partition(trips, pins, now, 10, /*pinned_rows=*/5, /*general_pins=*/2, /*limit=*/10);
+    CHECK(!r.has_pin_split);
+    CHECK(r.departure_pool.size() == 8);
+    CHECK(r.general_pool.empty());
+    CHECK(r.eff_pinned == 5);  // capped by pinned_rows_count
+    CHECK(r.eff_unpinned == 5);
+  }
+}
+
+// =====================================================================
+// Transition — various panel sizes
+// =====================================================================
+
+TEST_SUITE("Transition — various panel sizes") {
+
+  TEST_CASE("4-row: cascade = 750ms") {
+    Transition tr;
+    tr.stagger_rows = 4;
+    CHECK(tr.cascade_ms() == 750);
+    CHECK(tr.collapse_duration_ms() == 1250);
+    CHECK(tr.total_replace_ms() == 3000);
+  }
+
+  TEST_CASE("8-row: cascade = 1750ms") {
+    Transition tr;
+    tr.stagger_rows = 8;
+    CHECK(tr.cascade_ms() == 1750);
+    CHECK(tr.collapse_duration_ms() == 2250);
+    CHECK(tr.total_replace_ms() == 5000);
+  }
+
+  TEST_CASE("1-row: zero cascade, minimal animation") {
+    Transition tr;
+    tr.stagger_rows = 1;
+    CHECK(tr.cascade_ms() == 0);
+    CHECK(tr.collapse_duration_ms() == 500);
+    CHECK(tr.total_replace_ms() == 1500);
+  }
+
+  TEST_CASE("10-row: cascade = 2250ms") {
+    Transition tr;
+    tr.stagger_rows = 10;
+    CHECK(tr.cascade_ms() == 2250);
+    CHECK(tr.collapse_duration_ms() == 2750);
+  }
+
+  TEST_CASE("each row_scale is independent of total stagger_rows") {
+    // row_scale for row 0 should be the same regardless of how many total rows
+    Transition tr3, tr6;
+    tr3.stagger_rows = 3;
+    tr6.stagger_rows = 6;
+
+    for (unsigned long t = 0; t <= 1000; t += 50) {
+      CHECK(tr3.row_scale(0, t, false) == doctest::Approx(tr6.row_scale(0, t, false)));
+      CHECK(tr3.row_scale(0, t, true) == doctest::Approx(tr6.row_scale(0, t, true)));
+    }
+  }
+}
+
+// =====================================================================
+// Pin-color consistency — 6-row panel
+// =====================================================================
+
+TEST_SUITE("PinColorConsistency — 6-row panel") {
+
+  TEST_CASE("6-row: large split with PIN_BOTH — no mismatch") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_BOTH},
+        {"R2:B", PIN_BOTH},
+        {"R3:C", PIN_BOTH},
+        {"R4:D", PIN_BOTH},
+        {"R5:E", PIN_BOTH},
+        {"R6:F", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 120),   // LS
+         make_trip("R2", "B", now + 300),    // LS
+         make_trip("R3", "C", now + 400),    // LS
+         make_trip("R4", "D", now + 900),    // not LS
+         make_trip("R5", "E", now + 1200),   // not LS
+         make_trip("R6", "F", now + 1800)},  // general
+        pins, now, 10, /*pinned_rows=*/5, /*general_pins=*/2, /*limit=*/6);
+    CHECK(!has_pool_color_mismatch(r, pins, now, 10));
+  }
+
+  TEST_CASE("6-row: PIN_BOTH dups straddling threshold — no mismatch") {
+    std::map<std::string, PinMode> pins = {
+        {"R1:A", PIN_BOTH},
+        {"R2:B", PIN_GENERAL},
+    };
+    unsigned int now = 1000;
+    auto r = split_pin_partition(
+        {make_trip("R1", "A", now + 300),    // LS → departure
+         make_trip("R1", "A", now + 400),    // dup, LS → departure
+         make_trip("R1", "A", now + 599),    // dup, just inside threshold → departure
+         make_trip("R1", "A", now + 700),    // dup, just outside threshold → general
+         make_trip("R2", "B", now + 1800),
+         make_trip("U1", "C", now + 500)},
+        pins, now, 10, /*pinned_rows=*/4, /*general_pins=*/2, /*limit=*/6);
+    CHECK(!has_pool_color_mismatch(r, pins, now, 10));
+  }
+}
+
+// =====================================================================
+// ScrollContainer — paging edge cases for various slot counts
+// =====================================================================
+
+TEST_SUITE("ScrollContainer — various slot counts") {
+
+  TEST_CASE("1 slot: pages through all items individually") {
+    ScrollContainer sc;
+    sc.reset();
+    int pool = 5, slots = 1;
+    CHECK(sc.page_count(pool, slots) == 5);
+    CHECK(sc.needs_paging(pool, slots));
+    for (int i = 0; i < 5; i++) {
+      CHECK(sc.start_index(pool, slots) == i);
+      CHECK(sc.end_index(pool, slots) == i + 1);
+      sc.advance_page(pool, slots);
+    }
+    CHECK(sc.page_offset == 0);  // wrapped
+  }
+
+  TEST_CASE("5 slots, pool=5: no paging needed") {
+    ScrollContainer sc;
+    CHECK(!sc.needs_paging(5, 5));
+    CHECK(sc.page_count(5, 5) == 1);
+  }
+
+  TEST_CASE("4 slots, pool=8: 5 pages") {
+    ScrollContainer sc;
+    CHECK(sc.page_count(8, 4) == 5);
+    CHECK(sc.needs_paging(8, 4));
+  }
+
+  TEST_CASE("clamp with 0 slots: safe") {
+    ScrollContainer sc;
+    sc.page_offset = 5;
+    sc.clamp(10, 0);
+    CHECK(sc.page_offset == 0);
+  }
+
+  TEST_CASE("pool=0, any slots: no paging") {
+    ScrollContainer sc;
+    CHECK(!sc.needs_paging(0, 3));
+    CHECK(!sc.needs_paging(0, 6));
+    CHECK(sc.page_count(0, 3) == 1);
   }
 }
